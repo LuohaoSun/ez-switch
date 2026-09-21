@@ -20,10 +20,8 @@ let package = Package(
             ],
             path: "Sources/EZSwitch",
             linkerSettings: [
-                // SwiftPM 把部署目标当成 SDK 版本写进 LC_BUILD_VERSION（实测 sdk 13.0），
-                // 而系统按"链接的 SDK 版本"决定给不给新外观（Liquid Glass / 新窗口 chrome）——
-                // sdk 13.0 会被当成老 app 渲染。显式声明 minos 13.0 / sdk 27.0：
-                // 继续支持 macOS 13，同时让系统认出是新 SDK。
+                // SwiftPM 在 macOS 13 部署目标下会把 LC_BUILD_VERSION.sdk 写成 13.0，
+                // 导致系统按老 SDK 应用渲染。保留 minOS 13.0，同时把链接 SDK 标为 27.0。
                 .unsafeFlags(["-Xlinker", "-platform_version",
                               "-Xlinker", "macos",
                               "-Xlinker", "13.0",

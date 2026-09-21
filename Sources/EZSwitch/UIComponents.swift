@@ -95,28 +95,6 @@ struct ServiceSummary: View {
     }
 }
 
-struct SourceListScrollAppearance: NSViewRepresentable {
-    final class Probe: NSView {
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            DispatchQueue.main.async { [weak self] in self?.configure() }
-        }
-
-        func configure() {
-            guard let scroll = enclosingScrollView else { return }
-            // AppKit-backed sidebar lists can ignore SwiftUI's scrollIndicators setting.
-            scroll.hasVerticalScroller = false
-            scroll.hasHorizontalScroller = false
-            scroll.drawsBackground = false
-        }
-    }
-
-    func makeNSView(context: Context) -> Probe { Probe(frame: .zero) }
-    func updateNSView(_ view: Probe, context: Context) {
-        DispatchQueue.main.async { view.configure() }
-    }
-}
-
 struct NativeListRow: ViewModifier {
     func body(content: Content) -> some View {
         content
