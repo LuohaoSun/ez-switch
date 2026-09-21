@@ -159,7 +159,8 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(WindowActivator().frame(width: 0, height: 0))
-        .frame(minWidth: 820, minHeight: 580)
+        // 侧栏展开时仍要给供应商页留出 260pt 列表 + 390pt 详情。
+        .frame(minWidth: 860, minHeight: 580)
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button {
