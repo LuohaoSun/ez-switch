@@ -108,31 +108,7 @@ enum SettingsSection: Hashable {
 @MainActor
 final class SettingsNav: ObservableObject {
     @Published var section: SettingsSection = .models
-    @Published var columns: NavigationSplitViewVisibility = .all
-}
-
-extension View {
-    @ViewBuilder
-    func instantSidebarToggle(_ nav: SettingsNav) -> some View {
-        if #available(macOS 14.0, *) {
-            self.toolbar(removing: .sidebarToggle)
-                .toolbar {
-                    ToolbarItem(placement: .navigation) {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                nav.columns = nav.columns == .detailOnly ? .all : .detailOnly
-                            }
-                        } label: {
-                            Label("切换侧栏", systemImage: "sidebar.left")
-                        }
-                        .help(nav.columns == .detailOnly ? "展开侧栏" : "收起侧栏")
-                        .keyboardShortcut("s", modifiers: [.command, .control])
-                    }
-                }
-        } else {
-            self
-        }
-    }
+    @Published var sidebarVisible = true
 }
 
 struct SettingsView: View {
@@ -140,39 +116,95 @@ struct SettingsView: View {
     @StateObject private var nav = SettingsNav()
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $nav.columns) {
-            List(selection: selection) {
-                Label("路由", systemImage: "arrow.triangle.branch")
-                    .tag(SettingsSection.models)
-                Label("供应商", systemImage: "server.rack")
-                    .tag(SettingsSection.remotes)
-                Label("活动", systemImage: "waveform.path.ecg")
-                    .tag(SettingsSection.activity)
-                Label("通用", systemImage: "gearshape")
-                    .tag(SettingsSection.general)
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
+                SettingsSidebarRow(title: "路由", systemImage: "arrow.triangle.branch",
+                                   section: .models, selection: nav.section) {
+                    nav.section = .models
+                }
+                SettingsSidebarRow(title: "供应商", systemImage: "server.rack",
+                                   section: .remotes, selection: nav.section) {
+                    nav.section = .remotes
+                }
+                SettingsSidebarRow(title: "活动", systemImage: "waveform.path.ecg",
+                                   section: .activity, selection: nav.section) {
+                    nav.section = .activity
+                }
+                SettingsSidebarRow(title: "通用", systemImage: "gearshape",
+                                   section: .general, selection: nav.section) {
+                    nav.section = .general
+                }
+                Spacer(minLength: 0)
             }
-            .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
-            .instantSidebarToggle(nav)
-        } detail: {
-            switch nav.section {
-            case .models: ModelsPane(store: store)
-            case .remotes: RemotesView(store: store)
-            case .activity: LogWindowView()
-            case .general: GeneralPane(store: store)
+            .padding(.horizontal, 8)
+            .padding(.top, 12)
+            .frame(width: 190)
+            .frame(maxHeight: .infinity, alignment: .top)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .frame(width: nav.sidebarVisible ? 190 : 0, alignment: .leading)
+            .clipped()
+            .opacity(nav.sidebarVisible ? 1 : 0)
+            .allowsHitTesting(nav.sidebarVisible)
+
+            Divider().opacity(nav.sidebarVisible ? 1 : 0)
+
+            NavigationStack {
+                switch nav.section {
+                case .models: ModelsPane(store: store)
+                case .remotes: RemotesView(store: store)
+                case .activity: LogWindowView()
+                case .general: GeneralPane(store: store)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(WindowActivator().frame(width: 0, height: 0))
+        // 侧栏展开时仍要给供应商页留出 260pt 列表 + 390pt 详情。
+        .frame(minWidth: 860, minHeight: 580)
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        nav.sidebarVisible.toggle()
+                    }
+                } label: {
+                    Label(nav.sidebarVisible ? "隐藏侧栏" : "显示侧栏",
+                          systemImage: "sidebar.left")
+                }
+                .help(nav.sidebarVisible ? "隐藏侧栏" : "显示侧栏")
+                .keyboardShortcut("s", modifiers: [.command, .control])
             }
         }
-        .navigationSplitViewStyle(.balanced)
-        .background(WindowActivator().frame(width: 0, height: 0))
-        .frame(minWidth: 820, minHeight: 580)
     }
+}
 
-    /// List(selection:) 要的是 Binding<SelectionValue?>，这里显式包一层
-    private var selection: Binding<SettingsSection?> {
-        Binding(
-            get: { nav.section },
-            set: { if let s = $0 { nav.section = s } }
-        )
+private struct SettingsSidebarRow: View {
+    let title: String
+    let systemImage: String
+    let section: SettingsSection
+    let selection: SettingsSection
+    let action: () -> Void
+
+    private var selected: Bool { section == selection }
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.body)
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 9)
+                .frame(height: 30)
+                .background {
+                    if selected {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.accentColor.opacity(0.16))
+                    }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 

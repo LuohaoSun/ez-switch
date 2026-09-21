@@ -42,7 +42,7 @@ struct RemotesView: View {
     @StateObject private var ui = RemotesViewDraft()
 
     var body: some View {
-        HSplitView {
+        HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("供应商").font(.headline)
@@ -62,7 +62,6 @@ struct RemotesView: View {
                             Text("\(group.remotes.count)").font(.caption).foregroundStyle(.secondary)
                         }
                         .modifier(NativeListRow())
-                        .background(SourceListScrollAppearance().frame(width: 0, height: 0))
                         .tag(group.provider)
                         .listRowSeparator(.hidden)
                     }
@@ -72,8 +71,9 @@ struct RemotesView: View {
                 .scrollIndicators(.hidden)
                 .onDeleteCommand { requestDelete() }
             }
-            .frame(minWidth: 180, idealWidth: 220, maxWidth: 320)
+            .frame(width: 260)
             .background(Color(nsColor: .windowBackgroundColor))
+            Divider()
             VStack(alignment: .leading, spacing: 0) {
                 if let group = currentGroup {
                     HStack(alignment: .top, spacing: 12) {

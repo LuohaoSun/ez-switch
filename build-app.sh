@@ -5,8 +5,8 @@
 #   ./build-app.sh --install  构建后安装到 /Applications 并重启、验证服务
 #
 # 两个关键点：
-#  1. Package.swift 里用 -Xlinker -platform_version 把 sdk 版本写成 27.0（否则 SwiftPM
-#     会写部署目标的 13.0，系统就把 app 当老 SDK app 渲染，没有新窗口外观/液态玻璃）。
+#  1. Package.swift 显式把链接 SDK 标为 27.0，同时保持 macOS 13 最低版本；否则
+#     SwiftPM 会写入 sdk 13.0，系统按老 SDK 应用渲染，新窗口外观不会生效。
 #  2. ad-hoc 签名必须重新做（改过二进制的 bundle 签名会失效，系统会拒绝启动）。
 set -euo pipefail
 
