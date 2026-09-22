@@ -4,13 +4,37 @@ import AppKit
 @MainActor
 final class GeneralDraft: ObservableObject {
     @Published var port = ""
+    @Published var harness: HarnessTarget = .codex
+}
+
+enum HarnessTarget: String, CaseIterable, Identifiable {
+    case codex
+    case claudeCode
+    case opencode
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .codex: return "Codex"
+        case .claudeCode: return "Claude Code"
+        case .opencode: return "OpenCode"
+        }
+    }
+
+    var endpointPath: String {
+        switch self {
+        case .codex, .opencode: return "/v1"
+        case .claudeCode: return ""
+        }
+    }
 }
 
 enum HarnessPrompt {
-    static func make(endpoint: String, modelIDs: [String]) -> String {
+    static func make(harness: HarnessTarget, endpoint: String, modelIDs: [String]) -> String {
         let models = modelIDs.isEmpty ? "<model-id>" : modelIDs.joined(separator: "、")
         return """
-        请帮我配置一个使用 EZ Switch 的本地模型供应商：
+        请帮我配置 \(harness.displayName) 供应商：
 
         - 端点：\(endpoint)
         - 密钥：任意占位符（例如 ez-switch-local）
@@ -38,7 +62,8 @@ struct GeneralPane: View {
 
     private var promptText: String {
         HarnessPrompt.make(
-            endpoint: store.connectionURL + "/v1",
+            harness: draft.harness,
+            endpoint: store.connectionURL + draft.harness.endpointPath,
             modelIDs: store.config.fakes.map(\.fakeModelID)
         )
     }
@@ -76,6 +101,11 @@ struct GeneralPane: View {
                     Text("请先在“模型”页添加一个本机模型 ID。")
                         .foregroundStyle(.secondary)
                 } else {
+                    Picker("Harness", selection: $draft.harness) {
+                        ForEach(HarnessTarget.allCases) { harness in
+                            Text(harness.displayName).tag(harness)
+                        }
+                    }
                     Text(promptText)
                         .font(.system(size: 12, design: .monospaced))
                         .textSelection(.enabled)
