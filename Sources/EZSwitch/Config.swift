@@ -19,9 +19,9 @@ enum EndpointKind: String, Codable, CaseIterable {
     /// harness 里填的固定 fake model id
     var defaultFakeModelID: String {
         switch self {
-        case .chat: return "router-chat"
-        case .responses: return "router-responses"
-        case .messages: return "router-claude"
+        case .chat: return "chat"
+        case .responses: return "codex"
+        case .messages: return "claude"
         }
     }
 
