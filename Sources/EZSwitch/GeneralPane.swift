@@ -40,7 +40,7 @@ enum HarnessPrompt {
         - 密钥：任意占位符（例如 ez-switch-local）
         - 模型：\(models)
 
-        请修改当前 harness 的配置文件，并在需要时说明如何重新加载或重启。
+        请修改 \(harness.displayName) 的配置文件，并在需要时说明如何重新加载或重启。
         """
     }
 }
@@ -98,6 +98,8 @@ struct GeneralPane: View {
                 Toggle("登录时启动", isOn: Binding(get: { store.loginItemEnabled }, set: { _ in store.toggleLoginItem() }))
             }
             Section("Harness 配置提示词") {
+                Text("将 EZ Switch 配置为你的 Harness 供应商：选择要接入的工具并复制提示词。")
+                    .foregroundStyle(.secondary)
                 if store.config.fakes.isEmpty {
                     Text("请先在“模型”页添加一个本机模型 ID。")
                         .foregroundStyle(.secondary)

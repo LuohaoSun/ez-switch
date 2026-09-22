@@ -1,22 +1,27 @@
-import XCTest
+import Foundation
+import Testing
 @testable import EZSwitch
 
-final class UpdateCheckerTests: XCTestCase {
-    func testVersionComparison() {
-        XCTAssertTrue(UpdateVersion.isNewer("0.1.3", than: "0.1.2"))
-        XCTAssertFalse(UpdateVersion.isNewer("0.2.0", than: "0.10.0"))
-        XCTAssertTrue(UpdateVersion.isNewer("1.0.0", than: "0.99.99"))
-        XCTAssertFalse(UpdateVersion.isNewer("0.1.2", than: "0.1.2"))
-        XCTAssertFalse(UpdateVersion.isNewer("0.1.1", than: "0.1.2"))
+@Suite("Update checker")
+struct UpdateCheckerTests {
+    @Test
+    func versionComparison() {
+        #expect(UpdateVersion.isNewer("0.1.3", than: "0.1.2"))
+        #expect(!UpdateVersion.isNewer("0.2.0", than: "0.10.0"))
+        #expect(UpdateVersion.isNewer("1.0.0", than: "0.99.99"))
+        #expect(!UpdateVersion.isNewer("0.1.2", than: "0.1.2"))
+        #expect(!UpdateVersion.isNewer("0.1.1", than: "0.1.2"))
     }
 
-    func testChecksumParser() {
+    @Test
+    func checksumParser() {
         let checksum = String(repeating: "a", count: 64)
-        XCTAssertEqual(UpdateVersion.checksum(from: "\(checksum)  dist/EZSwitch.dmg"), checksum)
-        XCTAssertNil(UpdateVersion.checksum(from: "not-a-checksum"))
+        #expect(UpdateVersion.checksum(from: "\(checksum)  dist/EZSwitch.dmg") == checksum)
+        #expect(UpdateVersion.checksum(from: "not-a-checksum") == nil)
     }
 
-    func testReleaseDecodesAndFindsAssets() throws {
+    @Test
+    func releaseDecodesAndFindsAssets() throws {
         let json = """
         {
           "tag_name": "v0.2.0",
@@ -37,8 +42,8 @@ final class UpdateCheckerTests: XCTestCase {
 
         let release = try JSONDecoder().decode(UpdateRelease.self, from: Data(json.utf8))
 
-        XCTAssertEqual(release.version, "0.2.0")
-        XCTAssertEqual(release.diskImage?.name, "EZSwitch-0.2.0.dmg")
-        XCTAssertEqual(release.checksum?.name, "EZSwitch-0.2.0.dmg.sha256")
+        #expect(release.version == "0.2.0")
+        #expect(release.diskImage?.name == "EZSwitch-0.2.0.dmg")
+        #expect(release.checksum?.name == "EZSwitch-0.2.0.dmg.sha256")
     }
 }

@@ -1,9 +1,12 @@
-import XCTest
+import Foundation
+import Testing
 @testable import EZSwitch
 
 @MainActor
-final class ConfigStoreTests: XCTestCase {
-    func testRemoveProviderRemovesAllModelsAndUnbindsRoutes() throws {
+@Suite("Config store")
+struct ConfigStoreTests {
+    @Test
+    func removeProviderRemovesAllModelsAndUnbindsRoutes() throws {
         let alphaOne = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
                                   baseURL: "https://alpha.example")
         let alphaTwo = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
@@ -29,18 +32,19 @@ final class ConfigStoreTests: XCTestCase {
         let store = ConfigStore(configURL: url)
         let unbound = store.removeProvider("Alpha")
 
-        XCTAssertEqual(unbound, ["router-chat", "router-responses"])
-        XCTAssertEqual(store.config.remotes.map(\.id), [beta.id])
-        XCTAssertNil(store.config.fakes[0].remoteID)
-        XCTAssertNil(store.config.fakes[1].remoteID)
-        XCTAssertEqual(store.config.fakes[2].remoteID, beta.id)
+        #expect(unbound == ["router-chat", "router-responses"])
+        #expect(store.config.remotes.map(\.id) == [beta.id])
+        #expect(store.config.fakes[0].remoteID == nil)
+        #expect(store.config.fakes[1].remoteID == nil)
+        #expect(store.config.fakes[2].remoteID == beta.id)
 
         let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: url))
-        XCTAssertEqual(persisted.remotes.map(\.id), [beta.id])
-        XCTAssertEqual(persisted.fakes.compactMap(\.remoteID), [beta.id])
+        #expect(persisted.remotes.map(\.id) == [beta.id])
+        #expect(persisted.fakes.compactMap(\.remoteID) == [beta.id])
     }
 
-    func testRemoveUnknownProviderIsNoOp() throws {
+    @Test
+    func removeUnknownProviderIsNoOp() throws {
         let remote = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
                                 baseURL: "https://alpha.example")
         let directory = FileManager.default.temporaryDirectory
@@ -52,13 +56,14 @@ final class ConfigStoreTests: XCTestCase {
 
         let store = ConfigStore(configURL: url)
 
-        XCTAssertEqual(store.removeProvider("Missing"), [])
-        XCTAssertEqual(store.config.remotes, [remote])
+        #expect(store.removeProvider("Missing") == [])
+        #expect(store.config.remotes == [remote])
     }
 
-    func testUpdateModelPreservesProviderConnection() throws {
+    @Test
+    func updateModelPreservesProviderConnection() throws {
         let oldRemote = makeRemote(name: "Alpha · one", model: "one", apiKey: "secret",
-                                   baseURL: "https://alpha.example/",
+                                   baseURL: "https://alpha.example",
                                    extraHeaders: ["X-Test": "yes"])
         let chat = FakeModel(id: UUID(), fakeModelID: "router-chat",
                              displayName: "router-chat", remoteID: oldRemote.id)
@@ -66,34 +71,36 @@ final class ConfigStoreTests: XCTestCase {
                                   displayName: "router-responses", remoteID: oldRemote.id)
         let store = try makeStore(remotes: [oldRemote], fakes: [chat, responses])
 
-        XCTAssertNil(store.updateModel(id: oldRemote.id, model: "two"))
+        #expect(store.updateModel(id: oldRemote.id, model: "two") == nil)
 
-        let updated = try XCTUnwrap(store.config.remotes.first)
-        XCTAssertEqual(updated.name, "Alpha · two")
-        XCTAssertEqual(updated.model, "two")
-        XCTAssertEqual(updated.apiKey, "secret")
-        XCTAssertEqual(updated.extraHeaders, ["X-Test": "yes"])
-        XCTAssertEqual(updated.apiEndpoints, oldRemote.apiEndpoints)
-        XCTAssertEqual(store.config.fakes[0].remoteID, oldRemote.id)
-        XCTAssertEqual(store.config.fakes[1].remoteID, oldRemote.id)
+        let updated = try #require(store.config.remotes.first)
+        #expect(updated.name == "Alpha · two")
+        #expect(updated.model == "two")
+        #expect(updated.apiKey == "secret")
+        #expect(updated.extraHeaders == ["X-Test": "yes"])
+        #expect(updated.apiEndpoints == oldRemote.apiEndpoints)
+        #expect(store.config.fakes[0].remoteID == oldRemote.id)
+        #expect(store.config.fakes[1].remoteID == oldRemote.id)
     }
 
-    func testAddModelCopiesUnifiedProviderConnection() throws {
+    @Test
+    func addModelCopiesUnifiedProviderConnection() throws {
         let first = makeRemote(name: "Alpha · one", model: "one", apiKey: "secret",
                                baseURL: "https://alpha.example",
                                extraHeaders: ["X-Test": "yes"])
         let store = try makeStore(remotes: [first], fakes: [])
 
-        XCTAssertNil(store.addModel(provider: "Alpha", model: "two"))
+        #expect(store.addModel(provider: "Alpha", model: "two") == nil)
 
-        let added = try XCTUnwrap(store.config.remotes.first { $0.model == "two" })
-        XCTAssertEqual(added.name, "Alpha · two")
-        XCTAssertEqual(added.apiKey, first.apiKey)
-        XCTAssertEqual(added.extraHeaders, first.extraHeaders)
-        XCTAssertEqual(added.apiEndpoints, first.apiEndpoints)
+        let added = try #require(store.config.remotes.first { $0.model == "two" })
+        #expect(added.name == "Alpha · two")
+        #expect(added.apiKey == first.apiKey)
+        #expect(added.extraHeaders == first.extraHeaders)
+        #expect(added.apiEndpoints == first.apiEndpoints)
     }
 
-    func testAddModelRejectsMixedProviderConnection() throws {
+    @Test
+    func addModelRejectsMixedProviderConnection() throws {
         let first = makeRemote(name: "Alpha · one", model: "one", apiKey: "one",
                                baseURL: "https://alpha.example")
         let second = makeRemote(name: "Alpha · two", model: "two", apiKey: "two",
@@ -102,22 +109,24 @@ final class ConfigStoreTests: XCTestCase {
 
         let error = store.addModel(provider: "Alpha", model: "three")
 
-        XCTAssertEqual(error, "该供应商的 API Key 不一致，请先在供应商设置中统一")
-        XCTAssertEqual(store.config.remotes.map(\.model), ["one", "two"])
+        #expect(error == "该供应商的 API Key 不一致，请先在供应商设置中统一")
+        #expect(store.config.remotes.map(\.model) == ["one", "two"])
     }
 
-    func testFakeRouteIsSharedAcrossAPIFormats() throws {
+    @Test
+    func fakeRouteIsSharedAcrossAPIFormats() throws {
         let remote = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
                                 baseURL: "https://alpha.example")
         let route = FakeModel(id: UUID(), fakeModelID: "router", displayName: "router",
                               remoteID: remote.id)
         let store = try makeStore(remotes: [remote], fakes: [route])
 
-        XCTAssertEqual(store.router.route(fakeModelID: "router")?.remote.id, remote.id)
-        XCTAssertEqual(store.router.route(fakeModelID: "missing")?.remote.id, nil)
+        #expect(store.router.route(fakeModelID: "router")?.remote.id == remote.id)
+        #expect(store.router.route(fakeModelID: "missing")?.remote.id == nil)
     }
 
-    func testLegacyEndpointFieldsMigrateToExplicitProtocols() throws {
+    @Test
+    func legacyEndpointFieldsMigrateToExplicitProtocols() throws {
         let remoteID = UUID()
         let fakeID = UUID()
         let json = """
@@ -144,16 +153,17 @@ final class ConfigStoreTests: XCTestCase {
 
         let config = try JSONDecoder().decode(AppConfig.self, from: Data(json.utf8))
 
-        XCTAssertEqual(config.remotes.first?.name, "Alpha · one")
-        XCTAssertEqual(config.fakes.first?.fakeModelID, "router")
-        XCTAssertTrue(config.remotes.first?.supports(.chat) == true)
-        XCTAssertTrue(config.remotes.first?.supports(.responses) == true)
-        XCTAssertFalse(config.remotes.first?.supports(.messages) == true)
-        XCTAssertEqual(config.remotes.first?.apiEndpoints.chat.baseURL, "https://alpha.example/v1")
-        XCTAssertEqual(config.remotes.first?.apiEndpoints.responses.baseURL, "https://alpha.example/v1")
+        #expect(config.remotes.first?.name == "Alpha · one")
+        #expect(config.fakes.first?.fakeModelID == "router")
+        #expect(config.remotes.first?.supports(.chat) == true)
+        #expect(config.remotes.first?.supports(.responses) == true)
+        #expect(config.remotes.first?.supports(.messages) == false)
+        #expect(config.remotes.first?.apiEndpoints.chat.baseURL == "https://alpha.example/v1")
+        #expect(config.remotes.first?.apiEndpoints.responses.baseURL == "https://alpha.example/v1")
     }
 
-    func testGLMAnthropicLegacyConfigMigratesToThreeEndpointURLs() throws {
+    @Test
+    func glmAnthropicLegacyConfigMigratesToThreeEndpointURLs() throws {
         let remoteID = UUID()
         let json = """
         {
@@ -171,40 +181,47 @@ final class ConfigStoreTests: XCTestCase {
         """
 
         let config = try JSONDecoder().decode(AppConfig.self, from: Data(json.utf8))
-        let remote = try XCTUnwrap(config.remotes.first)
+        let remote = try #require(config.remotes.first)
 
-        XCTAssertEqual(remote.apiEndpoints.chat.baseURL,
-                       "https://open.bigmodel.cn/api/coding/paas/v4")
-        XCTAssertEqual(remote.apiEndpoints.responses.baseURL,
-                       "https://open.bigmodel.cn/api/v1")
-        XCTAssertEqual(remote.apiEndpoints.messages.baseURL,
-                       "https://open.bigmodel.cn/api/anthropic")
-        XCTAssertEqual(Forwarder.upstreamURL(remote: remote, endpoint: .chat, query: "")?.absoluteString,
-                       "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions")
-        XCTAssertEqual(Forwarder.upstreamURL(remote: remote, endpoint: .responses, query: "")?.absoluteString,
-                       "https://open.bigmodel.cn/api/v1/responses")
-        XCTAssertEqual(Forwarder.upstreamURL(remote: remote, endpoint: .messages, query: "")?.absoluteString,
-                       "https://open.bigmodel.cn/api/anthropic/v1/messages")
+        #expect(remote.apiEndpoints.chat.baseURL ==
+                "https://open.bigmodel.cn/api/coding/paas/v4")
+        #expect(remote.apiEndpoints.responses.baseURL ==
+                "https://open.bigmodel.cn/api/v1")
+        #expect(remote.apiEndpoints.messages.baseURL ==
+                "https://open.bigmodel.cn/api/anthropic")
+        #expect(Forwarder.upstreamURL(remote: remote, endpoint: .chat, query: "")?.absoluteString ==
+                "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions")
+        #expect(Forwarder.upstreamURL(remote: remote, endpoint: .responses, query: "")?.absoluteString ==
+                "https://open.bigmodel.cn/api/v1/responses")
+        #expect(Forwarder.upstreamURL(remote: remote, endpoint: .messages, query: "")?.absoluteString ==
+                "https://open.bigmodel.cn/api/anthropic/v1/messages")
     }
 
-    func testNormalizeFakesMergesDuplicateModelIDs() {
+    @Test
+    func normalizeFakesMergesDuplicateModelIDs() {
         let firstRemote = UUID()
         let secondRemote = UUID()
+        let firstRemoteModel = makeRemote(id: firstRemote, name: "Alpha · one", model: "one",
+                                          apiKey: "a", baseURL: "https://alpha.example")
+        let secondRemoteModel = makeRemote(id: secondRemote, name: "Beta · one", model: "one",
+                                           apiKey: "b", baseURL: "https://beta.example")
         let first = FakeModel(id: UUID(), fakeModelID: "router", displayName: "router",
                               remoteID: firstRemote)
         let duplicate = FakeModel(id: UUID(), fakeModelID: "router", displayName: "router",
                                   remoteID: secondRemote)
 
         let (config, changed) = ConfigStore.normalizeFakes(
-            AppConfig(port: 8788, remotes: [], fakes: [first, duplicate])
+            AppConfig(port: 8788, remotes: [firstRemoteModel, secondRemoteModel],
+                      fakes: [first, duplicate])
         )
 
-        XCTAssertTrue(changed)
-        XCTAssertEqual(config.fakes.count, 1)
-        XCTAssertEqual(config.fakes.first?.remoteID, firstRemote)
+        #expect(changed)
+        #expect(config.fakes.count == 1)
+        #expect(config.fakes.first?.remoteID == firstRemote)
     }
 
-    func testNormalizeFakesPrefersResolvableRemote() {
+    @Test
+    func normalizeFakesPrefersResolvableRemote() {
         let invalidRemote = UUID()
         let validRemote = UUID()
         let invalid = FakeModel(id: UUID(), fakeModelID: "router", displayName: "router",
@@ -218,12 +235,13 @@ final class ConfigStoreTests: XCTestCase {
             AppConfig(port: 8788, remotes: [remote], fakes: [invalid, valid])
         )
 
-        XCTAssertTrue(changed)
-        XCTAssertEqual(config.fakes.count, 1)
-        XCTAssertEqual(config.fakes.first?.remoteID, validRemote)
+        #expect(changed)
+        #expect(config.fakes.count == 1)
+        #expect(config.fakes.first?.remoteID == validRemote)
     }
 
-    func testNormalizeBaseURLsOnlyTrimsTrailingSlash() {
+    @Test
+    func normalizeBaseURLsOnlyTrimsTrailingSlash() {
         let remote = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
                                 baseURL: "https://alpha.example/v1/")
 
@@ -231,13 +249,14 @@ final class ConfigStoreTests: XCTestCase {
             AppConfig(port: 8788, remotes: [remote], fakes: [])
         )
 
-        XCTAssertTrue(changed)
-        XCTAssertEqual(config.remotes.first?.apiEndpoints.chat.baseURL, "https://alpha.example/v1")
-        XCTAssertEqual(config.remotes.first?.apiEndpoints.responses.baseURL, "https://alpha.example/v1")
-        XCTAssertEqual(config.remotes.first?.apiEndpoints.messages.baseURL, "https://alpha.example/v1")
+        #expect(changed)
+        #expect(config.remotes.first?.apiEndpoints.chat.baseURL == "https://alpha.example/v1")
+        #expect(config.remotes.first?.apiEndpoints.responses.baseURL == "https://alpha.example/v1")
+        #expect(config.remotes.first?.apiEndpoints.messages.baseURL == "https://alpha.example/v1")
     }
 
-    func testEndpointSpecificBaseURLsAreUsedIndependently() {
+    @Test
+    func endpointSpecificBaseURLsAreUsedIndependently() {
         let remote = RemoteModel(
             id: UUID(), name: "Provider · model", apiKey: "a", model: "real", extraHeaders: [:],
             apiEndpoints: APIEndpointSettings(
@@ -247,38 +266,40 @@ final class ConfigStoreTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(Forwarder.upstreamURL(remote: remote, endpoint: .chat, query: "")?.absoluteString,
-                       "https://chat.example/v1/chat/completions")
-        XCTAssertEqual(Forwarder.upstreamURL(remote: remote, endpoint: .responses, query: "x=1")?.absoluteString,
-                       "https://responses.example/responses?x=1")
-        XCTAssertNil(Forwarder.upstreamURL(remote: remote, endpoint: .messages, query: ""))
+        #expect(Forwarder.upstreamURL(remote: remote, endpoint: .chat, query: "")?.absoluteString ==
+                "https://chat.example/v1/chat/completions")
+        #expect(Forwarder.upstreamURL(remote: remote, endpoint: .responses, query: "x=1")?.absoluteString ==
+                "https://responses.example/responses?x=1")
+        #expect(Forwarder.upstreamURL(remote: remote, endpoint: .messages, query: "") == nil)
     }
 
-    func testEndpointSettingsRequireOneEnabledValidURL() {
+    @Test
+    func endpointSettingsRequireOneEnabledValidURL() {
         let none = APIEndpointSettings(chat: .disabled, responses: .disabled, messages: .disabled)
         let missingURL = APIEndpointSettings(
             chat: EndpointSetting(enabled: true, baseURL: ""),
             responses: .disabled, messages: .disabled)
         let valid = APIEndpointSettings.enabled([.responses], baseURL: "https://example.com")
 
-        XCTAssertEqual(ConfigStore.validateEndpoints(none), "至少启用一种接口协议")
-        XCTAssertEqual(ConfigStore.validateEndpoints(missingURL), "Chat Completions 已启用，请填写 Base URL")
-        XCTAssertNil(ConfigStore.validateEndpoints(valid))
+        #expect(ConfigStore.validateEndpoints(none) == "至少启用一种接口协议")
+        #expect(ConfigStore.validateEndpoints(missingURL) == "Chat Completions 已启用，请填写 Base URL")
+        #expect(ConfigStore.validateEndpoints(valid) == nil)
     }
 
-    func testExampleUsesOfficialProviderDefaults() {
+    @Test
+    func exampleUsesOfficialProviderDefaults() {
         let config = AppConfig.example()
 
-        XCTAssertEqual(config.remotes.map(\.name), [
+        #expect(config.remotes.map(\.name) == [
             "DeepSeek官方 · deepseek-chat",
             "OpenAI官方 · gpt-5.2"
         ])
-        XCTAssertEqual(config.remotes[0].apiEndpoints,
-                       .enabled([.chat], baseURL: "https://api.deepseek.com/v1"))
-        XCTAssertEqual(config.remotes[1].apiEndpoints,
-                       .enabled([.chat, .responses], baseURL: "https://api.openai.com/v1"))
-        XCTAssertEqual(config.fakes.map(\.fakeModelID), ["main"])
-        XCTAssertEqual(config.fakes[0].remoteID, config.remotes[1].id)
+        #expect(config.remotes[0].apiEndpoints ==
+                .enabled([.chat], baseURL: "https://api.deepseek.com/v1"))
+        #expect(config.remotes[1].apiEndpoints ==
+                .enabled([.chat, .responses], baseURL: "https://api.openai.com/v1"))
+        #expect(config.fakes.map(\.fakeModelID) == ["main"])
+        #expect(config.fakes[0].remoteID == config.remotes[1].id)
     }
 
     private func makeStore(remotes: [RemoteModel], fakes: [FakeModel]) throws -> ConfigStore {
