@@ -280,30 +280,23 @@ struct RemoteGroup: Identifiable {
 
 extension AppConfig {
     static func example() -> AppConfig {
-        let chat = RemoteModel(id: UUID(), name: "GPT-5.2 (OpenAI)",
-                               apiKey: "sk-REPLACE-ME", model: "gpt-5.2", extraHeaders: [:],
-                               apiEndpoints: APIEndpointSettings(
-                                   chat: EndpointSetting(enabled: true, baseURL: "https://api.openai.com/v1"),
-                                   responses: EndpointSetting(enabled: true, baseURL: "https://api.openai.com/v1"),
-                                   messages: .disabled))
-        let chatRelay = RemoteModel(id: UUID(), name: "DeepSeek (中转站)",
-                                    apiKey: "sk-REPLACE-ME", model: "deepseek-chat", extraHeaders: [:],
-                                    apiEndpoints: .enabled([.chat], baseURL: "https://api.deepseek.com/v1"))
-        let codex = RemoteModel(id: UUID(), name: "GPT-5.2 Codex (OpenAI)",
-                                apiKey: "sk-REPLACE-ME", model: "gpt-5.2-codex", extraHeaders: [:],
-                                apiEndpoints: .enabled([.responses], baseURL: "https://api.openai.com/v1"))
-        let claude = RemoteModel(id: UUID(), name: "Sonnet (Anthropic)",
-                                 apiKey: "sk-REPLACE-ME", model: "claude-sonnet-4-5", extraHeaders: [:],
-                                 apiEndpoints: .enabled([.messages], baseURL: "https://api.anthropic.com"))
-        let remotes = [chat, chatRelay, codex, claude]
+        let deepSeek = RemoteModel(
+            id: UUID(), name: "DeepSeek官方 · deepseek-chat",
+            apiKey: "sk-REPLACE-ME", model: "deepseek-chat", extraHeaders: [:],
+            apiEndpoints: .enabled([.chat], baseURL: "https://api.deepseek.com/v1")
+        )
+        let openAI = RemoteModel(
+            id: UUID(), name: "OpenAI官方 · gpt-5.2",
+            apiKey: "sk-REPLACE-ME", model: "gpt-5.2", extraHeaders: [:],
+            apiEndpoints: .enabled([.chat, .responses], baseURL: "https://api.openai.com/v1")
+        )
+        let remotes = [deepSeek, openAI]
 
         let fakes = [
             FakeModel(id: UUID(), fakeModelID: EndpointKind.chat.defaultFakeModelID,
-                      displayName: EndpointKind.chat.defaultFakeModelID, remoteID: chat.id),
+                      displayName: EndpointKind.chat.defaultFakeModelID, remoteID: deepSeek.id),
             FakeModel(id: UUID(), fakeModelID: EndpointKind.responses.defaultFakeModelID,
-                      displayName: EndpointKind.responses.defaultFakeModelID, remoteID: codex.id),
-            FakeModel(id: UUID(), fakeModelID: EndpointKind.messages.defaultFakeModelID,
-                      displayName: EndpointKind.messages.defaultFakeModelID, remoteID: claude.id),
+                      displayName: EndpointKind.responses.defaultFakeModelID, remoteID: openAI.id),
         ]
         return AppConfig(port: 8788, remotes: remotes, fakes: fakes)
     }

@@ -266,6 +266,22 @@ final class ConfigStoreTests: XCTestCase {
         XCTAssertNil(ConfigStore.validateEndpoints(valid))
     }
 
+    func testExampleUsesOfficialProviderDefaults() {
+        let config = AppConfig.example()
+
+        XCTAssertEqual(config.remotes.map(\.name), [
+            "DeepSeek官方 · deepseek-chat",
+            "OpenAI官方 · gpt-5.2"
+        ])
+        XCTAssertEqual(config.remotes[0].apiEndpoints,
+                       .enabled([.chat], baseURL: "https://api.deepseek.com/v1"))
+        XCTAssertEqual(config.remotes[1].apiEndpoints,
+                       .enabled([.chat, .responses], baseURL: "https://api.openai.com/v1"))
+        XCTAssertEqual(config.fakes.map(\.fakeModelID), ["router-chat", "router-responses"])
+        XCTAssertEqual(config.fakes[0].remoteID, config.remotes[0].id)
+        XCTAssertEqual(config.fakes[1].remoteID, config.remotes[1].id)
+    }
+
     private func makeStore(remotes: [RemoteModel], fakes: [FakeModel]) throws -> ConfigStore {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("EZSwitchTests-\(UUID().uuidString)", isDirectory: true)

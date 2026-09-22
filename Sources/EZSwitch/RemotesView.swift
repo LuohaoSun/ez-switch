@@ -396,7 +396,7 @@ struct RemoteEditSheet: View {
             Form {
                 Section("供应商") {
                     if managesConnection {
-                        TextField("名称", text: $draft.providerName, prompt: Text(verbatim: "Krill"))
+                        TextField("名称", text: $draft.providerName)
                     } else {
                         Text(draft.providerName)
                             .textSelection(.enabled)
