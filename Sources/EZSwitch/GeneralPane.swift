@@ -48,6 +48,7 @@ enum HarnessPrompt {
 struct GeneralPane: View {
     @ObservedObject var store: ConfigStore
     @StateObject private var draft = GeneralDraft()
+    @StateObject private var updater = UpdateChecker()
 
     private var validPort: Int? {
         guard let port = Int(draft.port), (1...65535).contains(port) else { return nil }
@@ -125,6 +126,7 @@ struct GeneralPane: View {
                     Spacer()
                     Text(appVersion).foregroundStyle(.secondary)
                 }
+                updateContent
             }
             Section("配置文件") {
                 Text(store.configURL.path).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -142,5 +144,64 @@ struct GeneralPane: View {
     private func savePort() {
         guard let port = validPort, port != store.config.port else { return }
         store.setPort(port)
+    }
+
+    @ViewBuilder
+    private var updateContent: some View {
+        switch updater.state {
+        case .idle:
+            Button {
+                Task { await updater.check() }
+            } label: {
+                Label("检查更新", systemImage: "arrow.clockwise")
+            }
+        case .checking:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("正在检查更新…")
+            }
+        case .upToDate:
+            Label("当前已是最新版本", systemImage: "checkmark.circle")
+                .foregroundStyle(.secondary)
+            Button("再次检查") { Task { await updater.check() } }
+        case .available(let release):
+            VStack(alignment: .leading, spacing: 10) {
+                Label("发现新版本 \(release.version)", systemImage: "arrow.down.circle")
+                    .font(.headline)
+                if let body = release.body, !body.isEmpty {
+                    ScrollView {
+                        Text(body)
+                            .font(.caption)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 140)
+                }
+                HStack {
+                    Link("查看 Release", destination: release.htmlURL)
+                    Button {
+                        Task { await updater.downloadAndOpen(release) }
+                    } label: {
+                        Label("下载并打开 DMG", systemImage: "arrow.down.doc")
+                    }
+                }
+            }
+        case .downloading:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("正在下载 DMG…")
+            }
+        case .verifying:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("正在校验 SHA-256…")
+            }
+        case .ready(let fileName):
+            Label("已打开 \(fileName)，请拖入 Applications 完成更新。", systemImage: "checkmark.circle")
+                .foregroundStyle(.secondary)
+        case .failed(let message):
+            Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            Button("重新检查") { Task { await updater.check() } }
+        }
     }
 }
