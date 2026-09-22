@@ -88,6 +88,8 @@ claude
 
 ## 切换模型
 
+![EZ Switch 菜单栏菜单](Resources/MenuBar.png)
+
 点击菜单栏中的 EZ Switch 图标，选择某个本机模型 ID 对应的供应商模型即可。切换立即写盘并生效；正在运行的请求不会被中断。
 
 ## 支持的接口
