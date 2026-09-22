@@ -15,6 +15,12 @@ struct GeneralPane: View {
         return port
     }
 
+    private var appVersion: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
+        return "\(short) (\(build))"
+    }
+
     var body: some View {
         Form {
             Section("本地服务") {
@@ -42,6 +48,13 @@ struct GeneralPane: View {
             }
             Section("启动") {
                 Toggle("登录时启动", isOn: Binding(get: { store.loginItemEnabled }, set: { _ in store.toggleLoginItem() }))
+            }
+            Section("应用") {
+                HStack {
+                    Text("版本")
+                    Spacer()
+                    Text(appVersion).foregroundStyle(.secondary)
+                }
             }
             Section("配置文件") {
                 Text(store.configURL.path).font(.system(.caption, design: .monospaced)).textSelection(.enabled)

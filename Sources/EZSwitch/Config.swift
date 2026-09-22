@@ -584,7 +584,7 @@ final class ConfigStore: ObservableObject {
         config.fakes[idx].remoteID = remoteID
         router.update(config)
         save()
-        Log.shared.log("route: \(fake.fakeModelID) → \(name)")
+        Log.shared.log("route switch: \(fake.fakeModelID) -> \(name)")
     }
 
     /// 新增一个路由；fakeModelID 全局唯一，为空或重复则拒绝。

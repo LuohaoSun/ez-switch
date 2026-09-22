@@ -26,7 +26,7 @@ final class LogModel: ObservableObject {
     var lines: [String] {
         text.components(separatedBy: .newlines).filter {
             !$0.isEmpty && (query.isEmpty || $0.localizedCaseInsensitiveContains(query))
-        }
+        }.reversed()
     }
 }
 
@@ -51,6 +51,7 @@ struct LogWindowView: View {
                            detail: model.query.isEmpty ? "服务启动和请求记录会显示在这里。" : "尝试搜索模型 ID、状态码或错误信息。", symbol: "waveform.path.ecg")
                 Spacer()
             } else {
+                // 最新日志固定在顶部，切换路由后不需要再滚到长列表底部确认。
                 List(Array(model.lines.enumerated()), id: \.offset) { entry in
                     Text(entry.element)
                         .font(.system(size: 12, design: .monospaced))

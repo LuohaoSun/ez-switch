@@ -33,7 +33,7 @@ EZ Switch 是 macOS 原生菜单栏应用，后端只依赖 `swift-nio`。服务
 
 ### 下载安装包
 
-从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载 `EZSwitch-0.1.0.dmg`，打开磁盘映像后，将 `EZ Switch.app` 拖入
+从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载 `EZSwitch-0.1.1.dmg`，打开磁盘映像后，将 `EZ Switch.app` 拖入
 `Applications` 文件夹即可完成安装。当前发布包支持 macOS 13 及以上版本。
 
 > 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。如果首次启动被 macOS 阻止，

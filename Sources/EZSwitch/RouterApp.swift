@@ -19,7 +19,6 @@ struct RouterApp: App {
 
     init() {
         NSApplication.shared.setActivationPolicy(.accessory)   // 不占 Dock
-        AppMainMenu.shared.install()                          // accessory app 也需要自己的主菜单
         ConfigStore.shared.startServer()                      // 幂等；菜单没点开前就开始服务
     }
 
@@ -40,138 +39,21 @@ struct RouterApp: App {
             LogWindowView()
         }
         .defaultSize(width: 560, height: 420)
-    }
-}
-
-/// LSUIElement app 默认没有主菜单。安装一份标准 AppKit 菜单，并在 SwiftUI 完成启动、
-/// app 被激活时重新确认，避免窗口成为 key window 后菜单栏仍归上一个 app。
-@MainActor
-private final class AppMainMenu: NSObject {
-    static let shared = AppMainMenu()
-
-    private var observingActivation = false
-
-    private override init() {
-        super.init()
-    }
-
-    func install() {
-        let appName = AppBrand.name
-        let mainMenu = NSMenu(title: "MainMenu")
-
-        let appMenuItem = NSMenuItem()
-        mainMenu.addItem(appMenuItem)
-        let appMenu = NSMenu(title: appName)
-        appMenuItem.submenu = appMenu
-
-        addItem(to: appMenu, title: "关于 \(appName)",
-                action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)))
-        appMenu.addItem(.separator())
-
-        let servicesItem = NSMenuItem(title: "服务", action: nil, keyEquivalent: "")
-        let servicesMenu = NSMenu(title: "服务")
-        servicesItem.submenu = servicesMenu
-        appMenu.addItem(servicesItem)
-        NSApplication.shared.servicesMenu = servicesMenu
-
-        appMenu.addItem(.separator())
-        addItem(to: appMenu, title: "隐藏 \(appName)",
-                action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        addItem(to: appMenu, title: "隐藏其他应用",
-                action: #selector(NSApplication.hideOtherApplications(_:)),
-                keyEquivalent: "h", modifiers: [.command, .option])
-        addItem(to: appMenu, title: "全部显示",
-                action: #selector(NSApplication.unhideAllApplications(_:)))
-        appMenu.addItem(.separator())
-        addItem(to: appMenu, title: "退出 \(appName)",
-                action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-
-        let fileMenuItem = NSMenuItem()
-        mainMenu.addItem(fileMenuItem)
-        let fileMenu = NSMenu(title: "文件")
-        fileMenuItem.submenu = fileMenu
-        addItem(to: fileMenu, title: "关闭窗口",
-                action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-
-        let editMenuItem = NSMenuItem()
-        mainMenu.addItem(editMenuItem)
-        let editMenu = NSMenu(title: "编辑")
-        editMenuItem.submenu = editMenu
-        addItem(to: editMenu, title: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
-        addItem(to: editMenu, title: "重做", action: Selector(("redo:")),
-                keyEquivalent: "z", modifiers: [.command, .shift])
-        editMenu.addItem(.separator())
-        addItem(to: editMenu, title: "剪切",
-                action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        addItem(to: editMenu, title: "复制",
-                action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        addItem(to: editMenu, title: "粘贴",
-                action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        addItem(to: editMenu, title: "全选",
-                action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-
-        let windowMenuItem = NSMenuItem()
-        mainMenu.addItem(windowMenuItem)
-        let windowMenu = NSMenu(title: "窗口")
-        windowMenuItem.submenu = windowMenu
-        addItem(to: windowMenu, title: "最小化",
-                action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        addItem(to: windowMenu, title: "缩放", action: #selector(NSWindow.performZoom(_:)))
-        windowMenu.addItem(.separator())
-        addItem(to: windowMenu, title: "前置全部窗口",
-                action: #selector(NSApplication.arrangeInFront(_:)))
-        NSApplication.shared.windowsMenu = windowMenu
-
-        let helpMenuItem = NSMenuItem()
-        mainMenu.addItem(helpMenuItem)
-        let helpMenu = NSMenu(title: "帮助")
-        helpMenuItem.submenu = helpMenu
-        addItem(to: helpMenu, title: "\(appName) 帮助",
-                action: #selector(showHelp(_:)), target: self)
-        NSApplication.shared.helpMenu = helpMenu
-
-        NSApplication.shared.mainMenu = mainMenu
-        startObservingActivationIfNeeded()
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("关于 \(AppBrand.name)") {
+                    NSApplication.shared.orderFrontStandardAboutPanel(nil)
+                }
+            }
+            CommandGroup(replacing: .help) {
+                Button("\(AppBrand.name) 帮助") {
+                    showHelp()
+                }
+            }
+        }
     }
 
-    @discardableResult
-    private func addItem(to menu: NSMenu, title: String, action: Selector?,
-                         keyEquivalent: String = "",
-                         modifiers: NSEvent.ModifierFlags = [.command],
-                         target: AnyObject? = nil) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
-        item.keyEquivalentModifierMask = keyEquivalent.isEmpty ? [] : modifiers
-        item.target = target
-        menu.addItem(item)
-        return item
-    }
-
-    private func startObservingActivationIfNeeded() {
-        guard !observingActivation else { return }
-        observingActivation = true
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(applicationDidFinishLaunching(_:)),
-            name: NSApplication.didFinishLaunchingNotification,
-            object: NSApplication.shared
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(applicationDidBecomeActive(_:)),
-            name: NSApplication.didBecomeActiveNotification,
-            object: NSApplication.shared
-        )
-    }
-
-    @objc private func applicationDidFinishLaunching(_ notification: Notification) {
-        install()
-    }
-
-    @objc private func applicationDidBecomeActive(_ notification: Notification) {
-        install()
-    }
-
-    @objc private func showHelp(_ sender: Any?) {
+    private func showHelp() {
         NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = AppBrand.name
