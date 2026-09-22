@@ -39,21 +39,20 @@ http://127.0.0.1:8788
 
 ### 2. 配置路由
 
-首次启动会预置两条本机路由，模型 ID 分别对应用途：
+首次启动会预置一个固定的本机模型 ID：
 
 ```text
-chat   OpenAI Chat Completions
-codex  OpenAI Responses / Codex
+main
 ```
 
-把它们绑定到需要的供应商模型。工具请求这些 ID 时，EZ Switch 会转发到当前绑定的上游模型。需要 Claude Code 时，再添加一个例如 `claude` 的本机模型 ID。
+`main` 会绑定到需要的供应商模型。Codex、OpenAI-compatible 工具和 Claude Code 都使用这个 ID；切换 `main` 的上游目标后，所有工具立即使用新目标。
 
 ### 3. 接入工具
 
 Codex 示例配置：
 
 ```toml
-model = "codex"
+model = "main"
 model_provider = "ezswitch"
 
 [model_providers.ezswitch]
@@ -75,7 +74,7 @@ codex
 ```text
 base_url = http://127.0.0.1:8788/v1
 api_key  = any-local-placeholder
-model    = chat
+model    = main
 ```
 
 Claude Code 可设置：
@@ -83,7 +82,7 @@ Claude Code 可设置：
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 export ANTHROPIC_AUTH_TOKEN=any-local-placeholder
-export ANTHROPIC_MODEL=claude
+export ANTHROPIC_MODEL=main
 claude
 ```
 

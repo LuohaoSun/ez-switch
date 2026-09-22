@@ -16,15 +16,6 @@ enum EndpointKind: String, Codable, CaseIterable {
         }
     }
 
-    /// harness 里填的固定 fake model id
-    var defaultFakeModelID: String {
-        switch self {
-        case .chat: return "chat"
-        case .responses: return "codex"
-        case .messages: return "claude"
-        }
-    }
-
     /// Base URL 之外的协议相对路径（纯反向代理，不做协议转换）。
     /// 例如 OpenAI 填 `https://api.openai.com/v1`，最终请求 `/v1/chat/completions`；
     /// GLM Coding Plan 填 `https://open.bigmodel.cn/api/coding/paas/v4`，最终请求
@@ -293,10 +284,8 @@ extension AppConfig {
         let remotes = [deepSeek, openAI]
 
         let fakes = [
-            FakeModel(id: UUID(), fakeModelID: EndpointKind.chat.defaultFakeModelID,
-                      displayName: EndpointKind.chat.defaultFakeModelID, remoteID: deepSeek.id),
-            FakeModel(id: UUID(), fakeModelID: EndpointKind.responses.defaultFakeModelID,
-                      displayName: EndpointKind.responses.defaultFakeModelID, remoteID: openAI.id),
+            FakeModel(id: UUID(), fakeModelID: "main",
+                      displayName: "main", remoteID: openAI.id),
         ]
         return AppConfig(port: 8788, remotes: remotes, fakes: fakes)
     }

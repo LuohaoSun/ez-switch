@@ -277,9 +277,8 @@ final class ConfigStoreTests: XCTestCase {
                        .enabled([.chat], baseURL: "https://api.deepseek.com/v1"))
         XCTAssertEqual(config.remotes[1].apiEndpoints,
                        .enabled([.chat, .responses], baseURL: "https://api.openai.com/v1"))
-        XCTAssertEqual(config.fakes.map(\.fakeModelID), ["chat", "codex"])
-        XCTAssertEqual(config.fakes[0].remoteID, config.remotes[0].id)
-        XCTAssertEqual(config.fakes[1].remoteID, config.remotes[1].id)
+        XCTAssertEqual(config.fakes.map(\.fakeModelID), ["main"])
+        XCTAssertEqual(config.fakes[0].remoteID, config.remotes[1].id)
     }
 
     private func makeStore(remotes: [RemoteModel], fakes: [FakeModel]) throws -> ConfigStore {
