@@ -1,24 +1,61 @@
 import SwiftUI
 import AppKit
 
-/// 启动参数。`--open-settings`：启动即打开设置窗。
-/// 用静态标记防重复：menuBarExtraStyle(.menu) 的内容视图和 label 都可能各自 onAppear 一次。
-enum LaunchFlag {
-    static var openSettingsHandled = false
-}
-
 private enum AppBrand {
     static var name: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "EZ Switch"
     }
 }
 
+@MainActor
+private final class AppWindowManager {
+    static let shared = AppWindowManager()
+
+    private var settingsWindow: NSWindow?
+
+    func showSettings(store: ConfigStore) {
+        if let settingsWindow {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            settingsWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let hosting = NSHostingController(rootView: SettingsView(store: store))
+        let window = NSWindow(contentViewController: hosting)
+        window.title = AppBrand.name
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 980, height: 680))
+        window.minSize = NSSize(width: 860, height: 580)
+        window.isReleasedWhenClosed = false
+        window.center()
+        settingsWindow = window
+
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+}
+
+@MainActor
+private final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppWindowManager.shared.showSettings(store: ConfigStore.shared)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        AppWindowManager.shared.showSettings(store: ConfigStore.shared)
+        return true
+    }
+}
+
 @main
 struct RouterApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = ConfigStore.shared
 
     init() {
-        NSApplication.shared.setActivationPolicy(.accessory)   // 不占 Dock
+        NSApplication.shared.setActivationPolicy(.regular)    // 启动即显示设置窗口
         ConfigStore.shared.startServer()                      // 幂等；菜单没点开前就开始服务
     }
 
@@ -29,11 +66,6 @@ struct RouterApp: App {
             MenuBarLabel(store: store)
         }
         .menuBarExtraStyle(.menu)
-
-        Window(AppBrand.name, id: "settings") {
-            SettingsView(store: store)
-        }
-        .defaultSize(width: 980, height: 680)
 
         Window("日志", id: "logs") {
             LogWindowView()
@@ -63,45 +95,30 @@ struct RouterApp: App {
     }
 }
 
-/// 菜单栏图标（点开前就会实例化，所以 --open-settings 也挂这里）
+/// 菜单栏图标
 private struct MenuBarLabel: View {
     @ObservedObject var store: ConfigStore
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Image(systemName: store.serverError != nil ? "exclamationmark.triangle" : store.runningPort == nil ? "network.slash" : "arrow.triangle.branch")
             .accessibilityLabel(store.serviceTitle)
-            .onAppear { handleLaunchFlags(openWindow) }
     }
 }
 
-/// 菜单内容容器：首帧兜底起服务 + 处理启动参数
+/// 菜单内容容器：首帧兜底起服务
 private struct MenuBarContent: View {
     @ObservedObject var store: ConfigStore
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         MenuView(store: store)
             .onAppear {
                 store.startServer()
-                handleLaunchFlags(openWindow)
             }
     }
 }
 
-/// `--open-settings` 只生效一次（label 和内容视图可能各触发一遍）
-@MainActor
-private func handleLaunchFlags(_ openWindow: OpenWindowAction) {
-    guard CommandLine.arguments.contains("--open-settings") else { return }
-    guard !LaunchFlag.openSettingsHandled else { return }
-    LaunchFlag.openSettingsHandled = true
-    openWindow(id: "settings")
-    NSApp.activate(ignoringOtherApps: true)
-}
-
 struct MenuView: View {
     @ObservedObject var store: ConfigStore
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         if let err = store.serverError {
@@ -139,8 +156,7 @@ struct MenuView: View {
         Divider()
 
         Button("设置…") {
-            openWindow(id: "settings")
-            NSApp.activate(ignoringOtherApps: true)   // accessory app 不开窗就抢不到焦点
+            AppWindowManager.shared.showSettings(store: store)
         }
 
         Divider()
