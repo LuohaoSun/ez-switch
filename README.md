@@ -14,7 +14,7 @@ EZ Switch 在本机提供 OpenAI / Anthropic 兼容接口。Codex、Claude Code�
 
 从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZ Switch.app` 拖入 `Applications` 文件夹。要求 macOS 13 或以上。
 
-> 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。首次启动如被阻止，请在 Finder 中右键应用并选择“打开”，或在“系统设置 → 隐私与安全性”中允许。
+> 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。首次启动如被 macOS 阻止，请前往 `系统设置 → 隐私与安全性`，在安全提示中点击 **“仍要打开”**，然后再次确认打开应用。
 
 ## 使用
 
@@ -25,6 +25,8 @@ EZ Switch 在本机提供 OpenAI / Anthropic 兼容接口。Codex、Claude Code�
 ```text
 http://127.0.0.1:8788
 ```
+
+“通用”页可以检查应用更新；发现新版本后会下载 DMG、校验 SHA-256 并打开安装。
 
 ### 1. 配置供应商
 
@@ -39,20 +41,20 @@ http://127.0.0.1:8788
 
 ### 2. 配置路由
 
-在“模型”页创建本机模型 ID，例如：
+首次启动会预置一个固定的本机模型 ID：
 
 ```text
-router-responses
+main
 ```
 
-把它绑定到某个供应商模型。工具请求这个 ID 时，EZ Switch 会把请求转发给当前绑定的上游模型。
+`main` 会绑定到需要的供应商模型。Codex、OpenAI-compatible 工具和 Claude Code 都使用这个 ID；切换 `main` 的上游目标后，所有工具立即使用新目标。
 
 ### 3. 接入工具
 
 Codex 示例配置：
 
 ```toml
-model = "router-responses"
+model = "main"
 model_provider = "ezswitch"
 
 [model_providers.ezswitch]
@@ -74,7 +76,7 @@ codex
 ```text
 base_url = http://127.0.0.1:8788/v1
 api_key  = any-local-placeholder
-model    = router-chat
+model    = main
 ```
 
 Claude Code 可设置：
@@ -82,11 +84,13 @@ Claude Code 可设置：
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 export ANTHROPIC_AUTH_TOKEN=any-local-placeholder
-export ANTHROPIC_MODEL=router-claude
+export ANTHROPIC_MODEL=main
 claude
 ```
 
 ## 切换模型
+
+![EZ Switch 菜单栏菜单](Resources/MenuBar.png)
 
 点击菜单栏中的 EZ Switch 图标，选择某个本机模型 ID 对应的供应商模型即可。切换立即写盘并生效；正在运行的请求不会被中断。
 

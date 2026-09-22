@@ -1,8 +1,10 @@
-import XCTest
+import Foundation
+import Testing
 @testable import EZSwitch
 
 /// SSEReorderer 的行为测试：把交错输出项的流收拢成 Codex 能正确跟踪的顺序。
-final class SSEReorderTests: XCTestCase {
+@Suite("SSE reorder")
+struct SSEReorderTests {
 
     // MARK: helpers
 
@@ -55,7 +57,8 @@ final class SSEReorderTests: XCTestCase {
             + sse("response.completed", index: nil, itemId: nil)
     }
 
-    func testInterleavedBlocksAreCollapsed() {
+    @Test
+    func interleavedBlocksAreCollapsed() {
         let (events, reorderer) = run(interleavedStream())
         let expected = [
             "response.created",
@@ -72,31 +75,33 @@ final class SSEReorderTests: XCTestCase {
             "response.output_item.done",       // idx=1 收尾
             "response.completed",
         ]
-        XCTAssertEqual(events, expected, "交错事件应按输出项收拢为原子块")
-        XCTAssertEqual(reorderer.pendingCount, 0, "流结束后不应还有扣住的事件")
+        #expect(events == expected, "交错事件应按输出项收拢为原子块")
+        #expect(reorderer.pendingCount == 0, "流结束后不应还有扣住的事件")
     }
 
     /// 关键断言：文本增量必须落在它所属项的 added 之后、done 之前，
     /// 否则 Codex 会报 "OutputTextDelta without active item" 并丢字。
-    func testTextDeltaSitsInsideItsItemBlock() throws {
+    @Test
+    func textDeltaSitsInsideItsItemBlock() throws {
         let (events, _) = run(interleavedStream())
         // 第一个 output_item.done（idx=0 推理项）必须早于 message 的开场
-        let done0 = try XCTUnwrap(events.firstIndex(of: "response.output_item.done"))
-        let added1 = try XCTUnwrap(events.firstIndex(of: "response.output_item.added", after: done0 + 1))
-        let delta = try XCTUnwrap(events.firstIndex(of: "response.output_text.delta"))
-        let done1 = try XCTUnwrap(events.lastIndex(of: "response.output_item.done"))
-        XCTAssertLessThan(done0, added1, "前一项必须先收尾，后一项才开场")
-        XCTAssertLessThan(added1, delta, "idx=1 的 added 必须先于它的 delta")
-        XCTAssertLessThan(delta, done1, "delta 必须落在自身项的收尾之前")
+        let done0 = try #require(events.firstIndex(of: "response.output_item.done"))
+        let added1 = try #require(events.firstIndex(of: "response.output_item.added", after: done0 + 1))
+        let delta = try #require(events.firstIndex(of: "response.output_text.delta"))
+        let done1 = try #require(events.lastIndex(of: "response.output_item.done"))
+        try #require(done0 < added1, "前一项必须先收尾，后一项才开场")
+        try #require(added1 < delta, "idx=1 的 added 必须先于它的 delta")
+        try #require(delta < done1, "delta 必须落在自身项的收尾之前")
         // 该项区间内不应夹带前一项的收尾事件（交错的特征）
         let slice = Array(events[added1...done1])
-        XCTAssertEqual(slice.filter { $0 == "response.reasoning.done" }.count, 0,
-                       "message 块内不应再出现推理项的收尾事件")
+        #expect(slice.filter { $0 == "response.reasoning.done" }.count == 0,
+                "message 块内不应再出现推理项的收尾事件")
     }
 
     // MARK: 规范流应当是恒等变换
 
-    func testWellFormedStreamIsUnchanged() {
+    @Test
+    func wellFormedStreamIsUnchanged() {
         let stream = sse("response.created", index: nil, itemId: nil)
             + sse("response.output_item.added", index: 0, itemId: "msg_1", extra: "\"item\":{\"type\":\"message\"}")
             + sse("response.content_part.added", index: 0, itemId: "msg_1")
@@ -107,7 +112,7 @@ final class SSEReorderTests: XCTestCase {
             + sse("response.output_item.done", index: 0, itemId: "msg_1", extra: "\"item\":{\"type\":\"message\"}")
             + sse("response.completed", index: nil, itemId: nil)
         let (events, reorderer) = run(stream)
-        XCTAssertEqual(events, [
+        #expect(events == [
             "response.created",
             "response.output_item.added",
             "response.content_part.added",
@@ -118,32 +123,35 @@ final class SSEReorderTests: XCTestCase {
             "response.output_item.done",
             "response.completed",
         ])
-        XCTAssertEqual(reorderer.pendingCount, 0)
+        #expect(reorderer.pendingCount == 0)
     }
 
     /// 字节被任意切分（真实网络行为）不应影响结果
-    func testChunkBoundariesDoNotMatter() {
+    @Test
+    func chunkBoundariesDoNotMatter() {
         let whole = run(interleavedStream(), chunkSize: 1_000_000).events
         for size in [1, 3, 7, 64] {
-            XCTAssertEqual(run(interleavedStream(), chunkSize: size).events, whole,
-                           "按 \(size) 字节切分时结果应与整块一致")
+            #expect(run(interleavedStream(), chunkSize: size).events == whole,
+                    "按 \(size) 字节切分时结果应与整块一致")
         }
     }
 
     // MARK: 异常流兜底
 
-    func testUnclosedItemIsReleasedAtFinish() {
+    @Test
+    func unclosedItemIsReleasedAtFinish() {
         let stream = sse("response.output_item.added", index: 0, itemId: "msg_1", extra: "\"item\":{\"type\":\"message\"}")
             + sse("response.output_text.delta", index: 0, itemId: "msg_1", extra: "\"delta\":\"甲\"")
         let (events, reorderer) = run(stream)   // 上游没发 done 就断了
-        XCTAssertEqual(events, ["response.output_item.added", "response.output_text.delta"],
-                       "不完整流也不能吞事件")
-        XCTAssertEqual(reorderer.stats.releasedAtFinish, 2)
+        #expect(events == ["response.output_item.added", "response.output_text.delta"],
+                "不完整流也不能吞事件")
+        #expect(reorderer.stats.releasedAtFinish == 2)
     }
 
     // MARK: 三个输出项（推理 + 文本 + 工具调用）
 
-    func testThreeItemsWithToolCallStayOrdered() {
+    @Test
+    func threeItemsWithToolCallStayOrdered() {
         let stream = sse("response.output_item.added", index: 0, itemId: "rs_1", extra: "\"item\":{\"type\":\"reasoning\"}")
             + sse("response.reasoning.delta", index: 0, itemId: "rs_1", extra: "\"delta\":\"想\"")
             + sse("response.output_item.added", index: 1, itemId: "msg_1", extra: "\"item\":{\"type\":\"message\"}")
@@ -157,7 +165,7 @@ final class SSEReorderTests: XCTestCase {
             + sse("response.output_item.done", index: 2, itemId: "fc_1", extra: "\"item\":{\"type\":\"function_call\"}")
             + sse("response.completed", index: nil, itemId: nil)
         let (events, reorderer) = run(stream)
-        XCTAssertEqual(events, [
+        #expect(events == [
             "response.output_item.added",             // reasoning
             "response.reasoning.delta",
             "response.reasoning.done",
@@ -171,16 +179,15 @@ final class SSEReorderTests: XCTestCase {
             "response.output_item.done",
             "response.completed",
         ])
-        XCTAssertEqual(reorderer.pendingCount, 0)
+        #expect(reorderer.pendingCount == 0)
     }
 
     /// sequence_number 重排后应保持严格单调
-    func testSequenceNumbersAreRenumberedMonotonically() {
+    @Test
+    func sequenceNumbersAreRenumberedMonotonically() {
         let reorderer = SSEReorderer()
         var out = Data()
-        var buf = ByteBufferAllocator().buffer(capacity: 0)
-        buf.writeBytes(Array(interleavedStream().utf8))
-        for block in reorderer.consume(buf) { out.append(block) }
+        for block in reorderer.consume(Data(interleavedStream().utf8)) { out.append(block) }
         for block in reorderer.finish() { out.append(block) }
         var seen: [Int] = []
         for line in String(decoding: out, as: UTF8.self).split(separator: "\n") where line.hasPrefix("data: ") {
@@ -191,7 +198,7 @@ final class SSEReorderTests: XCTestCase {
                 seen.append(seq)
             }
         }
-        XCTAssertEqual(seen, Array(0..<seen.count), "重编号后应是从 0 起的连续序号")
+        #expect(seen == Array(0..<seen.count), "重编号后应是从 0 起的连续序号")
     }
 }
 
