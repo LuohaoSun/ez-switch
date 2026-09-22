@@ -14,7 +14,7 @@ EZ Switch 在本机提供 OpenAI / Anthropic 兼容接口。Codex、Claude Code�
 
 从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZ Switch.app` 拖入 `Applications` 文件夹。要求 macOS 13 或以上。
 
-> 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。首次启动如被阻止，请在 Finder 中右键应用并选择“打开”，或在“系统设置 → 隐私与安全性”中允许。
+> 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。首次启动如被 macOS 阻止，请前往 `系统设置 → 隐私与安全性`，在安全提示中点击 **“仍要打开”**，然后再次确认打开应用。
 
 ## 使用
 
