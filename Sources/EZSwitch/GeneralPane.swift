@@ -7,6 +7,9 @@ import SwiftUI
 final class GeneralDraft: ObservableObject {
     @Published var port = ""
     @Published var harness: HarnessTarget = .codex
+    @Published var pendingHarnessPlan: HarnessConfigPlan?
+    @Published var showingHarnessConfirmation = false
+    @Published var harnessMessage: String?
 }
 
 enum HarnessTarget: String, CaseIterable, Identifiable {
@@ -30,11 +33,33 @@ enum HarnessTarget: String, CaseIterable, Identifiable {
         case .claudeCode: return ""
         }
     }
+
+    var requiredEndpoint: EndpointKind? {
+        switch self {
+        case .codex: return .responses
+        case .claudeCode: return .messages
+        case .opencode: return nil
+        }
+    }
+
+    func defaultModel(in models: [FakeModel]) -> FakeModel? {
+        models.first { $0.fakeModelID == "main" } ?? models.first
+    }
 }
 
 enum HarnessPrompt {
     static func make(harness: HarnessTarget, endpoint: String, modelIDs: [String]) -> String {
         let models = modelIDs.isEmpty ? "<model-id>" : modelIDs.joined(separator: "、")
+        if harness == .opencode {
+            return """
+            请帮我在 OpenCode 中添加 EZ Switch 供应商，并配置以下全部本机模型 ID：\(models)。
+
+            - OpenAI 兼容端点：\(endpoint)
+            - 密钥：任意占位符（例如 ez-switch-local）
+
+            请检查本机 OpenCode 版本与实际配置路径，保留现有供应商和设置，先备份再修改；配置完成后说明如何在 OpenCode 中切换这些模型。EZ Switch 会在本机把每个模型 ID 路由到对应上游。
+            """
+        }
         return """
         请帮我配置 \(harness.displayName) 供应商：
 
@@ -140,6 +165,7 @@ struct GeneralPane: View {
     @StateObject private var draft = GeneralDraft()
     @StateObject private var loginItem = LoginItemDraft()
     @ObservedObject private var updater = UpdateChecker.shared
+    private let harnessManager = HarnessConfigManager()
 
     private var validPort: Int? {
         guard let port = Int(draft.port), (1...65535).contains(port) else { return nil }
@@ -154,11 +180,21 @@ struct GeneralPane: View {
 
     private var promptText: String {
         HarnessPrompt.make(
-            harness: draft.harness,
-            endpoint: store.connectionURL + draft.harness.endpointPath,
+            harness: .opencode,
+            endpoint: store.connectionURL + HarnessTarget.opencode.endpointPath,
             modelIDs: store.config.fakes.map(\.fakeModelID)
         )
     }
+
+    private var compatibleFakes: [FakeModel] {
+        guard let kind = draft.harness.requiredEndpoint else { return [] }
+        return store.config.fakes.filter { fake in
+            guard let remote = store.routeRemote(fake) else { return false }
+            return remote.supports(kind) && !remote.needsCredentials
+        }
+    }
+
+    private var defaultFake: FakeModel? { draft.harness.defaultModel(in: compatibleFakes) }
 
     var body: some View {
         Form {
@@ -183,6 +219,80 @@ struct GeneralPane: View {
                 } else {
                     Text("修改端口后需要重启应用。路由切换即时生效。")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Section("接入工具") {
+                Picker("工具", selection: $draft.harness) {
+                    ForEach(HarnessTarget.allCases) { harness in
+                        Text(harness.displayName).tag(harness)
+                    }
+                }
+                if draft.harness == .opencode {
+                    Text("复制提示词并交给 OpenCode 的 agent，它可以代你配置全部本机模型。")
+                        .foregroundStyle(.secondary)
+                    if store.config.fakes.isEmpty {
+                        Text("请先在“路由”页添加本机模型 ID。")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(promptText)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    Button {
+                        copyText(promptText)
+                    } label: {
+                        Label("复制提示词", systemImage: "doc.on.doc")
+                    }
+                    .disabled(store.config.fakes.isEmpty)
+                } else {
+                    if compatibleFakes.isEmpty {
+                        Text("没有可用模型。请先绑定支持 \(draft.harness == .codex ? "Responses" : "Messages") 的上游并填写 API Key。")
+                            .foregroundStyle(.orange)
+                    } else {
+                        LabeledContent("可用本机模型") {
+                            Text(compatibleFakes.map(\.fakeModelID).joined(separator: "、"))
+                                .multilineTextAlignment(.trailing)
+                                .textSelection(.enabled)
+                        }
+                        Text("默认使用 \(defaultFake?.fakeModelID ?? "")；其他 ID 可通过 \(draft.harness == .codex ? "codex -m" : "claude --model") 指定，工具内置列表不一定显示。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let url = harnessManager.fileURL(for: draft.harness) {
+                        Text(url.path)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    HStack {
+                        Button {
+                            prepareHarnessInstall()
+                        } label: {
+                            Label("一键配置", systemImage: "square.and.pencil")
+                        }
+                        .disabled(defaultFake == nil || store.runningPort == nil ||
+                                  store.runningPort != store.config.port || harnessManager.hasBackup(for: draft.harness))
+                        Button {
+                            draft.pendingHarnessPlan = nil
+                            draft.showingHarnessConfirmation = true
+                        } label: {
+                            Label("一键恢复", systemImage: "arrow.uturn.backward")
+                        }
+                        .disabled(!harnessManager.hasBackup(for: draft.harness))
+                    }
+                    if harnessManager.hasBackup(for: draft.harness) {
+                        Text("原配置已备份；恢复时若检测到后续修改，将停止并保留备份。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if store.runningPort != nil, store.runningPort != store.config.port {
+                        Text("端口变更待重启，重启 EZ Switch 后才能配置工具。")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                }
+                if let harnessMessage = draft.harnessMessage {
+                    Text(harnessMessage).font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
             Section("启动") {
@@ -210,31 +320,6 @@ struct GeneralPane: View {
                     .controlSize(.small)
                 }
             }
-            Section("Harness 配置提示词") {
-                Text("将 EZ Switch 配置为你的 Harness 供应商：选择要接入的工具并复制提示词。")
-                    .foregroundStyle(.secondary)
-                if store.config.fakes.isEmpty {
-                    Text("请先在“模型”页添加一个本机模型 ID。")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Picker("Harness", selection: $draft.harness) {
-                        ForEach(HarnessTarget.allCases) { harness in
-                            Text(harness.displayName).tag(harness)
-                        }
-                    }
-                    Text(promptText)
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                    Button {
-                        copyText(promptText)
-                    } label: {
-                        Label("复制提示词", systemImage: "doc.on.doc")
-                    }
-                }
-            }
             Section("应用") {
                 HStack {
                     Text("版本")
@@ -259,6 +344,23 @@ struct GeneralPane: View {
             refreshLoginItemState()
         }
         .onChange(of: store.config.port) { port in draft.port = String(port) }
+        .onChange(of: draft.harness) { _ in
+            draft.harnessMessage = nil
+        }
+        .alert("\(draft.pendingHarnessPlan == nil ? "恢复" : "配置") \(draft.harness.displayName)？",
+               isPresented: $draft.showingHarnessConfirmation) {
+            Button(draft.pendingHarnessPlan == nil ? "恢复原配置" : "配置并备份") {
+                if draft.pendingHarnessPlan == nil { restoreHarness() }
+                else { installHarness() }
+            }
+            Button("取消", role: .cancel) { draft.pendingHarnessPlan = nil }
+        } message: {
+            if let plan = draft.pendingHarnessPlan {
+                Text("将为 \(draft.harness.displayName) 配置本机端点，设置 \(plan.modelID) 为默认模型；其他兼容 ID 可通过命令行指定。更新 \(plan.fileURL.path) 前会备份原文件；已有会话需重新启动。")
+            } else {
+                Text("只在配置文件仍是 EZ Switch 写出的版本时恢复。原备份保留在 \(harnessManager.backupLocation(for: draft.harness).path)。")
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshLoginItemState()
         }
@@ -267,6 +369,42 @@ struct GeneralPane: View {
     private func savePort() {
         guard let port = validPort, port != store.config.port else { return }
         store.setPort(port)
+    }
+
+    private func prepareHarnessInstall() {
+        guard let fake = defaultFake, store.runningPort == store.config.port else { return }
+        do {
+            let plan = try harnessManager.preview(target: draft.harness,
+                endpoint: store.connectionURL + draft.harness.endpointPath, modelID: fake.fakeModelID)
+            if plan.original == plan.proposed {
+                draft.harnessMessage = "配置文件已经包含相同设置。"
+            } else {
+                draft.pendingHarnessPlan = plan
+                draft.showingHarnessConfirmation = true
+            }
+        } catch {
+            draft.harnessMessage = error.localizedDescription
+        }
+    }
+
+    private func installHarness() {
+        guard let plan = draft.pendingHarnessPlan else { return }
+        defer { draft.pendingHarnessPlan = nil }
+        do {
+            try harnessManager.install(plan)
+            draft.harnessMessage = "已配置 \(plan.target.displayName)。重新启动该工具后生效。"
+        } catch {
+            draft.harnessMessage = error.localizedDescription
+        }
+    }
+
+    private func restoreHarness() {
+        do {
+            try harnessManager.restore(draft.harness)
+            draft.harnessMessage = "原配置已恢复。重新启动该工具后生效。"
+        } catch {
+            draft.harnessMessage = error.localizedDescription
+        }
     }
 
     private func setLoginItemEnabled(_ enabled: Bool) {

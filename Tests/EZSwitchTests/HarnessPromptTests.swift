@@ -1,8 +1,20 @@
+import Foundation
 import Testing
 @testable import EZSwitch
 
 @Suite("Harness prompt")
 struct HarnessPromptTests {
+    @Test
+    func oneClickHarnessDefaultPrefersCompatibleMainOtherwiseFirst() {
+        let first = FakeModel(id: UUID(), fakeModelID: "ultra", displayName: "ultra", remoteID: UUID())
+        let main = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main", remoteID: UUID())
+        #expect(HarnessTarget.codex.requiredEndpoint == .responses)
+        #expect(HarnessTarget.claudeCode.requiredEndpoint == .messages)
+        #expect(HarnessTarget.codex.defaultModel(in: [first, main])?.fakeModelID == "main")
+        #expect(HarnessTarget.codex.defaultModel(in: [first])?.fakeModelID == "ultra")
+        #expect(HarnessTarget.codex.defaultModel(in: []) == nil)
+    }
+
     @Test
     func promptContainsDynamicEndpointAndModel() {
         let prompt = HarnessPrompt.make(
@@ -35,14 +47,20 @@ struct HarnessPromptTests {
 
     @Test
     func promptNamesOpenCodeDirectly() {
+        let modelIDs = ["ultra", "main", "sub"]
         let prompt = HarnessPrompt.make(
             harness: .opencode,
             endpoint: "http://127.0.0.1:8788/v1",
-            modelIDs: ["main"]
+            modelIDs: modelIDs
         )
 
-        #expect(prompt.contains("请帮我配置 OpenCode 供应商："))
-        #expect(prompt.contains("请修改 OpenCode 的配置文件"))
-        #expect(!prompt.contains("当前 harness"))
+        #expect(prompt.contains("在 OpenCode 中添加 EZ Switch 供应商"))
+        #expect(prompt.contains("全部本机模型 ID：ultra、main、sub"))
+        for modelID in modelIDs {
+            #expect(prompt.contains(modelID))
+        }
+        #expect(prompt.contains("http://127.0.0.1:8788/v1"))
+        #expect(prompt.contains("保留现有供应商和设置，先备份再修改"))
+        #expect(prompt.contains("如何在 OpenCode 中切换这些模型"))
     }
 }
