@@ -61,6 +61,58 @@ struct ConfigStoreTests {
     }
 
     @Test
+    func moveProvidersKeepsGroupsTogetherAndPersistsOrder() throws {
+        let aOne = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                              baseURL: "https://alpha.example")
+        let beta = makeRemote(name: "Beta · one", model: "one", apiKey: "b",
+                              baseURL: "https://beta.example")
+        let aTwo = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                              baseURL: "https://alpha.example")
+        let gamma = makeRemote(name: "Gamma · one", model: "one", apiKey: "c",
+                               baseURL: "https://gamma.example")
+        let store = try makeStore(remotes: [aOne, beta, aTwo, gamma], fakes: [])
+
+        store.moveProviders(sources: ["Alpha"], before: nil)
+        #expect(store.config.remotes.map(\.id) == [beta.id, gamma.id, aOne.id, aTwo.id])
+        #expect(store.remoteGroups(matching: "").map(\.provider) == ["Beta", "Gamma", "Alpha"])
+
+        store.moveProviders(sources: ["Alpha"], before: "Beta")
+        #expect(store.config.remotes.map(\.id) == [aOne.id, aTwo.id, beta.id, gamma.id])
+        store.moveProviders(sources: ["Alpha"], before: "Missing")
+        store.moveProviders(sources: ["Missing"], before: nil)
+        #expect(store.config.remotes.map(\.id) == [aOne.id, aTwo.id, beta.id, gamma.id])
+        let reloaded = ConfigStore(configURL: store.configURL)
+        #expect(reloaded.config.remotes.map(\.id) == [aOne.id, aTwo.id, beta.id, gamma.id])
+        #expect(reloaded.groupedRemotes().map(\.provider) == ["Alpha", "Beta", "Gamma"])
+    }
+
+    @Test
+    func moveModelsStaysWithinProviderAndPersistsOrder() throws {
+        let aOne = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                              baseURL: "https://alpha.example")
+        let beta = makeRemote(name: "Beta · one", model: "one", apiKey: "b",
+                              baseURL: "https://beta.example")
+        let aTwo = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                              baseURL: "https://alpha.example")
+        let aThree = makeRemote(name: "Alpha · three", model: "three", apiKey: "a",
+                                baseURL: "https://alpha.example")
+        let route = FakeModel(id: UUID(), fakeModelID: "chat", displayName: "chat", remoteID: aOne.id)
+        let store = try makeStore(remotes: [aOne, beta, aTwo, aThree], fakes: [route])
+
+        store.moveModels(provider: "Alpha", sources: [aOne.id], before: aThree.id)
+        #expect(store.config.remotes.map(\.id) == [aTwo.id, beta.id, aOne.id, aThree.id])
+        store.moveModels(provider: "Alpha", sources: [aTwo.id], before: nil)
+        #expect(store.config.remotes.map(\.id) == [aOne.id, beta.id, aThree.id, aTwo.id])
+        #expect(store.router.route(fakeModelID: "chat")?.remote.id == aOne.id)
+
+        store.moveModels(provider: "Alpha", sources: [aOne.id], before: beta.id)
+        store.moveModels(provider: "Alpha", sources: [beta.id], before: nil)
+        #expect(store.config.remotes.map(\.id) == [aOne.id, beta.id, aThree.id, aTwo.id])
+        let reloaded = ConfigStore(configURL: store.configURL)
+        #expect(reloaded.config.remotes.map(\.id) == [aOne.id, beta.id, aThree.id, aTwo.id])
+    }
+
+    @Test
     func updateModelPreservesProviderConnection() throws {
         let oldRemote = makeRemote(name: "Alpha · one", model: "one", apiKey: "secret",
                                    baseURL: "https://alpha.example",

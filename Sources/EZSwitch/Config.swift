@@ -677,6 +677,49 @@ final class ConfigStore: ObservableObject {
 
     // MARK: 远端
 
+    /// 供应商作为整体排序；旧配置即使交错存放模型，也按分组后的顺序写回。
+    func moveProviders(sources: [String], before target: String?) {
+        var groups = groupedRemotes()
+        let sourceSet = Set(sources)
+        guard !sourceSet.isEmpty,
+              sourceSet.count == sources.count,
+              sources.allSatisfy({ name in groups.contains(where: { $0.provider == name }) })
+        else { return }
+        guard let destination = target.flatMap({ name in groups.firstIndex(where: { $0.provider == name }) })
+                ?? (target == nil ? groups.count : nil),
+              target.map({ !sourceSet.contains($0) }) ?? true else { return }
+        let offsets = IndexSet(groups.indices.filter { sourceSet.contains(groups[$0].provider) })
+        groups.move(fromOffsets: offsets, toOffset: destination)
+        let reordered = groups.flatMap(\.remotes)
+        guard reordered != config.remotes else { return }
+        config.remotes = reordered
+        router.update(config)
+        save()
+        Log.shared.log("provider: 排序更新（\(groups.count) 个）")
+    }
+
+    /// 模型只在所属供应商内排序，不改变其他供应商在配置中的位置。
+    func moveModels(provider: String, sources: [UUID], before target: UUID?) {
+        let indices = config.remotes.indices.filter {
+            splitProviderModel(config.remotes[$0].name).provider == provider
+        }
+        var models = indices.map { config.remotes[$0] }
+        let sourceSet = Set(sources)
+        guard !sourceSet.isEmpty, sourceSet.count == sources.count,
+              sources.allSatisfy({ id in models.contains(where: { $0.id == id }) }) else { return }
+        guard let destination = target.flatMap({ id in models.firstIndex(where: { $0.id == id }) })
+                ?? (target == nil ? models.count : nil),
+              target.map({ !sourceSet.contains($0) }) ?? true else { return }
+        let offsets = IndexSet(models.indices.filter { sourceSet.contains(models[$0].id) })
+        let original = models
+        models.move(fromOffsets: offsets, toOffset: destination)
+        guard models != original else { return }
+        for (index, model) in zip(indices, models) { config.remotes[index] = model }
+        router.update(config)
+        save()
+        Log.shared.log("remote: \(provider) 模型排序更新（\(models.count) 个）")
+    }
+
     @discardableResult
     func addRemote(_ remote: RemoteModel) -> String? {
         let endpoints = Self.normalizedEndpoints(remote.apiEndpoints)

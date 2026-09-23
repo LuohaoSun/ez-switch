@@ -61,6 +61,10 @@ struct RemotesView: View {
                 List(selection: providerSelection) {
                     ForEach(visibleGroups) { group in
                         HStack(spacing: 8) {
+                            if ui.query.isEmpty {
+                                Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
+                                    .help("拖动调整供应商顺序")
+                            }
                             Text(group.provider).lineLimit(1).truncationMode(.middle)
                                 .help(group.provider)
                             Spacer(minLength: 4)
@@ -73,6 +77,14 @@ struct RemotesView: View {
                         .modifier(NativeListRow())
                         .tag(group.provider)
                         .listRowSeparator(.hidden)
+                        .moveDisabled(!ui.query.isEmpty)
+                    }
+                    .onMove { offsets, destination in
+                        guard ui.query.isEmpty else { return }
+                        let groups = visibleGroups
+                        let sources = offsets.map { groups[$0].provider }
+                        let target = destination < groups.count ? groups[destination].provider : nil
+                        store.moveProviders(sources: sources, before: target)
                     }
                 }
                 .listStyle(.sidebar)
@@ -96,6 +108,13 @@ struct RemotesView: View {
                     }.padding(20)
                     List(selection: modelSelection) {
                         ForEach(group.remotes) { remote in row(for: remote) }
+                            .onMove { offsets, destination in
+                                guard ui.query.isEmpty else { return }
+                                let sources = offsets.map { group.remotes[$0].id }
+                                let target = destination < group.remotes.count
+                                    ? group.remotes[destination].id : nil
+                                store.moveModels(provider: group.provider, sources: sources, before: target)
+                            }
                     }.listStyle(.inset)
                         .onDeleteCommand { requestDelete() }
                 } else {
@@ -311,6 +330,10 @@ struct RemotesView: View {
     @ViewBuilder
     private func row(for remote: RemoteModel) -> some View {
         HStack(spacing: 14) {
+            if ui.query.isEmpty {
+                Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
+                    .help("拖动调整模型顺序")
+            }
             Text(remote.model)
                 .font(.system(.body, design: .monospaced).weight(.medium))
                 .lineLimit(1).truncationMode(.middle)
@@ -332,6 +355,7 @@ struct RemotesView: View {
         }
         .modifier(NativeListRow())
         .tag(remote.id)
+        .moveDisabled(!ui.query.isEmpty)
         .contextMenu {
             Button("编辑…") { ui.target = RemoteEditTarget(remote: remote) }
             Button("复制模型 ID") { copyText(remote.model) }
