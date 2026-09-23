@@ -20,6 +20,15 @@ final class RemotesViewDraft: ObservableObject {
             selection = .provider(provider)
         }
     }
+
+    func selectionAfterRemoving(_ remote: RemoteModel, from groups: [RemoteGroup]) -> RemoteListSelection? {
+        let provider = splitProviderModel(remote.name).provider
+        guard let group = groups.first(where: { $0.provider == provider }),
+              let index = group.remotes.firstIndex(where: { $0.id == remote.id }) else { return nil }
+        if index + 1 < group.remotes.count { return .model(group.remotes[index + 1].id) }
+        if index > 0 { return .model(group.remotes[index - 1].id) }
+        return nil
+    }
 }
 
 struct RemoteEditTarget: Identifiable {
@@ -134,12 +143,14 @@ struct RemotesView: View {
             }
             Button("删除", role: .destructive) {
                 if let remote = ui.deletion {
+                    let nextSelection = ui.selectionAfterRemoving(remote, from: visibleGroups)
                     store.removeRemote(id: remote.id)
+                    ui.selection = nextSelection
                 } else if let provider = ui.providerDeletion {
                     store.removeProvider(provider.provider)
                     UserDefaults.standard.removeObject(forKey: "selectedProvider")
+                    ui.selection = nil
                 }
-                ui.selection = nil
                 ui.deletion = nil
                 ui.providerDeletion = nil
             }
