@@ -70,8 +70,21 @@ enum UpdateVersion {
     }
 }
 
+enum AutomaticUpdatePolicy {
+    static let interval: TimeInterval = 24 * 60 * 60
+
+    static func shouldCheck(lastCheckedAt: Date?, lastCheckedVersion: String?,
+                            currentVersion: String, now: Date) -> Bool {
+        guard let lastCheckedAt, lastCheckedVersion == currentVersion else { return true }
+        let elapsed = now.timeIntervalSince(lastCheckedAt)
+        return elapsed < 0 || elapsed >= interval
+    }
+}
+
 @MainActor
 final class UpdateChecker: ObservableObject {
+    static let shared = UpdateChecker()
+
     enum State: Equatable {
         case idle
         case checking
@@ -84,32 +97,78 @@ final class UpdateChecker: ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
+    @Published private(set) var availableRelease: UpdateRelease?
+    @Published private(set) var automaticallyChecksForUpdates: Bool
 
     private let currentVersion: String
     private let session: URLSession
+    private let defaults: UserDefaults
+    private var automaticCheckTimer: Timer?
 
-    init(currentVersion: String? = nil) {
+    private static let automaticChecksKey = "automaticallyChecksForUpdates"
+    private static let lastCheckedAtKey = "lastUpdateCheckDate"
+    private static let lastCheckedVersionKey = "lastUpdateCheckVersion"
+
+    init(currentVersion: String? = nil, defaults: UserDefaults = .standard, session: URLSession? = nil) {
         self.currentVersion = currentVersion
             ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             ?? "0"
+        self.defaults = defaults
+        self.automaticallyChecksForUpdates = defaults.object(forKey: Self.automaticChecksKey) as? Bool ?? true
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 20
         configuration.timeoutIntervalForResource = 120
-        self.session = URLSession(configuration: configuration)
+        self.session = session ?? URLSession(configuration: configuration)
     }
 
-    func check() async {
+    func startAutomaticChecks() {
+        guard automaticallyChecksForUpdates, automaticCheckTimer == nil else { return }
+        automaticCheckTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in await self?.checkAutomaticallyIfDue() }
+        }
+        // Always refresh at launch so an available release is visible after reopening the app.
+        Task {
+            if automaticallyChecksForUpdates { await check(silently: true) }
+        }
+    }
+
+    func setAutomaticallyChecksForUpdates(_ enabled: Bool) {
+        guard automaticallyChecksForUpdates != enabled else { return }
+        automaticallyChecksForUpdates = enabled
+        defaults.set(enabled, forKey: Self.automaticChecksKey)
+        if enabled {
+            startAutomaticChecks()
+        } else {
+            automaticCheckTimer?.invalidate()
+            automaticCheckTimer = nil
+        }
+    }
+
+    private func checkAutomaticallyIfDue() async {
+        guard automaticallyChecksForUpdates,
+              AutomaticUpdatePolicy.shouldCheck(
+                lastCheckedAt: defaults.object(forKey: Self.lastCheckedAtKey) as? Date,
+                lastCheckedVersion: defaults.string(forKey: Self.lastCheckedVersionKey),
+                currentVersion: currentVersion, now: Date()
+              ) else { return }
+        await check(silently: true)
+    }
+
+    func check(silently: Bool = false) async {
         guard state != .checking && state != .downloading && state != .verifying else { return }
+        let previousState = state
         state = .checking
         do {
             let release: UpdateRelease = try await request(
                 URL(string: "https://api.github.com/repos/LuohaoSun/ez-switch/releases/latest")!
             )
-            state = UpdateVersion.isNewer(release.version, than: currentVersion)
-                ? .available(release)
-                : .upToDate
+            availableRelease = UpdateVersion.isNewer(release.version, than: currentVersion) ? release : nil
+            state = availableRelease.map(State.available) ?? .upToDate
+            defaults.set(Date(), forKey: Self.lastCheckedAtKey)
+            defaults.set(currentVersion, forKey: Self.lastCheckedVersionKey)
         } catch {
-            state = .failed("检查更新失败：\(error.localizedDescription)")
+            state = silently ? (previousState == .checking ? .idle : previousState)
+                : .failed("检查更新失败：\(error.localizedDescription)")
         }
     }
 

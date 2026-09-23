@@ -1,6 +1,5 @@
 import Foundation
 import Combine
-import ServiceManagement
 import SwiftUI   // Array.move(fromOffsets:toOffset:)（fake 排序）来自 SwiftUI
 
 // MARK: - 数据模型
@@ -722,9 +721,27 @@ final class ConfigStore: ObservableObject {
 
     @discardableResult
     func addRemote(_ remote: RemoteModel) -> String? {
+        let parsed = splitProviderModel(remote.name)
+        let provider = parsed.provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayModel = parsed.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = remote.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !displayModel.isEmpty, !model.isEmpty else { return "模型 ID 不能为空" }
+        guard !provider.isEmpty else { return "供应商名称不能为空或包含 · 分隔符" }
+        guard !config.remotes.contains(where: {
+            splitProviderModel($0.name).provider.trimmingCharacters(in: .whitespacesAndNewlines)
+                == provider
+                && $0.model.trimmingCharacters(in: .whitespacesAndNewlines) == model
+        }) else { return "该供应商下模型 ID 已存在" }
+        guard !config.remotes.contains(where: {
+            splitProviderModel($0.name).provider.trimmingCharacters(in: .whitespacesAndNewlines)
+                == provider
+        }) else { return "该供应商名称已存在" }
+
+        var remote = remote
+        remote.name = remote.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        remote.model = model
         let endpoints = Self.normalizedEndpoints(remote.apiEndpoints)
         if let error = Self.validateEndpoints(endpoints) { return error }
-        var remote = remote
         remote.apiEndpoints = endpoints
         config.remotes.append(remote)
         router.update(config)
@@ -961,24 +978,6 @@ final class ConfigStore: ObservableObject {
         } catch {
             Log.shared.log("reload: decode failed, 保留旧配置: \(error)")
         }
-    }
-
-    // MARK: 登录项（SMAppService 要求 .app bundle；swift run 裸跑时注册会失败，无害）
-
-    var loginItemEnabled: Bool { SMAppService.mainApp.status == .enabled }
-
-    func toggleLoginItem() {
-        do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
-            Log.shared.log("login item: \(loginItemEnabled ? "enabled" : "disabled")")
-        } catch {
-            Log.shared.log("login item toggle failed: \(error)")
-        }
-        objectWillChange.send()
     }
 
     // MARK: 服务
