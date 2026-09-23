@@ -1,9 +1,20 @@
 import SwiftUI
 import AppKit
+import Carbon
 
 private enum AppBrand {
     static var name: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "EZ Switch"
+    }
+}
+
+enum AppLaunchContext {
+    static func shouldShowPanel(for event: NSAppleEventDescriptor?) -> Bool {
+        guard let event, event.eventClass == kCoreEventClass, event.eventID == kAEOpenApplication else {
+            return true
+        }
+        return event.paramDescriptor(forKeyword: keyAELaunchedAsLogInItem) == nil &&
+            event.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue != keyAELaunchedAsLogInItem
     }
 }
 
@@ -40,7 +51,9 @@ private final class AppWindowManager {
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AppWindowManager.shared.showSettings(store: ConfigStore.shared)
+        if AppLaunchContext.shouldShowPanel(for: NSAppleEventManager.shared().currentAppleEvent) {
+            AppWindowManager.shared.showSettings(store: ConfigStore.shared)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -55,7 +68,7 @@ struct RouterApp: App {
     @StateObject private var store = ConfigStore.shared
 
     init() {
-        NSApplication.shared.setActivationPolicy(.regular)    // 启动即显示设置窗口
+        NSApplication.shared.setActivationPolicy(.accessory)
         ConfigStore.shared.startServer()                      // 幂等；菜单没点开前就开始服务
     }
 
@@ -77,6 +90,12 @@ struct RouterApp: App {
                     NSApplication.shared.orderFrontStandardAboutPanel(nil)
                 }
             }
+            CommandGroup(replacing: .appSettings) {
+                Button("设置…") {
+                    AppWindowManager.shared.showSettings(store: store)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
             CommandGroup(replacing: .help) {
                 Button("\(AppBrand.name) 帮助") {
                     showHelp()
@@ -89,7 +108,7 @@ struct RouterApp: App {
         NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = AppBrand.name
-        alert.informativeText = "点击菜单栏中的箭头图标可切换路由；选择“设置…”可管理模型、供应商和服务端口。"
+        alert.informativeText = "点击菜单栏中的箭头图标可切换路由；选择“EZ Switch 面板...”可管理模型、供应商和服务端口。"
         alert.addButton(withTitle: "好")
         alert.runModal()
     }
@@ -155,7 +174,7 @@ struct MenuView: View {
 
         Divider()
 
-        Button("设置…") {
+        Button("EZ Switch 面板...") {
             AppWindowManager.shared.showSettings(store: store)
         }
 
