@@ -271,20 +271,20 @@ struct RemoteGroup: Identifiable {
 extension AppConfig {
     static func example() -> AppConfig {
         let deepSeek = RemoteModel(
-            id: UUID(), name: "DeepSeek官方 · deepseek-chat",
-            apiKey: "sk-REPLACE-ME", model: "deepseek-chat", extraHeaders: [:],
+            id: UUID(), name: "DeepSeek官方 · deepseek-flash",
+            apiKey: "sk-REPLACE-ME", model: "deepseek-flash", extraHeaders: [:],
             apiEndpoints: .enabled([.chat], baseURL: "https://api.deepseek.com/v1")
         )
-        let openAI = RemoteModel(
-            id: UUID(), name: "OpenAI官方 · gpt-5.2",
-            apiKey: "sk-REPLACE-ME", model: "gpt-5.2", extraHeaders: [:],
-            apiEndpoints: .enabled([.chat, .responses], baseURL: "https://api.openai.com/v1")
+        let openCodeGo = RemoteModel(
+            id: UUID(), name: "OpenCode Go · deepseek-v4.1-flash",
+            apiKey: "sk-REPLACE-ME", model: "deepseek-v4.1-flash", extraHeaders: [:],
+            apiEndpoints: .enabled([.chat], baseURL: "https://opencode.ai/zen/go/v1")
         )
-        let remotes = [deepSeek, openAI]
+        let remotes = [deepSeek, openCodeGo]
 
         let fakes = [
             FakeModel(id: UUID(), fakeModelID: "main",
-                      displayName: "main", remoteID: openAI.id),
+                      displayName: "main", remoteID: openCodeGo.id),
         ]
         return AppConfig(port: 8788, remotes: remotes, fakes: fakes)
     }

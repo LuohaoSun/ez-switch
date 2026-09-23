@@ -1,4 +1,5 @@
 import Foundation
+import NIOHTTP1
 import Testing
 @testable import EZSwitch
 
@@ -380,15 +381,48 @@ struct ConfigStoreTests {
         let config = AppConfig.example()
 
         #expect(config.remotes.map(\.name) == [
-            "DeepSeek官方 · deepseek-chat",
-            "OpenAI官方 · gpt-5.2"
+            "DeepSeek官方 · deepseek-flash",
+            "OpenCode Go · deepseek-v4.1-flash"
         ])
+        #expect(config.remotes.map(\.model) == ["deepseek-flash", "deepseek-v4.1-flash"])
+        #expect(config.remotes.allSatisfy { $0.extraHeaders.isEmpty })
         #expect(config.remotes[0].apiEndpoints ==
                 .enabled([.chat], baseURL: "https://api.deepseek.com/v1"))
         #expect(config.remotes[1].apiEndpoints ==
-                .enabled([.chat, .responses], baseURL: "https://api.openai.com/v1"))
+                .enabled([.chat], baseURL: "https://opencode.ai/zen/go/v1"))
+        #expect(Forwarder.upstreamURL(remote: config.remotes[1], endpoint: .chat, query: "")?.absoluteString ==
+                "https://opencode.ai/zen/go/v1/chat/completions")
         #expect(config.fakes.map(\.fakeModelID) == ["main"])
         #expect(config.fakes[0].remoteID == config.remotes[1].id)
+    }
+
+    @Test
+    func openCodeGoForwardsConversationHeadersWithoutStaticSession() throws {
+        let remote = AppConfig.example().remotes[1]
+        let head = HTTPRequestHead(version: .http1_1, method: .POST, uri: "/v1/chat/completions",
+                                   headers: HTTPHeaders([
+                                    ("x-opencode-session", "conversation-1"),
+                                    ("x-opencode-client", "opencode"),
+                                    ("user-agent", "opencode/1.0"),
+                                    ("authorization", "Bearer local-placeholder")
+                                   ]))
+        let request = try Forwarder.buildRequest(clientHead: head, body: Data("{\"model\":\"main\"}".utf8),
+                                                 endpoint: .chat, remote: remote, query: "")
+
+        #expect(request.url?.absoluteString == "https://opencode.ai/zen/go/v1/chat/completions")
+        #expect(request.value(forHTTPHeaderField: "x-opencode-session") == "conversation-1")
+        #expect(request.value(forHTTPHeaderField: "x-opencode-client") == "opencode")
+        #expect(request.value(forHTTPHeaderField: "user-agent") == "opencode/1.0")
+        #expect(request.value(forHTTPHeaderField: "authorization") == "Bearer sk-REPLACE-ME")
+        let requestBody = try #require(request.httpBody)
+        let body = try #require(JSONSerialization.jsonObject(with: requestBody) as? [String: String])
+        #expect(body["model"] == "deepseek-v4.1-flash")
+
+        let withoutSession = try Forwarder.buildRequest(
+            clientHead: HTTPRequestHead(version: .http1_1, method: .POST, uri: "/v1/chat/completions"),
+            body: Data(), endpoint: .chat, remote: remote, query: "")
+        #expect(withoutSession.value(forHTTPHeaderField: "x-opencode-session") == nil)
+        #expect(withoutSession.value(forHTTPHeaderField: "user-agent")?.hasPrefix("EZSwitch/") == true)
     }
 
     private func makeStore(remotes: [RemoteModel], fakes: [FakeModel]) throws -> ConfigStore {

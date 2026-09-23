@@ -178,6 +178,15 @@ enum Forwarder {
             }
         }
 
+        if url.host == "opencode.ai", url.path.hasPrefix("/zen/go/v1/") {
+            // Go uses a per-conversation session for routing/cache; a static provider header would mix conversations.
+            for name in ["x-opencode-session", "x-opencode-request", "x-opencode-client", "x-opencode-project"] {
+                if let value = h.first(name: name) { req.setValue(value, forHTTPHeaderField: name) }
+            }
+            let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+            req.setValue(h.first(name: "user-agent") ?? "EZSwitch/\(version)", forHTTPHeaderField: "user-agent")
+        }
+
         for (k, v) in remote.extraHeaders {
             req.setValue(v, forHTTPHeaderField: k)
         }
