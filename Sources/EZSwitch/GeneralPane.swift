@@ -1,5 +1,7 @@
-import SwiftUI
 import AppKit
+import Combine
+import ServiceManagement
+import SwiftUI
 
 @MainActor
 final class GeneralDraft: ObservableObject {
@@ -45,10 +47,99 @@ enum HarnessPrompt {
     }
 }
 
+struct LoginItemToggleFeedback: Equatable {
+    let message: String
+    let retryEnabled: Bool?
+}
+
+struct LoginItemToggleResult: Equatable {
+    let isEnabled: Bool
+    let feedback: LoginItemToggleFeedback?
+}
+
+enum LoginItemToggleAction: Equatable {
+    case register
+    case unregister
+    case none
+}
+
+enum LoginItemToggleEvaluator {
+    static func action(requestedEnabled: Bool, status: SMAppService.Status) -> LoginItemToggleAction {
+        if requestedEnabled {
+            return status == .enabled || status == .requiresApproval ? .none : .register
+        }
+        return status == .enabled || status == .requiresApproval ? .unregister : .none
+    }
+
+    static func evaluate(
+        requestedEnabled: Bool,
+        before: SMAppService.Status,
+        after: SMAppService.Status,
+        error: Error?
+    ) -> LoginItemToggleResult {
+        let isEnabled = after == .enabled
+
+        if requestedEnabled, after == .requiresApproval {
+            return LoginItemToggleResult(
+                isEnabled: isEnabled,
+                feedback: LoginItemToggleFeedback(
+                    message: "登录项已登记，但需要系统批准。请在“系统设置 > 通用 > 登录项”中允许 EZ Switch。",
+                    retryEnabled: nil
+                )
+            )
+        }
+
+        let disableWhileApprovalPending = !requestedEnabled && after == .requiresApproval
+        if isEnabled == requestedEnabled, !disableWhileApprovalPending {
+            return LoginItemToggleResult(isEnabled: isEnabled, feedback: nil)
+        }
+
+        let action = requestedEnabled ? "开启" : "关闭"
+        let stateNote = before == after ? "系统状态未改变" : "系统状态未按预期更新"
+        let retryEnabled = requestedEnabled
+
+        if let error {
+            return LoginItemToggleResult(
+                isEnabled: isEnabled,
+                feedback: LoginItemToggleFeedback(
+                    message: "无法\(action)登录项：\(error.localizedDescription)（\(stateNote)）。请打开“系统设置 > 通用 > 登录项”检查设置，然后重试。",
+                    retryEnabled: retryEnabled
+                )
+            )
+        }
+
+        if after == .notFound {
+            return LoginItemToggleResult(
+                isEnabled: isEnabled,
+                feedback: LoginItemToggleFeedback(
+                    message: "系统未找到 EZ Switch 的登录项（\(stateNote)）。请先将 EZ Switch 放入“应用程序”文件夹，再打开登录项设置重试。",
+                    retryEnabled: retryEnabled
+                )
+            )
+        }
+
+        return LoginItemToggleResult(
+            isEnabled: isEnabled,
+            feedback: LoginItemToggleFeedback(
+                message: "\(action)登录项未生效，\(stateNote)。请打开“系统设置 > 通用 > 登录项”检查设置，然后重试。",
+                retryEnabled: retryEnabled
+            )
+        )
+    }
+}
+
+@MainActor
+final class LoginItemDraft: ObservableObject {
+    @Published var isEnabled = false
+    @Published var errorMessage: String?
+    @Published var retryEnabled: Bool?
+}
+
 struct GeneralPane: View {
     @ObservedObject var store: ConfigStore
     @StateObject private var draft = GeneralDraft()
-    @StateObject private var updater = UpdateChecker()
+    @StateObject private var loginItem = LoginItemDraft()
+    @ObservedObject private var updater = UpdateChecker.shared
 
     private var validPort: Int? {
         guard let port = Int(draft.port), (1...65535).contains(port) else { return nil }
@@ -95,7 +186,29 @@ struct GeneralPane: View {
                 }
             }
             Section("启动") {
-                Toggle("登录时启动", isOn: Binding(get: { store.loginItemEnabled }, set: { _ in store.toggleLoginItem() }))
+                Toggle("登录时启动", isOn: Binding(
+                    get: { loginItem.isEnabled },
+                    set: { setLoginItemEnabled($0) }
+                ))
+                if let error = loginItem.errorMessage {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(error)
+                            .textSelection(.enabled)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.red)
+
+                    HStack {
+                        if let retryEnabled = loginItem.retryEnabled {
+                            Button("重试") { setLoginItemEnabled(retryEnabled) }
+                        }
+                        Button("打开登录项设置") {
+                            SMAppService.openSystemSettingsLoginItems()
+                        }
+                    }
+                    .controlSize(.small)
+                }
             }
             Section("Harness 配置提示词") {
                 Text("将 EZ Switch 配置为你的 Harness 供应商：选择要接入的工具并复制提示词。")
@@ -128,6 +241,10 @@ struct GeneralPane: View {
                     Spacer()
                     Text(appVersion).foregroundStyle(.secondary)
                 }
+                Toggle("自动检查更新", isOn: Binding(
+                    get: { updater.automaticallyChecksForUpdates },
+                    set: { updater.setAutomaticallyChecksForUpdates($0) }
+                ))
                 updateContent
             }
             Section("配置文件") {
@@ -139,13 +256,74 @@ struct GeneralPane: View {
         .navigationTitle("通用")
         .onAppear {
             draft.port = String(store.config.port)
+            refreshLoginItemState()
         }
         .onChange(of: store.config.port) { port in draft.port = String(port) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshLoginItemState()
+        }
     }
 
     private func savePort() {
         guard let port = validPort, port != store.config.port else { return }
         store.setPort(port)
+    }
+
+    private func setLoginItemEnabled(_ enabled: Bool) {
+        let before = SMAppService.mainApp.status
+
+        var operationError: Error?
+        do {
+            switch LoginItemToggleEvaluator.action(requestedEnabled: enabled, status: before) {
+            case .register:
+                try SMAppService.mainApp.register()
+            case .unregister:
+                try SMAppService.mainApp.unregister()
+            case .none:
+                break
+            }
+        } catch {
+            operationError = error
+        }
+
+        let after = SMAppService.mainApp.status
+        let result = LoginItemToggleEvaluator.evaluate(
+            requestedEnabled: enabled,
+            before: before,
+            after: after,
+            error: operationError
+        )
+        apply(result)
+        Log.shared.log("login item: requested=\(enabled), before=\(before), after=\(after), error=\(String(describing: operationError))")
+    }
+
+    private func refreshLoginItemState() {
+        let status = SMAppService.mainApp.status
+        loginItem.isEnabled = status == .enabled
+
+        if status == .requiresApproval {
+            apply(LoginItemToggleEvaluator.evaluate(
+                requestedEnabled: true,
+                before: status,
+                after: status,
+                error: nil
+            ))
+        } else if status == .enabled, loginItem.retryEnabled == true {
+            clearLoginItemError()
+        } else if status == .notRegistered, loginItem.retryEnabled == false {
+            clearLoginItemError()
+        }
+    }
+
+    private func apply(_ result: LoginItemToggleResult) {
+        loginItem.isEnabled = result.isEnabled
+        loginItem.errorMessage = result.feedback?.message
+        loginItem.retryEnabled = result.feedback?.retryEnabled
+    }
+
+    private func clearLoginItemError() {
+        loginItem.errorMessage = nil
+        loginItem.retryEnabled = nil
     }
 
     @ViewBuilder

@@ -113,7 +113,7 @@ final class SettingsNav: ObservableObject {
 
 struct SettingsView: View {
     @ObservedObject var store: ConfigStore
-    @StateObject private var nav = SettingsNav()
+    @ObservedObject var nav: SettingsNav
 
     var body: some View {
         HStack(spacing: 0) {
@@ -353,6 +353,7 @@ final class FakeEditDraft: ObservableObject {
     @Published var modelID: String
     @Published var remoteID: UUID?
     @Published var confirmDelete = false
+    @Published var modelTouched = false
 
     init(source: FakeModel?) {
         modelID = source?.fakeModelID ?? ""
@@ -379,8 +380,9 @@ struct FakeEditSheet: View {
                 Section("客户端模型") {
                     TextField("对外模型 ID", text: $draft.modelID)
                         .font(.system(.body, design: .monospaced))
+                        .onChange(of: draft.modelID) { _ in draft.modelTouched = true }
 
-                    if let error = errorText {
+                    if draft.modelTouched, let error = errorText {
                         Text(error).font(.caption).foregroundStyle(.red)
                     }
                 }

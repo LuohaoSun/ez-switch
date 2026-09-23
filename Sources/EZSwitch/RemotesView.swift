@@ -7,10 +7,11 @@ import AppKit
 @MainActor
 final class RemotesViewDraft: ObservableObject {
     @Published var query = ""
-    @Published var newModelTemplate: RemoteModel?
     @Published var target: RemoteEditTarget?
     @Published var provider: RemoteGroup?
     @Published var selection: RemoteListSelection?
+    @Published var newModel = ""
+    @Published var modelError: String?
     @Published var deletion: RemoteModel?
     @Published var providerDeletion: RemoteGroup?
     @Published var confirmDelete = false
@@ -34,11 +35,6 @@ final class RemotesViewDraft: ObservableObject {
 struct RemoteEditTarget: Identifiable {
     let remote: RemoteModel?
     var id: String { remote?.id.uuidString ?? "new" }
-}
-
-private enum RemoteActionTarget {
-    case provider(RemoteGroup)
-    case model(RemoteModel)
 }
 
 enum RemoteListSelection: Hashable {
@@ -106,8 +102,31 @@ struct RemotesView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }.padding(20)
+                    HStack(spacing: 8) {
+                        TextField("模型 ID", text: $ui.newModel)
+                            .font(.system(.body, design: .monospaced))
+                            .onSubmit { addModel(to: group.provider) }
+                            .onChange(of: ui.newModel) { _ in ui.modelError = nil }
+                        Button { addModel(to: group.provider) } label: {
+                            Image(systemName: "plus")
+                        }
+                        .help("添加模型到 \(group.provider)")
+                        .disabled(ui.newModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    .padding(.horizontal, 20)
+                    if let error = ui.modelError {
+                        Text(error).font(.caption).foregroundStyle(.red)
+                            .padding(.horizontal, 20).padding(.top, 4)
+                    }
                     List(selection: modelSelection) {
-                        ForEach(group.remotes) { remote in row(for: remote) }
+                        ForEach(group.remotes) { remote in
+                            EditableModelRow(store: store, remote: remote, used: usedIDs.contains(remote.id),
+                                             canReorder: ui.query.isEmpty) {
+                                ui.selection = .model(remote.id)
+                                requestDelete()
+                            }
+                            .tag(remote.id)
+                        }
                             .onMove { offsets, destination in
                                 guard ui.query.isEmpty else { return }
                                 let sources = offsets.map { group.remotes[$0].id }
@@ -126,23 +145,28 @@ struct RemotesView: View {
             }.frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity)
         }
         .onChange(of: ui.query) { _ in reconcileSelection() }
+        .onChange(of: currentGroup?.provider) { _ in
+            ui.newModel = ""
+            ui.modelError = nil
+        }
         .onChange(of: store.config.remotes) { _ in reconcileSelection() }
         .onChange(of: store.config.fakes) { _ in reconcileSelection() }
+        .onAppear { reconcileSelection() }
         .searchable(text: $ui.query, prompt: "搜索所有供应商、模型或 URL")
         .navigationTitle("供应商")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { addItem() } label: {
-                    Label(isModelTarget ? "添加模型" : "添加供应商", systemImage: "plus")
-                }.help(isModelTarget ? "在当前供应商下添加模型" : "添加供应商")
-                Button { editSelected() } label: {
-                    Label(isModelTarget ? "编辑模型" : "编辑供应商", systemImage: "pencil")
-                }.disabled(actionTarget == nil)
-                    .help(isModelTarget ? "编辑选中的模型" : "编辑选中的供应商")
-                Button { requestDelete() } label: {
-                    Label(isModelTarget ? "删除模型" : "删除供应商", systemImage: "trash")
-                }.disabled(actionTarget == nil)
-                    .help(isModelTarget ? "删除选中的模型" : "删除选中的供应商")
+                Button { ui.target = RemoteEditTarget(remote: nil) } label: {
+                    Label("添加供应商", systemImage: "plus")
+                }.help("添加供应商")
+                Button { editProvider() } label: {
+                    Label("编辑供应商", systemImage: "pencil")
+                }.disabled(currentGroup == nil)
+                    .help("编辑当前供应商")
+                Button { requestProviderDelete() } label: {
+                    Label("删除供应商", systemImage: "trash")
+                }.disabled(currentGroup == nil)
+                    .help("删除当前供应商")
             }
         }
         .sheet(item: $ui.provider) { group in
@@ -152,7 +176,7 @@ struct RemotesView: View {
             }.id(group.id)
         }
         .sheet(item: $ui.target) { t in
-            RemoteEditSheet(store: store, source: t.remote, template: ui.newModelTemplate)
+            RemoteEditSheet(store: store, source: t.remote)
                 .id(t.id)   // 换条目时重建 draft
         }
         .alert(Text(deletionTitle), isPresented: $ui.confirmDelete) {
@@ -198,8 +222,7 @@ struct RemotesView: View {
 
     private var providerSelection: Binding<String?> {
         Binding(get: {
-            if case .provider(let provider) = ui.selection { return provider }
-            return nil
+            return currentGroup?.provider
         }, set: { value in
             guard let value else {
                 if case .provider = ui.selection { ui.selection = nil }
@@ -233,71 +256,47 @@ struct RemotesView: View {
         return summaries.count == 1 ? summaries.first! : "\(summaries.count) 种协议配置 · 编辑供应商可统一设置"
     }
 
-    private var actionTarget: RemoteActionTarget? {
-        switch ui.selection {
-        case .provider(let provider):
-            guard visibleGroups.contains(where: { $0.provider == provider }) else { return nil }
-            return .provider(RemoteGroup(provider: provider, remotes: allProviderRemotes(provider)))
-        case .model(let id):
-            guard visibleGroups.contains(where: { group in group.remotes.contains { $0.id == id } }),
-                  let remote = store.config.remotes.first(where: { $0.id == id })
-            else { return nil }
-            return .model(remote)
-        case nil:
-            return nil
-        }
+    private func addModel(to provider: String) {
+        guard !ui.newModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        ui.modelError = store.addModel(provider: provider, model: ui.newModel)
+        guard ui.modelError == nil else { return }
+        ui.query = ""
+        ui.newModel = ""
+        if let added = store.config.remotes.last { ui.selection = .model(added.id) }
     }
 
-    private var isModelTarget: Bool {
-        if case .model = actionTarget { return true }
-        return false
-    }
-
-    private func addItem() {
-        switch actionTarget {
-        case .model:
-            ui.newModelTemplate = allCurrentRemotes.first
-        case .provider, nil:
-            ui.newModelTemplate = nil
-        }
-        ui.target = RemoteEditTarget(remote: nil)
-    }
-
-    private func editSelected() {
-        switch actionTarget {
-        case .provider(let group):
-            ui.provider = group
-        case .model(let remote):
-            ui.target = RemoteEditTarget(remote: remote)
-        case nil:
-            break
-        }
+    private func editProvider() {
+        guard let provider = currentGroup?.provider else { return }
+        ui.provider = RemoteGroup(provider: provider, remotes: allProviderRemotes(provider))
     }
 
     private func requestDelete() {
-        switch actionTarget {
-        case .provider(let group):
-            ui.providerDeletion = group
-            ui.deletion = nil
-        case .model(let remote):
-            ui.deletion = remote
-            ui.providerDeletion = nil
-        case nil:
-            return
-        }
+        guard case .model(let id) = ui.selection,
+              let remote = store.config.remotes.first(where: { $0.id == id }) else { return }
+        ui.deletion = remote
+        ui.providerDeletion = nil
+        ui.confirmDelete = true
+    }
+
+    private func requestProviderDelete() {
+        guard let provider = currentGroup?.provider else { return }
+        ui.providerDeletion = RemoteGroup(provider: provider, remotes: allProviderRemotes(provider))
+        ui.deletion = nil
         ui.confirmDelete = true
     }
 
     private func reconcileSelection() {
         switch ui.selection {
         case .provider(let provider):
-            if !visibleGroups.contains(where: { $0.provider == provider }) { ui.selection = nil }
+            if !visibleGroups.contains(where: { $0.provider == provider }) {
+                ui.selection = visibleGroups.first.map { .provider($0.provider) }
+            }
         case .model(let id):
             if !visibleGroups.contains(where: { group in group.remotes.contains { $0.id == id } }) {
-                ui.selection = nil
+                ui.selection = visibleGroups.first.map { .provider($0.provider) }
             }
         case nil:
-            break
+            ui.selection = visibleGroups.first.map { .provider($0.provider) }
         }
     }
 
@@ -327,50 +326,101 @@ struct RemotesView: View {
             : "以下路由将失去目标：\(routes.joined(separator: "、"))。")
     }
 
-    @ViewBuilder
-    private func row(for remote: RemoteModel) -> some View {
-        HStack(spacing: 14) {
-            if ui.query.isEmpty {
-                Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
-                    .help("拖动调整模型顺序")
-            }
-            Text(remote.model)
-                .font(.system(.body, design: .monospaced).weight(.medium))
-                .lineLimit(1).truncationMode(.middle)
-                .help(([remote.model, remote.endpointSummary] + remote.endpointBaseURLs).joined(separator: "\n"))
-                .layoutPriority(1)
-            Spacer(minLength: 8)
-            if usedIDs.contains(remote.id) {
-                Image(systemName: "arrow.triangle.branch")
-                    .foregroundStyle(.secondary)
-                    .help("用于：" + store.config.fakes.filter { $0.remoteID == remote.id }
-                        .map(\.fakeModelID).joined(separator: "、"))
-                    .accessibilityLabel("已用于路由")
-            }
-            if remote.needsCredentials {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .foregroundStyle(.orange).help("凭据待配置")
-                    .accessibilityLabel("凭据待配置")
-            }
-        }
-        .modifier(NativeListRow())
-        .tag(remote.id)
-        .moveDisabled(!ui.query.isEmpty)
-        .contextMenu {
-            Button("编辑…") { ui.target = RemoteEditTarget(remote: remote) }
-            Button("复制模型 ID") { copyText(remote.model) }
-            Divider()
-            Button("删除…", role: .destructive) {
-                ui.selection = .model(remote.id)
-                requestDelete()
-            }
-        }
-    }
-
     /// 行尾只显示 host（拿不到 host 时退回整串）
     static func host(of baseURL: String) -> String {
         if let u = URL(string: baseURL), let h = u.host, !h.isEmpty { return h }
         return baseURL
+    }
+}
+
+@MainActor
+final class ModelRowDraft: ObservableObject {
+    @Published var model: String
+    @Published var error: String?
+
+    init(model: String) { self.model = model }
+}
+
+private struct EditableModelRow: View {
+    @ObservedObject var store: ConfigStore
+    let remote: RemoteModel
+    let used: Bool
+    let canReorder: Bool
+    let onDelete: () -> Void
+    @StateObject private var draft: ModelRowDraft
+
+    init(store: ConfigStore, remote: RemoteModel, used: Bool, canReorder: Bool,
+         onDelete: @escaping () -> Void) {
+        self.store = store
+        self.remote = remote
+        self.used = used
+        self.canReorder = canReorder
+        self.onDelete = onDelete
+        _draft = StateObject(wrappedValue: ModelRowDraft(model: remote.model))
+    }
+
+    private var changed: Bool { draft.model != remote.model }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                if canReorder {
+                    Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
+                        .help("拖动调整模型顺序")
+                }
+                TextField("模型 ID", text: $draft.model)
+                    .font(.system(.body, design: .monospaced).weight(.medium))
+                    .textFieldStyle(.plain)
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                    .onSubmit { save() }
+                    .onChange(of: draft.model) { _ in draft.error = nil }
+                    .help(([remote.model, remote.endpointSummary] + remote.endpointBaseURLs).joined(separator: "\n"))
+                if changed {
+                    Button { save() } label: { Image(systemName: "checkmark") }
+                        .buttonStyle(.borderless).help("保存模型 ID")
+                    Button {
+                        draft.model = remote.model
+                        draft.error = nil
+                    } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.borderless).help("取消修改")
+                }
+                if used {
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundStyle(.secondary)
+                        .help("用于：" + store.config.fakes.filter { $0.remoteID == remote.id }
+                            .map(\.fakeModelID).joined(separator: "、"))
+                        .accessibilityLabel("已用于路由")
+                }
+                if remote.needsCredentials {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(.orange).help("凭据待配置")
+                        .accessibilityLabel("凭据待配置")
+                }
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless).help("删除模型")
+                .accessibilityLabel("删除模型 \(remote.model)")
+            }
+            if let error = draft.error {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .modifier(NativeListRow())
+        .moveDisabled(!canReorder)
+        .onChange(of: remote.model) { newValue in
+            draft.model = newValue
+            draft.error = nil
+        }
+        .contextMenu {
+            Button("复制模型 ID") { copyText(remote.model) }
+            Button("删除…", role: .destructive, action: onDelete)
+        }
+    }
+
+    private func save() {
+        guard changed else { return }
+        draft.error = store.updateModel(id: remote.id, model: draft.model)
     }
 }
 
@@ -393,6 +443,9 @@ final class RemoteEditDraft: ObservableObject {
     @Published var revealKey = false
     @Published var confirmDelete = false
     @Published var error: String?
+    @Published var modelTouched = false
+    @Published var providerTouched = false
+    @Published var endpointsTouched = false
 
     init(source: RemoteModel?) {
         let split = splitProviderModel(source?.name ?? "")
@@ -432,6 +485,10 @@ struct RemoteEditSheet: View {
                 Section("供应商") {
                     if managesConnection {
                         TextField("名称", text: $draft.providerName)
+                            .onChange(of: draft.providerName) { _ in draft.providerTouched = true }
+                        if draft.providerTouched, let error = providerError {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        }
                     } else {
                         Text(draft.providerName)
                             .textSelection(.enabled)
@@ -441,8 +498,9 @@ struct RemoteEditSheet: View {
                 Section(managesConnection ? "首个模型" : "模型") {
                     TextField("模型 ID", text: $draft.model)
                         .font(.system(.body, design: .monospaced))
+                        .onChange(of: draft.model) { _ in draft.modelTouched = true }
 
-                    if draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if draft.modelTouched && draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text("模型 ID 不能为空").font(.caption).foregroundStyle(.red)
                     }
                 }
@@ -450,6 +508,7 @@ struct RemoteEditSheet: View {
                 if managesConnection {
                     Section("接口协议") {
                         EndpointSettingsEditor(settings: $draft.endpoints)
+                            .onChange(of: draft.endpoints) { _ in draft.endpointsTouched = true }
                         Text("启用哪些协议就填写对应 Base URL；Base URL 是完整前缀，路由器只追加协议相对路径。")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -497,7 +556,8 @@ struct RemoteEditSheet: View {
             }
             .formStyle(.grouped)
 
-            if let err = errorText ?? draft.error {
+            if let err = draft.error ?? (draft.modelTouched || draft.providerTouched || draft.endpointsTouched
+                                         ? connectionError : nil) {
                 Text(err)
                     .font(.caption)
                     .foregroundColor(.red)
@@ -554,14 +614,26 @@ struct RemoteEditSheet: View {
 
     /// 即时校验（红字）；nil = 可以保存
     private var errorText: String? {
-        if draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "模型 ID 不能为空"
-        }
-        if managesConnection,
-           let error = ConfigStore.validateEndpoints(ConfigStore.normalizedEndpoints(draft.endpoints)) {
-            return error
+        if draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "模型 ID 不能为空" }
+        return providerError ?? connectionError
+    }
+
+    private var providerError: String? {
+        guard managesConnection else { return nil }
+        let provider = draft.providerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = draft.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = (provider.isEmpty || provider == model) ? model : provider
+        if name.isEmpty { return nil }
+        if name.contains(" · ") { return "供应商名称不能包含 · 分隔符" }
+        if store.config.remotes.contains(where: { splitProviderModel($0.name).provider == name }) {
+            return "该供应商名称已存在"
         }
         return nil
+    }
+
+    private var connectionError: String? {
+        guard managesConnection else { return nil }
+        return ConfigStore.validateEndpoints(ConfigStore.normalizedEndpoints(draft.endpoints))
     }
 
     private func save() {

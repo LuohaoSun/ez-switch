@@ -166,6 +166,43 @@ struct ConfigStoreTests {
     }
 
     @Test
+    func addRemoteRejectsExistingProviderName() throws {
+        let existing = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                                  baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [existing], fakes: [])
+        let incoming = makeRemote(name: "Alpha · two", model: "two", apiKey: "b",
+                                  baseURL: "https://alpha.example")
+
+        let error = store.addRemote(incoming)
+
+        #expect(error == "该供应商名称已存在")
+        #expect(store.config.remotes == [existing])
+    }
+
+    @Test
+    func addRemoteRejectsEquivalentDuplicateModelWithoutMutation() throws {
+        let existing = makeRemote(name: "Alpha", model: "one", apiKey: "a",
+                                  baseURL: "https://alpha.example")
+        let route = FakeModel(id: UUID(), fakeModelID: "router", displayName: "router",
+                              remoteID: existing.id)
+        let store = try makeStore(remotes: [existing], fakes: [route])
+        let before = store.config
+        let incoming = makeRemote(name: "Alpha · one", model: "one", apiKey: "b",
+                                  baseURL: "https://alpha.example")
+
+        let error = store.addRemote(incoming)
+
+        #expect(error == "该供应商下模型 ID 已存在")
+        #expect(store.config.remotes == before.remotes)
+        #expect(store.config.fakes == before.fakes)
+        #expect(store.router.route(fakeModelID: "router")?.remote.id == existing.id)
+
+        let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: store.configURL))
+        #expect(persisted.remotes == before.remotes)
+        #expect(persisted.fakes == before.fakes)
+    }
+
+    @Test
     func fakeRouteIsSharedAcrossAPIFormats() throws {
         let remote = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
                                 baseURL: "https://alpha.example")

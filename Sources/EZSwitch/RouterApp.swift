@@ -23,8 +23,10 @@ private final class AppWindowManager {
     static let shared = AppWindowManager()
 
     private var settingsWindow: NSWindow?
+    private let settingsNav = SettingsNav()
 
-    func showSettings(store: ConfigStore) {
+    func showSettings(store: ConfigStore, section: SettingsSection? = nil) {
+        if let section { settingsNav.section = section }
         if let settingsWindow {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
@@ -32,7 +34,7 @@ private final class AppWindowManager {
             return
         }
 
-        let hosting = NSHostingController(rootView: SettingsView(store: store))
+        let hosting = NSHostingController(rootView: SettingsView(store: store, nav: settingsNav))
         let window = NSWindow(contentViewController: hosting)
         window.title = AppBrand.name
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
@@ -51,6 +53,7 @@ private final class AppWindowManager {
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UpdateChecker.shared.startAutomaticChecks()
         if AppLaunchContext.shouldShowPanel(for: NSAppleEventManager.shared().currentAppleEvent) {
             AppWindowManager.shared.showSettings(store: ConfigStore.shared)
         }
@@ -90,12 +93,7 @@ struct RouterApp: App {
                     NSApplication.shared.orderFrontStandardAboutPanel(nil)
                 }
             }
-            CommandGroup(replacing: .appSettings) {
-                Button("设置…") {
-                    AppWindowManager.shared.showSettings(store: store)
-                }
-                .keyboardShortcut(",", modifiers: .command)
-            }
+            CommandGroup(replacing: .appSettings) {}
             CommandGroup(replacing: .help) {
                 Button("\(AppBrand.name) 帮助") {
                     showHelp()
@@ -117,10 +115,11 @@ struct RouterApp: App {
 /// 菜单栏图标
 private struct MenuBarLabel: View {
     @ObservedObject var store: ConfigStore
+    @ObservedObject private var updater = UpdateChecker.shared
 
     var body: some View {
-        Image(systemName: store.serverError != nil ? "exclamationmark.triangle" : store.runningPort == nil ? "network.slash" : "arrow.triangle.branch")
-            .accessibilityLabel(store.serviceTitle)
+        Image(systemName: store.serverError != nil ? "exclamationmark.triangle" : store.runningPort == nil ? "network.slash" : updater.availableRelease != nil ? "arrow.down.circle" : "arrow.triangle.branch")
+            .accessibilityLabel(updater.availableRelease.map { "\(store.serviceTitle)，新版本 \($0.version) 可用" } ?? store.serviceTitle)
     }
 }
 
@@ -138,6 +137,7 @@ private struct MenuBarContent: View {
 
 struct MenuView: View {
     @ObservedObject var store: ConfigStore
+    @ObservedObject private var updater = UpdateChecker.shared
 
     var body: some View {
         if let err = store.serverError {
@@ -146,6 +146,12 @@ struct MenuView: View {
         Text(store.serviceTitle)
         Button("复制本地地址 · " + store.connectionURL) { copyText(store.connectionURL) }
             .disabled(store.runningPort == nil)
+
+        if let release = updater.availableRelease {
+            Button("新版本 \(release.version) 可用…") {
+                AppWindowManager.shared.showSettings(store: store, section: .general)
+            }
+        }
 
         Divider()
 
