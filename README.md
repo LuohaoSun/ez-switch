@@ -99,6 +99,20 @@ export ANTHROPIC_MODEL=main
 claude
 ```
 
+## 命令行切换
+
+新版本应用包内含 `Contents/MacOS/ezs`，DMG 根目录也提供独立的 `ezs` 可执行文件。例如将 DMG 中的 `ezs` 复制到 `~/.local/bin/`，并确保该目录已在 `PATH` 中，之后可在终端运行：
+
+```bash
+ezs --help
+ezs list
+ezs set main --provider "command-wsz" --model "deepseek/deepseek-v4.1-flash"
+# 当名称有歧义时，可通过配置中的 UUID 精确指定：
+ezs set main --remote-id <UUID>
+```
+
+`list` 一次显示当前本机模型 ID 的绑定及各供应商下的可选模型。`set` 会让正在运行的 EZ Switch 立即切换并保存；应用未运行时命令报错。CLI 经用户私有目录中的 Unix socket 与应用通信，不直接修改配置文件。使用自定义 `EZSWITCH_CONFIG`（或旧 `MODEL_ROUTER_CONFIG`）启动应用时，CLI 需使用相同的环境变量。正在执行的请求仍使用切换前选中的上游。
+
 ## 切换模型
 
 ![EZ Switch 菜单栏菜单](Resources/MenuBar.png)
@@ -131,3 +145,13 @@ claude
 ## 许可证
 
 [MIT License](LICENSE)
+
+## Responses → Chat 转换预览
+
+`./build-feature.sh` 构建独立的 `dist/EZSwitch-ChatPreview.app`（不安装，也不覆盖当前 `/Applications/EZSwitch.app`）。构建需要 Swift 与 Go 1.26+；可通过 `GO_BIN=/path/to/go ./build-feature.sh` 指定 Go。预览版使用同一份 EZ Switch 配置时会影响同一组路由，因此建议测试时设置独立的 `EZSWITCH_CONFIG` 和不同服务端口，再启动预览 App。预览版签名与正式版不同，不自动注册开机启动。
+
+运行 `./run-feature.sh` 可启动独立预览实例：首次将现有配置复制到 `~/Library/Application Support/EZSwitch-ChatPreview/config.json`，监听 `18988`，后续不会覆盖这份预览配置。Codex 测试客户端的 Base URL 应指向 `http://127.0.0.1:18988/v1`。可通过 `EZSWITCH_PREVIEW_PORT` 修改预览端口。
+
+在供应商设置里，将 Responses 设为“转发到 Chat”，并启用 Chat Completions、填写其 Base URL；无需另填转发地址。Codex 仍请求 EZ Switch 的 `/v1/responses`；预览版经 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 转换器生成 Chat 请求，并把上游 Chat 响应转换为 Responses 流或 JSON。未选转换的路由保持原生 Responses 转发。第三方组件的许可证和版本见 [ThirdParty/README.md](ThirdParty/README.md)。
+
+此模式要求 Codex 在 `input` 中发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩；遇到这些功能应使用原生 Responses 上游。已验证普通请求、流式结束、工具调用与结果续接。协议转换不是无损的，正式使用前仍需在目标供应商和具体 Codex 版本上测试长会话、并行工具和压缩行为。

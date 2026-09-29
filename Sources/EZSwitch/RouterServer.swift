@@ -137,7 +137,7 @@ enum RequestProcessor {
             return
         }
 
-        let endpointBaseURL = remote.endpointSetting(for: endpoint).baseURL
+        let endpointBaseURL = remote.endpointSetting(for: endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint).baseURL
         Log.shared.log("[\(endpoint.rawValue)] \(head.method) \(path) model=\(fake.fakeModelID) → \(remote.name) \(hostOf(endpointBaseURL))/\(remote.model)")
 
         let started = Date()
@@ -148,7 +148,8 @@ enum RequestProcessor {
                                                        endpoint: endpoint, remote: remote, query: query)
         } catch {
             Log.shared.log("[\(endpoint.rawValue)] upstream failed: \(error)")
-            await writeJSON(channel: channel, status: 502,
+            let status = (error as? ResponseTranslationError)?.clientError == true ? 400 : 502
+            await writeJSON(channel: channel, status: status,
                             object: ["error": ["message": "upstream: \(error)"]])
             return
         }
@@ -158,7 +159,8 @@ enum RequestProcessor {
         let isSSE = (upstream.response.value(forHTTPHeaderField: "content-type") ?? "")
             .lowercased().contains("text/event-stream")
         let isSuccess = (200..<300).contains(upstream.response.statusCode)
-        let reorderer: SSEReorderer? = (endpoint == .responses && isSuccess && isSSE) ? SSEReorderer() : nil
+        let converting = endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions
+        let reorderer: SSEReorderer? = (endpoint == .responses && isSuccess && isSSE && !converting) ? SSEReorderer() : nil
 
         func write(_ chunk: ByteBuffer) async throws -> Int {
             guard let reorderer else {

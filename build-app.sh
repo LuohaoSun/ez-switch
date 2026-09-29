@@ -17,6 +17,9 @@ BUNDLE_ID=local.sunluohao.ezswitch
 INSTALL_DIR=/Applications
 DIST=dist/$APP_NAME.app
 
+echo "==> Responses translator"
+./build-translator.sh
+
 echo "==> swift build -c release"
 swift build -c release
 
@@ -24,6 +27,11 @@ echo "==> 组装 $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST/Contents/MacOS" "$DIST/Contents/Resources"
 cp .build/release/$APP_NAME "$DIST/Contents/MacOS/$APP_NAME"
+cp .build/release/ezs "$DIST/Contents/MacOS/ezs"
+cp .build/ezs-responses-bridge "$DIST/Contents/MacOS/ezs-responses-bridge"
+cp -R .build/bridge-licenses "$DIST/Contents/Resources/ThirdPartyLicenses"
+cp ThirdParty/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/README.md"
+codesign --force -s - "$DIST/Contents/MacOS/ezs-responses-bridge"
 cp Resources/Info.plist "$DIST/Contents/Info.plist"
 cp Resources/AppIcon.icns "$DIST/Contents/Resources/AppIcon.icns"
 

@@ -5,7 +5,8 @@ let package = Package(
     name: "EZSwitch",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "EZSwitch", targets: ["EZSwitch"])
+        .executable(name: "EZSwitch", targets: ["EZSwitch"]),
+        .executable(name: "ezs", targets: ["EZSCLI"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.62.0")
@@ -28,6 +29,7 @@ let package = Package(
                               "-Xlinker", "27.0"])
             ]
         ),
+        .executableTarget(name: "EZSCLI", path: "Sources/EZSCLI"),
         .testTarget(
             name: "EZSwitchTests",
             dependencies: ["EZSwitch"],

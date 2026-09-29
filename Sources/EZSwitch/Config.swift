@@ -35,16 +35,30 @@ struct EndpointSetting: Codable, Equatable, Hashable {
     static let disabled = EndpointSetting(enabled: false, baseURL: "")
 }
 
+enum ResponsesTransport: String, Codable, CaseIterable {
+    case native
+    case chatCompletions
+}
+
+enum ResponsesMode: Hashable {
+    case disabled
+    case native
+    case chatCompletions
+}
+
 /// 供应商级协议配置。每个模型复制同一份配置，UI 只允许在供应商设置中修改。
 struct APIEndpointSettings: Codable, Equatable, Hashable {
     var chat: EndpointSetting
     var responses: EndpointSetting
     var messages: EndpointSetting
+    var responsesTransport: ResponsesTransport
 
-    init(chat: EndpointSetting, responses: EndpointSetting, messages: EndpointSetting) {
+    init(chat: EndpointSetting, responses: EndpointSetting, messages: EndpointSetting,
+         responsesTransport: ResponsesTransport = .native) {
         self.chat = chat
         self.responses = responses
         self.messages = messages
+        self.responsesTransport = responsesTransport
     }
 
     init(from decoder: Decoder) throws {
@@ -52,6 +66,7 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
         chat = try c.decodeIfPresent(EndpointSetting.self, forKey: .chat) ?? .disabled
         responses = try c.decodeIfPresent(EndpointSetting.self, forKey: .responses) ?? .disabled
         messages = try c.decodeIfPresent(EndpointSetting.self, forKey: .messages) ?? .disabled
+        responsesTransport = try c.decodeIfPresent(ResponsesTransport.self, forKey: .responsesTransport) ?? .native
     }
 
     subscript(kind: EndpointKind) -> EndpointSetting {
@@ -72,7 +87,30 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
     }
 
     var enabledKinds: [EndpointKind] {
-        EndpointKind.allCases.filter { self[$0].enabled }
+        EndpointKind.allCases.filter { $0 == .responses ? supportsResponses : self[$0].enabled }
+    }
+
+    var supportsResponses: Bool {
+        responsesTransport == .chatCompletions ? chat.enabled : responses.enabled
+    }
+
+    var responsesMode: ResponsesMode {
+        if responsesTransport == .chatCompletions { return .chatCompletions }
+        return responses.enabled ? .native : .disabled
+    }
+
+    mutating func setResponsesMode(_ mode: ResponsesMode) {
+        switch mode {
+        case .disabled:
+            responsesTransport = .native
+            responses.enabled = false
+        case .native:
+            responsesTransport = .native
+            responses.enabled = true
+        case .chatCompletions:
+            responsesTransport = .chatCompletions
+            responses.enabled = false
+        }
     }
 
     static func all(baseURL: String) -> APIEndpointSettings {
@@ -226,10 +264,24 @@ struct RemoteModel: Codable, Identifiable, Equatable, Hashable {
 extension RemoteModel {
     func endpointSetting(for kind: EndpointKind) -> EndpointSetting { apiEndpoints[kind] }
 
-    func supports(_ kind: EndpointKind) -> Bool { apiEndpoints[kind].enabled }
+    func supports(_ kind: EndpointKind) -> Bool {
+        if kind == .responses, apiEndpoints.responsesTransport == .chatCompletions {
+            return apiEndpoints.chat.enabled
+        }
+        return apiEndpoints[kind].enabled
+    }
 
     var endpointBaseURLs: [String] {
-        EndpointKind.allCases.map { apiEndpoints[$0].baseURL }.filter { !$0.isEmpty }
+        let activeURLs: [String] = EndpointKind.allCases.compactMap { kind -> String? in
+            guard supports(kind) else { return nil }
+            let effectiveKind: EndpointKind = kind == .responses && apiEndpoints.responsesTransport == .chatCompletions
+                ? .chat : kind
+            let url = apiEndpoints[effectiveKind].baseURL
+            return url.isEmpty ? nil : url
+        }
+        return activeURLs.reduce(into: [String]()) { urls, url in
+            if !urls.contains(url) { urls.append(url) }
+        }
     }
 
     var endpointSummary: String {
@@ -364,6 +416,7 @@ final class ConfigStore: ObservableObject {
     let router = Router()
 
     private var server: RouterServer?
+    private var cliServer: CLIControlServer?
     private var dirSource: DispatchSourceFileSystemObject?
     private var reloadTask: Task<Void, Never>?
     private var started = false
@@ -918,8 +971,12 @@ final class ConfigStore: ObservableObject {
     }
 
     static func validateEndpoints(_ settings: APIEndpointSettings) -> String? {
+        if settings.responsesTransport == .chatCompletions && !settings.chat.enabled {
+            return "Responses 转换需要启用 Chat Completions 并填写其 Base URL"
+        }
         var enabled = 0
         for kind in EndpointKind.allCases {
+            if kind == .responses && settings.responsesTransport == .chatCompletions { continue }
             let setting = settings[kind]
             guard setting.enabled else { continue }
             enabled += 1
@@ -995,6 +1052,14 @@ final class ConfigStore: ObservableObject {
             try s.start(port: port)
             runningPort = port
             Log.shared.log("server: listening on http://127.0.0.1:\(port)")
+            let control = CLIControlServer(configURL: configURL)
+            do {
+                try control.start(store: self)
+                cliServer = control
+                Log.shared.log("cli: listening on \(CLIControlPath.socket(for: configURL).path)")
+            } catch {
+                Log.shared.log("cli: start failed: \(error)")
+            }
         } catch {
             serverError = "Server failed on port \(port): \(error)"
             Log.shared.log("server: start failed: \(error)")
