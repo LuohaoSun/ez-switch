@@ -26,12 +26,6 @@ private final class WorkspaceDraft: ObservableObject {
     @Published var query = ""
     @Published var collapsedProviders = Set<String>()
     @Published var collapsedRoutes = Set<UUID>()
-    @Published var cardDropTarget: String?
-    @Published var providerOrder: [String]?
-    @Published var routeOrder: [UUID]?
-    @Published var draggingProvider: String?
-    @Published var draggingRoute: UUID?
-    var dragSession = UUID()
     @Published var dropTarget: String?
     @Published var sheet: WorkspaceSheet?
     @Published var providerToDelete: String?
@@ -41,18 +35,7 @@ private final class WorkspaceDraft: ObservableObject {
 struct RouteWorkspaceView: View {
     @ObservedObject var store: ConfigStore
     @StateObject private var ui = WorkspaceDraft()
-    private let providerDragType = UTType(exportedAs: "local.sunluohao.ezswitch.provider-card")
-    private let routeDragType = UTType(exportedAs: "local.sunluohao.ezswitch.route-card")
-
-    private var groups: [RemoteGroup] {
-        let groups = store.remoteGroups(matching: ui.query)
-        guard let order = ui.providerOrder, ui.draggingProvider != nil else { return groups }
-        return groups.sorted { (order.firstIndex(of: $0.provider) ?? order.count) < (order.firstIndex(of: $1.provider) ?? order.count) }
-    }
-    private var routes: [FakeModel] {
-        guard let order = ui.routeOrder, ui.draggingRoute != nil else { return store.config.fakes }
-        return store.config.fakes.sorted { (order.firstIndex(of: $0.id) ?? order.count) < (order.firstIndex(of: $1.id) ?? order.count) }
-    }
+    private var groups: [RemoteGroup] { store.remoteGroups(matching: ui.query) }
     private var remoteByID: [UUID: RemoteModel] {
         Dictionary(uniqueKeysWithValues: store.config.remotes.map { ($0.id, $0) })
     }
@@ -127,15 +110,10 @@ struct RouteWorkspaceView: View {
                 EmptyState(title: "添加第一个供应商", detail: "先配置地址、凭据和模型，再拖到右侧路由。", symbol: "server.rack")
                 Spacer()
             } else {
-                ScrollView(showsIndicators: false) {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(groups) { group in
-                            supplierGroup(group)
-                        }
-                        cardEndTarget(type: providerDragType, key: "provider-end", delegate: providerDrop(before: nil))
-                    }.padding(.bottom, 12)
+                NativeReorderableCards(items: groups, spacing: 10, enabled: ui.query.isEmpty,
+                                       move: { store.moveProviders(sources: $0, before: $1) }) { group in
+                    supplierGroup(group)
                 }
-                .scrollIndicators(.never)
             }
         }
         .padding(16)
@@ -157,12 +135,7 @@ struct RouteWorkspaceView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(.isButton)
                 .accessibilityAction { toggleProvider(group.provider) }
-                .onDrag {
-                    ui.draggingRoute = nil
-                    ui.providerOrder = store.groupedRemotes().map(\.provider)
-                    ui.draggingProvider = group.provider
-                    return cardDragItem(group.provider, type: providerDragType)
-                }
+                .modifier(NativeCardDragHandle(id: group.id, enabled: ui.query.isEmpty))
                 .help("展开或收起；拖到其他供应商上方调整顺序")
 
                 Text("\(group.remotes.count)")
@@ -213,12 +186,6 @@ struct RouteWorkspaceView: View {
         .overlay(RoundedRectangle(cornerRadius: 11)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
         .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
-        .overlay(alignment: .top) {
-            if ui.cardDropTarget == "provider-\(group.provider)" {
-                Capsule().fill(Color.accentColor.opacity(0.6)).frame(height: 2).padding(.horizontal, 12)
-            }
-        }
-        .onDrop(of: [providerDragType.identifier], delegate: providerDrop(before: group.provider))
     }
 
     private func toggleProvider(_ provider: String) {
@@ -234,84 +201,6 @@ struct RouteWorkspaceView: View {
             if ui.collapsedRoutes.contains(id) { ui.collapsedRoutes.remove(id) }
             else { ui.collapsedRoutes.insert(id) }
         }
-    }
-
-    private func cardDragItem(_ value: String, type: UTType) -> NSItemProvider {
-        ui.dragSession = UUID()
-        let session = ui.dragSession
-        let item = WorkspaceDragItem()
-        item.finished = { [weak ui] in
-            DispatchQueue.main.async {
-                guard let ui, ui.dragSession == session else { return }
-                withAnimation(.easeInOut(duration: 0.22)) {
-                    ui.draggingProvider = nil
-                    ui.draggingRoute = nil
-                    ui.providerOrder = nil
-                    ui.routeOrder = nil
-                    ui.cardDropTarget = nil
-                }
-            }
-        }
-        item.registerDataRepresentation(forTypeIdentifier: type.identifier, visibility: .ownProcess) { completion in
-            completion(Data(value.utf8), nil)
-            return nil
-        }
-        return item
-    }
-
-    private func cardEndTarget(type: UTType, key: String, delegate: CardReorderDrop) -> some View {
-        RoundedRectangle(cornerRadius: 6)
-            .fill(ui.cardDropTarget == key ? Color.accentColor.opacity(0.08) : Color.clear)
-            .frame(height: 24)
-            .contentShape(Rectangle())
-            .onDrop(of: [type.identifier], delegate: delegate)
-    }
-
-    private func previewMove<ID: Equatable>(_ source: ID, over target: ID?, in order: [ID]) -> [ID] {
-        guard source != target, let from = order.firstIndex(of: source) else { return order }
-        var result = order
-        result.remove(at: from)
-        if let target, let to = order.firstIndex(of: target) {
-            result.insert(source, at: min(to, result.count))
-        } else { result.append(source) }
-        return result
-    }
-
-    private func providerDrop(before target: String?) -> CardReorderDrop {
-        CardReorderDrop(type: providerDragType.identifier, enabled: ui.query.isEmpty && ui.draggingProvider != nil,
-                       entered: {
-            guard let source = ui.draggingProvider else { return }
-            ui.cardDropTarget = target.map { "provider-\($0)" } ?? "provider-end"
-            withAnimation(.easeInOut(duration: 0.22)) {
-                ui.providerOrder = previewMove(source, over: target, in: ui.providerOrder ?? store.groupedRemotes().map(\.provider))
-            }
-        }, dropped: {
-            guard let source = ui.draggingProvider, let order = ui.providerOrder,
-                  let index = order.firstIndex(of: source) else { return false }
-            store.moveProviders(sources: [source], before: index + 1 < order.count ? order[index + 1] : nil)
-            ui.draggingProvider = nil
-            ui.providerOrder = nil
-            ui.cardDropTarget = nil
-            return true
-        })
-    }
-
-    private func routeDrop(before target: UUID?) -> CardReorderDrop {
-        CardReorderDrop(type: routeDragType.identifier, enabled: ui.draggingRoute != nil, entered: {
-            guard let source = ui.draggingRoute else { return }
-            ui.cardDropTarget = target.map { "route-\($0)" } ?? "route-end"
-            withAnimation(.easeInOut(duration: 0.22)) {
-                ui.routeOrder = previewMove(source, over: target, in: ui.routeOrder ?? store.config.fakes.map(\.id))
-            }
-        }, dropped: {
-            guard let source = ui.draggingRoute, let order = ui.routeOrder,
-                  let index = order.firstIndex(of: source) else { return false }
-            store.moveFakes(sources: [source], before: index + 1 < order.count ? order[index + 1] : nil)
-            ui.draggingRoute = nil
-            ui.routeOrder = nil
-            ui.cardDropTarget = nil
-            return true
-        })
     }
 
     private func acceptModelDrop(_ providers: [NSItemProvider], provider: String, before target: UUID) -> Bool {
@@ -344,15 +233,10 @@ struct RouteWorkspaceView: View {
                 EmptyState(title: "添加第一条路由", detail: "创建客户端模型 ID，然后从左侧拖入模型。", symbol: "arrow.triangle.branch")
                 Spacer()
             } else {
-                ScrollView(showsIndicators: false) {
-                    LazyVStack(spacing: 14) {
-                        ForEach(routes) { fake in
-                            routeCard(fake)
-                        }
-                        cardEndTarget(type: routeDragType, key: "route-end", delegate: routeDrop(before: nil))
-                    }.padding(.bottom, 20)
+                NativeReorderableCards(items: store.config.fakes, spacing: 14,
+                                       move: { store.moveFakes(sources: $0, before: $1) }) { fake in
+                    routeCard(fake)
                 }
-                .scrollIndicators(.never)
             }
         }.padding(20)
     }
@@ -373,12 +257,7 @@ struct RouteWorkspaceView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(.isButton)
                 .accessibilityAction { toggleRoute(fake.id) }
-                .onDrag {
-                    ui.draggingProvider = nil
-                    ui.routeOrder = store.config.fakes.map(\.id)
-                    ui.draggingRoute = fake.id
-                    return cardDragItem(fake.id.uuidString, type: routeDragType)
-                }
+                .modifier(NativeCardDragHandle(id: fake.id))
                 .help("展开或收起；拖动卡片调整路由顺序")
                 Toggle("自动切换", isOn: Binding(
                     get: { store.config.fakes.first(where: { $0.id == fake.id })?.autoFallback ?? false },
@@ -423,12 +302,6 @@ struct RouteWorkspaceView: View {
         .overlay(RoundedRectangle(cornerRadius: 12)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
         .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
-        .overlay(alignment: .top) {
-            if ui.cardDropTarget == "route-\(fake.id)" {
-                Capsule().fill(Color.accentColor.opacity(0.6)).frame(height: 2).padding(.horizontal, 14)
-            }
-        }
-        .onDrop(of: [routeDragType.identifier], delegate: routeDrop(before: fake.id))
     }
 
     private func candidateRow(fake: FakeModel, remote: RemoteModel, index: Int) -> some View {
@@ -514,25 +387,6 @@ struct RouteWorkspaceView: View {
         }
         return true
     }
-}
-
-private final class WorkspaceDragItem: NSItemProvider, @unchecked Sendable {
-    var finished: (() -> Void)?
-    deinit { finished?() }
-}
-
-private struct CardReorderDrop: DropDelegate {
-    let type: String
-    let enabled: Bool
-    let entered: () -> Void
-    let dropped: () -> Bool
-
-    func validateDrop(info: DropInfo) -> Bool { enabled && info.hasItemsConforming(to: [type]) }
-    func dropEntered(info: DropInfo) { if validateDrop(info: info) { entered() } }
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: validateDrop(info: info) ? .move : .cancel)
-    }
-    func performDrop(info: DropInfo) -> Bool { validateDrop(info: info) && dropped() }
 }
 
 @MainActor
