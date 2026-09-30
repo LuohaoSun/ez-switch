@@ -202,7 +202,7 @@ struct RemotesView: View {
         }
     }
 
-    private var usedIDs: Set<UUID> { Set(store.config.fakes.compactMap(\.remoteID)) }
+    private var usedIDs: Set<UUID> { Set(store.config.fakes.flatMap(\.orderedRemoteIDs)) }
 
     private var visibleGroups: [RemoteGroup] {
         store.remoteGroups(matching: ui.query)
@@ -446,6 +446,9 @@ final class RemoteEditDraft: ObservableObject {
     @Published var modelTouched = false
     @Published var providerTouched = false
     @Published var endpointsTouched = false
+    @Published var fetchingModels = false
+    @Published var catalogModels: [String]?
+    @Published var selectedModels = Set<String>()
 
     init(source: RemoteModel?) {
         let split = splitProviderModel(source?.name ?? "")
@@ -481,81 +484,91 @@ struct RemoteEditSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                Section("供应商") {
+            if managesConnection, let models = draft.catalogModels {
+                catalogSelection(models)
+            } else {
+                Form {
+                    Section("供应商") {
+                        if managesConnection {
+                            TextField("名称", text: $draft.providerName)
+                                .onChange(of: draft.providerName) { _ in draft.providerTouched = true }
+                            if draft.providerTouched, let error = providerError {
+                                Text(error).font(.caption).foregroundStyle(.red)
+                            }
+                        } else {
+                            Text(draft.providerName)
+                                .textSelection(.enabled)
+                        }
+                    }
+
+                    if !managesConnection {
+                        Section("模型") {
+                            TextField("模型 ID", text: $draft.model)
+                                .font(.system(.body, design: .monospaced))
+                                .onChange(of: draft.model) { _ in draft.modelTouched = true }
+
+                            if draft.modelTouched && draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text("模型 ID 不能为空").font(.caption).foregroundStyle(.red)
+                            }
+                        }
+                    }
+
                     if managesConnection {
-                        TextField("名称", text: $draft.providerName)
-                            .onChange(of: draft.providerName) { _ in draft.providerTouched = true }
-                        if draft.providerTouched, let error = providerError {
-                            Text(error).font(.caption).foregroundStyle(.red)
+                        Section("接口协议") {
+                            EndpointSettingsEditor(settings: $draft.endpoints)
+                                .onChange(of: draft.endpoints) { _ in draft.endpointsTouched = true }
+                            Text("启用哪些协议就填写对应 Base URL；Base URL 是完整前缀，路由器只追加协议相对路径。")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
-                    } else {
-                        Text(draft.providerName)
-                            .textSelection(.enabled)
-                    }
-                }
 
-                Section(managesConnection ? "首个模型" : "模型") {
-                    TextField("模型 ID", text: $draft.model)
-                        .font(.system(.body, design: .monospaced))
-                        .onChange(of: draft.model) { _ in draft.modelTouched = true }
-
-                    if draft.modelTouched && draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("模型 ID 不能为空").font(.caption).foregroundStyle(.red)
-                    }
-                }
-
-                if managesConnection {
-                    Section("接口协议") {
-                        EndpointSettingsEditor(settings: $draft.endpoints)
-                            .onChange(of: draft.endpoints) { _ in draft.endpointsTouched = true }
-                        Text("启用哪些协议就填写对应 Base URL；Base URL 是完整前缀，路由器只追加协议相对路径。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-
-                    Section("凭据") {
-                        HStack(spacing: 8) {
-                            if draft.revealKey {
-                                TextField("API Key", text: $draft.apiKey)
-                                    .font(.system(.body, design: .monospaced))
-                            } else {
-                                SecureField("API Key", text: $draft.apiKey)
-                                    .font(.system(.body, design: .monospaced))
-                            }
-                            Button {
-                                draft.revealKey.toggle()
-                            } label: {
-                                Image(systemName: draft.revealKey ? "eye.slash" : "eye")
-                            }
-                            .buttonStyle(.borderless)
-                            .help(draft.revealKey ? "隐藏 key" : "显示 key")
-                        }
-                    }
-
-                    Section("额外请求头") {
-                        ForEach($draft.headers) { $row in
+                        Section("凭据") {
                             HStack(spacing: 8) {
-                                TextField("Header", text: $row.key)
-                                    .font(.system(.caption, design: .monospaced))
-                                TextField("值", text: $row.value)
-                                    .font(.system(.caption, design: .monospaced))
+                                if draft.revealKey {
+                                    TextField("API Key", text: $draft.apiKey)
+                                        .font(.system(.body, design: .monospaced))
+                                } else {
+                                    SecureField("API Key", text: $draft.apiKey)
+                                        .font(.system(.body, design: .monospaced))
+                                }
                                 Button {
-                                    draft.headers.removeAll { $0.id == row.id }
+                                    draft.revealKey.toggle()
                                 } label: {
-                                    Image(systemName: "minus.circle")
+                                    Image(systemName: draft.revealKey ? "eye.slash" : "eye")
                                 }
                                 .buttonStyle(.borderless)
-                                .help("删除这一行")
+                                .help(draft.revealKey ? "隐藏 key" : "显示 key")
                             }
                         }
-                        Button("＋ 添加请求头") {
-                            draft.headers.append(HeaderRow(key: "", value: ""))
+
+                        Section("额外请求头") {
+                            ForEach($draft.headers) { $row in
+                                HStack(spacing: 8) {
+                                    TextField("Header", text: $row.key)
+                                        .font(.system(.caption, design: .monospaced))
+                                    TextField("值", text: $row.value)
+                                        .font(.system(.caption, design: .monospaced))
+                                    Button {
+                                        draft.headers.removeAll { $0.id == row.id }
+                                    } label: {
+                                        Image(systemName: "minus.circle")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("删除这一行")
+                                }
+                            }
+                            Button("＋ 添加请求头") {
+                                draft.headers.append(HeaderRow(key: "", value: ""))
+                            }
                         }
                     }
                 }
+                .formStyle(.grouped)
+                .disabled(draft.fetchingModels)
             }
-            .formStyle(.grouped)
 
+            if draft.fetchingModels {
+                ProgressView("正在获取模型列表…").padding(12)
+            }
             if let err = draft.error ?? (draft.modelTouched || draft.providerTouched || draft.endpointsTouched
                                          ? connectionError : nil) {
                 Text(err)
@@ -588,14 +601,78 @@ struct RemoteEditSheet: View {
                 Button("删除") { draft.confirmDelete = true }
                     .foregroundColor(.red)
             }
+            if managesConnection, draft.catalogModels != nil {
+                Button("返回连接设置") {
+                    draft.catalogModels = nil
+                    draft.selectedModels = []
+                    draft.error = nil
+                }
+            }
             Spacer()
             Button("取消") { dismiss() }
                 .keyboardShortcut(.cancelAction)
-            Button("保存") { save() }
+                .disabled(draft.fetchingModels)
+            Button(managesConnection && draft.catalogModels == nil ? "获取模型列表" : "保存") {
+                if managesConnection, draft.catalogModels == nil {
+                    Task { await fetchModels() }
+                } else { save() }
+            }
                 .keyboardShortcut(.defaultAction)
-                .disabled(errorText != nil)
+                .disabled(errorText != nil || draft.fetchingModels)
         }
         .padding(12)
+    }
+
+    private func catalogSelection(_ models: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("选择模型 · \(draft.providerName)").font(.title2.bold())
+            Text("已获取 \(models.count) 个模型，选择要添加的条目。")
+                .font(.callout).foregroundStyle(.secondary)
+            List(models, id: \.self) { model in
+                Button {
+                    if draft.selectedModels.contains(model) { draft.selectedModels.remove(model) }
+                    else { draft.selectedModels.insert(model) }
+                } label: {
+                    HStack {
+                        Image(systemName: draft.selectedModels.contains(model) ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(draft.selectedModels.contains(model) ? Color.accentColor : .secondary)
+                        Text(model).font(.system(.body, design: .monospaced))
+                        Spacer()
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain)
+            }
+            Text("已选择 \(draft.selectedModels.count) 个模型").font(.caption).foregroundStyle(.secondary)
+        }.padding(20)
+    }
+
+    private var parsedHeaders: [String: String] {
+        var headers: [String: String] = [:]
+        for row in draft.headers {
+            let key = row.key.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !key.isEmpty { headers[key] = row.value }
+        }
+        return headers
+    }
+
+    private func fetchModels() async {
+        guard errorText == nil else { return }
+        draft.fetchingModels = true
+        draft.error = nil
+        defer { draft.fetchingModels = false }
+        let remote = RemoteModel(id: UUID(), name: draft.providerName, apiKey: draft.apiKey,
+                                 model: "", extraHeaders: parsedHeaders,
+                                 apiEndpoints: ConfigStore.normalizedEndpoints(draft.endpoints))
+        do {
+            let models = try await ProviderModelCatalog.fetch(for: remote)
+            if models.isEmpty {
+                draft.error = "供应商返回了空模型列表，请检查接口设置后重试"
+            } else {
+                draft.selectedModels = []
+                draft.catalogModels = models
+            }
+        } catch {
+            draft.error = error.localizedDescription
+        }
     }
 
     /// 引用这个远端的路由。
@@ -614,15 +691,21 @@ struct RemoteEditSheet: View {
 
     /// 即时校验（红字）；nil = 可以保存
     private var errorText: String? {
-        if draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "模型 ID 不能为空" }
+        if managesConnection {
+            if draft.providerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "供应商名称不能为空"
+            }
+            if draft.catalogModels != nil, draft.selectedModels.isEmpty { return "请选择至少一个模型" }
+        } else if draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "模型 ID 不能为空"
+        }
         return providerError ?? connectionError
     }
 
     private var providerError: String? {
         guard managesConnection else { return nil }
         let provider = draft.providerName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let model = draft.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = (provider.isEmpty || provider == model) ? model : provider
+        let name = provider
         if name.isEmpty { return nil }
         if name.contains(" · ") { return "供应商名称不能包含 · 分隔符" }
         if store.config.remotes.contains(where: { splitProviderModel($0.name).provider == name }) {
@@ -641,23 +724,16 @@ struct RemoteEditSheet: View {
         draft.error = nil
         let model = draft.model.trimmingCharacters(in: .whitespacesAndNewlines)
         let provider = draft.providerName.trimmingCharacters(in: .whitespacesAndNewlines)
-        // provider 空或与 model 同名时，名字就是 model
-        let name = (provider.isEmpty || provider == model) ? model : "\(provider) · \(model)"
         if let src = source {
             draft.error = store.updateModel(id: src.id, model: model)
         } else if addingModelToProvider {
             draft.error = store.addModel(provider: provider, model: model)
         } else {
-            var parsed: [String: String] = [:]
-            for h in draft.headers {
-                let k = h.key.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !k.isEmpty else { continue }   // 跳过空 key
-                parsed[k] = h.value                 // 重名后者覆盖
-            }
-            draft.error = store.addRemote(RemoteModel(id: UUID(), name: name,
-                                                      apiKey: draft.apiKey, model: model,
-                                                      extraHeaders: parsed,
-                                                      apiEndpoints: ConfigStore.normalizedEndpoints(draft.endpoints)))
+            guard let models = draft.catalogModels,
+                  draft.selectedModels.isSubset(of: Set(models)) else { return }
+            draft.error = store.addProvider(name: provider, modelIDs: draft.selectedModels.sorted(),
+                                            apiKey: draft.apiKey, extraHeaders: parsedHeaders,
+                                            apiEndpoints: draft.endpoints)
         }
         if draft.error == nil { dismiss() }
     }

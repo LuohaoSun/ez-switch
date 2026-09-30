@@ -118,13 +118,9 @@ struct SettingsView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
-                SettingsSidebarRow(title: "路由", systemImage: "arrow.triangle.branch",
+                SettingsSidebarRow(title: "路由与模型", systemImage: "arrow.triangle.branch",
                                    section: .models, selection: nav.section) {
                     nav.section = .models
-                }
-                SettingsSidebarRow(title: "供应商", systemImage: "server.rack",
-                                   section: .remotes, selection: nav.section) {
-                    nav.section = .remotes
                 }
                 SettingsSidebarRow(title: "活动", systemImage: "waveform.path.ecg",
                                    section: .activity, selection: nav.section) {
@@ -150,8 +146,7 @@ struct SettingsView: View {
 
             NavigationStack {
                 switch nav.section {
-                case .models: ModelsPane(store: store)
-                case .remotes: RemotesView(store: store)
+                case .models, .remotes: RouteWorkspaceView(store: store)
                 case .activity: LogWindowView()
                 case .general: GeneralPane(store: store)
                 }
@@ -160,7 +155,7 @@ struct SettingsView: View {
         }
         .background(WindowActivator().frame(width: 0, height: 0))
         // 侧栏展开时仍要给供应商页留出 260pt 列表 + 390pt 详情。
-        .frame(minWidth: 860, minHeight: 580)
+        .frame(minWidth: 1020, minHeight: 620)
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button {
@@ -387,27 +382,16 @@ struct FakeEditSheet: View {
                     }
                 }
 
-                Section("绑定") {
-                    Picker("绑定远端", selection: $draft.remoteID) {
-                        Text("未绑定").tag(UUID?.none)
-                        ForEach(store.groupedRemotes()) { group in
-                            Section(group.provider) {
-                                ForEach(group.remotes) { remote in
-                                    Text(remote.routeLabel)
-                                        .tag(UUID?.some(remote.id))
-                                }
-                            }
-                        }
-                    }
-                }
+                Text("模型绑定和备用顺序在主界面拖拽设置。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
 
             Divider()
             footer
         }
-        .frame(width: 500)
-        .frame(minHeight: 360)
+        .frame(width: 440)
+        .frame(minHeight: 230)
         .alert("删除这条路由？", isPresented: $draft.confirmDelete) {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive) {

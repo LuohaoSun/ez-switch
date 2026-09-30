@@ -35,16 +35,30 @@ struct EndpointSetting: Codable, Equatable, Hashable {
     static let disabled = EndpointSetting(enabled: false, baseURL: "")
 }
 
+enum ResponsesTransport: String, Codable, CaseIterable {
+    case native
+    case chatCompletions
+}
+
+enum ResponsesMode: Hashable {
+    case disabled
+    case native
+    case chatCompletions
+}
+
 /// 供应商级协议配置。每个模型复制同一份配置，UI 只允许在供应商设置中修改。
 struct APIEndpointSettings: Codable, Equatable, Hashable {
     var chat: EndpointSetting
     var responses: EndpointSetting
     var messages: EndpointSetting
+    var responsesTransport: ResponsesTransport
 
-    init(chat: EndpointSetting, responses: EndpointSetting, messages: EndpointSetting) {
+    init(chat: EndpointSetting, responses: EndpointSetting, messages: EndpointSetting,
+         responsesTransport: ResponsesTransport = .native) {
         self.chat = chat
         self.responses = responses
         self.messages = messages
+        self.responsesTransport = responsesTransport
     }
 
     init(from decoder: Decoder) throws {
@@ -52,6 +66,7 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
         chat = try c.decodeIfPresent(EndpointSetting.self, forKey: .chat) ?? .disabled
         responses = try c.decodeIfPresent(EndpointSetting.self, forKey: .responses) ?? .disabled
         messages = try c.decodeIfPresent(EndpointSetting.self, forKey: .messages) ?? .disabled
+        responsesTransport = try c.decodeIfPresent(ResponsesTransport.self, forKey: .responsesTransport) ?? .native
     }
 
     subscript(kind: EndpointKind) -> EndpointSetting {
@@ -72,7 +87,30 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
     }
 
     var enabledKinds: [EndpointKind] {
-        EndpointKind.allCases.filter { self[$0].enabled }
+        EndpointKind.allCases.filter { $0 == .responses ? supportsResponses : self[$0].enabled }
+    }
+
+    var supportsResponses: Bool {
+        responsesTransport == .chatCompletions ? chat.enabled : responses.enabled
+    }
+
+    var responsesMode: ResponsesMode {
+        if responsesTransport == .chatCompletions { return .chatCompletions }
+        return responses.enabled ? .native : .disabled
+    }
+
+    mutating func setResponsesMode(_ mode: ResponsesMode) {
+        switch mode {
+        case .disabled:
+            responsesTransport = .native
+            responses.enabled = false
+        case .native:
+            responsesTransport = .native
+            responses.enabled = true
+        case .chatCompletions:
+            responsesTransport = .chatCompletions
+            responses.enabled = false
+        }
     }
 
     static func all(baseURL: String) -> APIEndpointSettings {
@@ -226,10 +264,24 @@ struct RemoteModel: Codable, Identifiable, Equatable, Hashable {
 extension RemoteModel {
     func endpointSetting(for kind: EndpointKind) -> EndpointSetting { apiEndpoints[kind] }
 
-    func supports(_ kind: EndpointKind) -> Bool { apiEndpoints[kind].enabled }
+    func supports(_ kind: EndpointKind) -> Bool {
+        if kind == .responses, apiEndpoints.responsesTransport == .chatCompletions {
+            return apiEndpoints.chat.enabled
+        }
+        return apiEndpoints[kind].enabled
+    }
 
     var endpointBaseURLs: [String] {
-        EndpointKind.allCases.map { apiEndpoints[$0].baseURL }.filter { !$0.isEmpty }
+        let activeURLs: [String] = EndpointKind.allCases.compactMap { kind -> String? in
+            guard supports(kind) else { return nil }
+            let effectiveKind: EndpointKind = kind == .responses && apiEndpoints.responsesTransport == .chatCompletions
+                ? .chat : kind
+            let url = apiEndpoints[effectiveKind].baseURL
+            return url.isEmpty ? nil : url
+        }
+        return activeURLs.reduce(into: [String]()) { urls, url in
+            if !urls.contains(url) { urls.append(url) }
+        }
     }
 
     var endpointSummary: String {
@@ -243,6 +295,44 @@ struct FakeModel: Codable, Identifiable, Equatable {
     var fakeModelID: String
     var displayName: String
     var remoteID: UUID?
+    var fallbackRemoteIDs: [UUID] = []
+    var autoFallback: Bool = true
+    var selectedRemoteID: UUID?
+
+    var startingRemoteID: UUID? {
+        if let selectedRemoteID, orderedRemoteIDs.contains(selectedRemoteID) { return selectedRemoteID }
+        return orderedRemoteIDs.first
+    }
+
+    var orderedRemoteIDs: [UUID] {
+        var seen = Set<UUID>()
+        return ([remoteID].compactMap { $0 } + fallbackRemoteIDs).filter { seen.insert($0).inserted }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, fakeModelID, displayName, remoteID, fallbackRemoteIDs, autoFallback, selectedRemoteID
+    }
+
+    init(id: UUID, fakeModelID: String, displayName: String, remoteID: UUID?,
+         fallbackRemoteIDs: [UUID] = [], autoFallback: Bool = true) {
+        self.id = id
+        self.fakeModelID = fakeModelID
+        self.displayName = displayName
+        self.remoteID = remoteID
+        self.fallbackRemoteIDs = fallbackRemoteIDs
+        self.autoFallback = autoFallback
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        fakeModelID = try container.decode(String.self, forKey: .fakeModelID)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        remoteID = try container.decodeIfPresent(UUID.self, forKey: .remoteID)
+        fallbackRemoteIDs = try container.decodeIfPresent([UUID].self, forKey: .fallbackRemoteIDs) ?? []
+        autoFallback = try container.decodeIfPresent(Bool.self, forKey: .autoFallback) ?? true
+        selectedRemoteID = try container.decodeIfPresent(UUID.self, forKey: .selectedRemoteID)
+    }
 }
 
 struct AppConfig: Codable {
@@ -297,6 +387,54 @@ final class Router {
     private var remotes: [UUID: RemoteModel] = [:]
     private var fakesByID: [String: FakeModel] = [:]
     private var allFakes: [FakeModel] = []
+    private var retryAfter: [UUID: Date] = [:]
+    private var activeRemoteIDs: [UUID: UUID] = [:]
+
+    func candidates(fakeModelID: String?, endpoint: EndpointKind? = nil) -> (fake: FakeModel, remotes: [RemoteModel])? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let want = fakeModelID, let fake = fakesByID[want] else { return nil }
+        var ordered = fake.orderedRemoteIDs.compactMap { remotes[$0] }
+        if let index = ordered.firstIndex(where: { $0.id == fake.startingRemoteID }) {
+            ordered = Array(ordered[index...]) + Array(ordered[..<index])
+        }
+        if !fake.autoFallback { ordered = Array(ordered.prefix(1)) }
+        if let endpoint { ordered = ordered.filter { $0.supports(endpoint) } }
+        let available = ordered.filter { (retryAfter[$0.id] ?? .distantPast) <= Date() }
+        return (fake, fake.autoFallback ? (available.isEmpty ? ordered : available) : ordered)
+    }
+
+    func recordFailure(remoteID: UUID, retryAfter date: Date = Date().addingTimeInterval(60)) {
+        lock.lock()
+        retryAfter[remoteID] = date
+        activeRemoteIDs = activeRemoteIDs.filter { $0.value != remoteID }
+        lock.unlock()
+    }
+
+    func selectRemote(fakeID: UUID, remoteID: UUID) {
+        lock.lock()
+        activeRemoteIDs[fakeID] = remoteID
+        retryAfter.removeValue(forKey: remoteID)
+        lock.unlock()
+    }
+
+    func recordAttempt(fakeID: UUID, remoteID: UUID) {
+        lock.lock()
+        activeRemoteIDs[fakeID] = remoteID
+        lock.unlock()
+    }
+
+    func recordSuccess(fakeID: UUID, remoteID: UUID) {
+        lock.lock()
+        retryAfter.removeValue(forKey: remoteID)
+        lock.unlock()
+    }
+
+    func activeRemoteID(fakeID: UUID) -> UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeRemoteIDs[fakeID] ?? allFakes.first(where: { $0.id == fakeID })?.startingRemoteID
+    }
 
     func update(_ config: AppConfig) {
         var r: [UUID: RemoteModel] = [:]
@@ -308,9 +446,19 @@ final class Router {
             if f[fake.fakeModelID] == nil { f[fake.fakeModelID] = fake }
         }
         lock.lock()
+        let previous = Dictionary(uniqueKeysWithValues: allFakes.map { ($0.id, $0.startingRemoteID) })
         remotes = r
         fakesByID = f
         allFakes = config.fakes
+        let valid = Set(r.keys)
+        retryAfter = retryAfter.filter { valid.contains($0.key) }
+        activeRemoteIDs = activeRemoteIDs.filter { fakeID, remoteID in
+            config.fakes.contains {
+                $0.id == fakeID && $0.orderedRemoteIDs.contains(remoteID) &&
+                    (previous[$0.id] ?? nil) == $0.startingRemoteID &&
+                    ($0.autoFallback || $0.startingRemoteID == remoteID)
+            }
+        }
         lock.unlock()
     }
 
@@ -320,7 +468,7 @@ final class Router {
         defer { lock.unlock() }
         guard let want = fakeModelID, let fake = fakesByID[want]
         else { return nil }
-        guard let rid = fake.remoteID,
+        guard let rid = fake.startingRemoteID,
               let remote = remotes[rid]
         else { return nil }
         return (fake, remote)
@@ -364,6 +512,7 @@ final class ConfigStore: ObservableObject {
     let router = Router()
 
     private var server: RouterServer?
+    private var cliServer: CLIControlServer?
     private var dirSource: DispatchSourceFileSystemObject?
     private var reloadTask: Task<Void, Never>?
     private var started = false
@@ -440,8 +589,13 @@ final class ConfigStore: ObservableObject {
         guard !remap.isEmpty else { return (config, false) }
         var fakes = config.fakes
         for i in fakes.indices {
-            if let rid = fakes[i].remoteID, let keep = remap[rid] {
-                fakes[i].remoteID = keep
+            let ids = fakes[i].orderedRemoteIDs.map { remap[$0] ?? $0 }
+            var seen = Set<UUID>()
+            let unique = ids.filter { seen.insert($0).inserted }
+            fakes[i].remoteID = unique.first
+            fakes[i].fallbackRemoteIDs = Array(unique.dropFirst())
+            if let selected = fakes[i].selectedRemoteID {
+                fakes[i].selectedRemoteID = remap[selected] ?? selected
             }
         }
         var out = config
@@ -459,14 +613,22 @@ final class ConfigStore: ObservableObject {
         let validRemoteIDs = Set(config.remotes.map(\.id))
         for original in config.fakes {
             var fake = original
-            if let remoteID = fake.remoteID, !validRemoteIDs.contains(remoteID) {
-                fake.remoteID = nil
+            let valid = fake.orderedRemoteIDs.filter { validRemoteIDs.contains($0) }
+            if valid != fake.orderedRemoteIDs || (fake.remoteID == nil && !valid.isEmpty) {
+                fake.remoteID = valid.first
+                fake.fallbackRemoteIDs = Array(valid.dropFirst())
+                changed = true
+            }
+            if let selected = fake.selectedRemoteID, !valid.contains(selected) {
+                fake.selectedRemoteID = nil
                 changed = true
             }
             if var existing = byID[fake.fakeModelID] {
                 changed = true
                 if existing.remoteID == nil, fake.remoteID != nil {
                     existing.remoteID = fake.remoteID
+                    existing.fallbackRemoteIDs = fake.fallbackRemoteIDs
+                    existing.selectedRemoteID = fake.selectedRemoteID
                     byID[fake.fakeModelID] = existing
                 }
             } else {
@@ -563,9 +725,41 @@ final class ConfigStore: ObservableObject {
             name = remote.name
         }
         config.fakes[idx].remoteID = remoteID
+        config.fakes[idx].selectedRemoteID = nil
+        if remoteID == nil { config.fakes[idx].fallbackRemoteIDs = [] }
+        else { config.fakes[idx].fallbackRemoteIDs.removeAll { $0 == remoteID } }
         router.update(config)
         save()
         Log.shared.log("route switch: \(fake.fakeModelID) -> \(name)")
+    }
+
+    @discardableResult
+    func setRouteTargets(fakeID: UUID, remoteIDs: [UUID], autoFallback: Bool) -> Bool {
+        guard let idx = config.fakes.firstIndex(where: { $0.id == fakeID }) else { return false }
+        let valid = Set(config.remotes.map(\.id))
+        guard remoteIDs.allSatisfy(valid.contains), Set(remoteIDs).count == remoteIDs.count else { return false }
+        config.fakes[idx].remoteID = remoteIDs.first
+        config.fakes[idx].fallbackRemoteIDs = Array(remoteIDs.dropFirst())
+        if let selected = config.fakes[idx].selectedRemoteID, !remoteIDs.contains(selected) {
+            config.fakes[idx].selectedRemoteID = nil
+        }
+        config.fakes[idx].autoFallback = autoFallback
+        router.update(config)
+        save()
+        Log.shared.log("route targets: \(config.fakes[idx].fakeModelID) -> \(remoteIDs.count) models")
+        return true
+    }
+
+    @discardableResult
+    func selectRouteModel(fakeID: UUID, remoteID: UUID) -> Bool {
+        guard let index = config.fakes.firstIndex(where: { $0.id == fakeID }),
+              config.fakes[index].orderedRemoteIDs.contains(remoteID) else { return false }
+        config.fakes[index].selectedRemoteID = remoteID == config.fakes[index].remoteID ? nil : remoteID
+        router.update(config)
+        router.selectRemote(fakeID: fakeID, remoteID: remoteID)
+        save()
+        Log.shared.log("route select: \(config.fakes[index].fakeModelID) -> \(remoteID)")
+        return true
     }
 
     /// 新增一个路由；fakeModelID 全局唯一，为空或重复则拒绝。
@@ -607,7 +801,7 @@ final class ConfigStore: ObservableObject {
 
     /// 行尾展示：当前绑定远端的模型 id（未绑定 → "未配置"）
     func boundModelID(for fake: FakeModel) -> String {
-        guard let rid = fake.remoteID,
+        guard let rid = fake.startingRemoteID,
               let r = config.remotes.first(where: { $0.id == rid })
         else { return "未配置" }
         return r.model
@@ -668,6 +862,9 @@ final class ConfigStore: ObservableObject {
         config.fakes[idx].fakeModelID = mid
         config.fakes[idx].displayName = mid
         config.fakes[idx].remoteID = remoteID
+        config.fakes[idx].selectedRemoteID = nil
+        if remoteID == nil { config.fakes[idx].fallbackRemoteIDs = [] }
+        else { config.fakes[idx].fallbackRemoteIDs.removeAll { $0 == remoteID } }
         router.update(config)
         save()
         Log.shared.log("fake: 更新 \(mid) → \(routeName(for: config.fakes[idx]))")
@@ -750,6 +947,28 @@ final class ConfigStore: ObservableObject {
         return nil
     }
 
+    @discardableResult
+    func addProvider(name: String, modelIDs: [String], apiKey: String,
+                     extraHeaders: [String: String], apiEndpoints: APIEndpointSettings) -> String? {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !name.contains(" · ") else { return "供应商名称不能为空或包含 · 分隔符" }
+        guard !config.remotes.contains(where: { splitProviderModel($0.name).provider == name })
+        else { return "该供应商名称已存在" }
+        let models = modelIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !models.isEmpty, models.allSatisfy({ !$0.isEmpty }) else { return "请选择至少一个模型" }
+        guard Set(models).count == models.count else { return "模型 ID 重复" }
+        let endpoints = Self.normalizedEndpoints(apiEndpoints)
+        if let error = Self.validateEndpoints(endpoints) { return error }
+        config.remotes.append(contentsOf: models.map {
+            RemoteModel(id: UUID(), name: "\(name) · \($0)", apiKey: apiKey, model: $0,
+                        extraHeaders: extraHeaders, apiEndpoints: endpoints)
+        })
+        router.update(config)
+        save()
+        Log.shared.log("provider: 新增 \(name)（\(models.count) 个模型）")
+        return nil
+    }
+
     /// 新增供应商下的模型：凭据和三协议配置完整复制该供应商当前的统一配置。
     /// 旧配置中这些字段不一致时拒绝新增，必须先通过供应商设置统一。
     @discardableResult
@@ -829,9 +1048,14 @@ final class ConfigStore: ObservableObject {
         guard let idx = config.remotes.firstIndex(where: { $0.id == id }) else { return [] }
         let remote = config.remotes.remove(at: idx)
         var unbound: [String] = []
-        for i in config.fakes.indices where config.fakes[i].remoteID == id {
-            unbound.append(config.fakes[i].fakeModelID)
-            config.fakes[i].remoteID = nil
+        for i in config.fakes.indices where config.fakes[i].orderedRemoteIDs.contains(id) {
+            let remaining = config.fakes[i].orderedRemoteIDs.filter { $0 != id }
+            config.fakes[i].remoteID = remaining.first
+            config.fakes[i].fallbackRemoteIDs = Array(remaining.dropFirst())
+            if let selected = config.fakes[i].selectedRemoteID, !remaining.contains(selected) {
+                config.fakes[i].selectedRemoteID = nil
+            }
+            if remaining.isEmpty { unbound.append(config.fakes[i].fakeModelID) }
         }
         router.update(config)
         save()
@@ -852,9 +1076,15 @@ final class ConfigStore: ObservableObject {
 
         var unbound: [String] = []
         for i in config.fakes.indices {
-            guard let remoteID = config.fakes[i].remoteID, ids.contains(remoteID) else { continue }
-            unbound.append(config.fakes[i].fakeModelID)
-            config.fakes[i].remoteID = nil
+            let old = config.fakes[i].orderedRemoteIDs
+            let remaining = old.filter { !ids.contains($0) }
+            guard remaining.count != old.count else { continue }
+            config.fakes[i].remoteID = remaining.first
+            config.fakes[i].fallbackRemoteIDs = Array(remaining.dropFirst())
+            if let selected = config.fakes[i].selectedRemoteID, !remaining.contains(selected) {
+                config.fakes[i].selectedRemoteID = nil
+            }
+            if remaining.isEmpty { unbound.append(config.fakes[i].fakeModelID) }
         }
         router.update(config)
         save()
@@ -918,8 +1148,12 @@ final class ConfigStore: ObservableObject {
     }
 
     static func validateEndpoints(_ settings: APIEndpointSettings) -> String? {
+        if settings.responsesTransport == .chatCompletions && !settings.chat.enabled {
+            return "Responses 转换需要启用 Chat Completions 并填写其 Base URL"
+        }
         var enabled = 0
         for kind in EndpointKind.allCases {
+            if kind == .responses && settings.responsesTransport == .chatCompletions { continue }
             let setting = settings[kind]
             guard setting.enabled else { continue }
             enabled += 1
@@ -995,6 +1229,14 @@ final class ConfigStore: ObservableObject {
             try s.start(port: port)
             runningPort = port
             Log.shared.log("server: listening on http://127.0.0.1:\(port)")
+            let control = CLIControlServer(configURL: configURL)
+            do {
+                try control.start(store: self)
+                cliServer = control
+                Log.shared.log("cli: listening on \(CLIControlPath.socket(for: configURL).path)")
+            } catch {
+                Log.shared.log("cli: start failed: \(error)")
+            }
         } catch {
             serverError = "Server failed on port \(port): \(error)"
             Log.shared.log("server: start failed: \(error)")
@@ -1036,7 +1278,7 @@ final class ConfigStore: ObservableObject {
 
     /// 单个 fake 当前绑定的远端名（未配置 → "未配置"）
     func routeName(for fake: FakeModel) -> String {
-        guard let rid = fake.remoteID,
+        guard let rid = fake.startingRemoteID,
               let r = config.remotes.first(where: { $0.id == rid })
         else { return "未配置" }
         return r.name

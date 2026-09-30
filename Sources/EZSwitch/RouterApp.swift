@@ -38,8 +38,8 @@ private final class AppWindowManager {
         let window = NSWindow(contentViewController: hosting)
         window.title = AppBrand.name
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 980, height: 680))
-        window.minSize = NSSize(width: 860, height: 580)
+        window.setContentSize(NSSize(width: 1080, height: 720))
+        window.minSize = NSSize(width: 1020, height: 620)
         window.isReleasedWhenClosed = false
         window.center()
         settingsWindow = window
@@ -155,26 +155,25 @@ struct MenuView: View {
 
         Divider()
 
-        // 每条路由只绑定一个上游模型，所有 API 格式共用；子菜单按供应商分组。
         ForEach(store.config.fakes) { fake in
             Menu {
-                let groups = store.groupedRemotes()
-                if groups.isEmpty {
-                    Text("未配置远端，请到设置里添加")
+                let candidates = fake.orderedRemoteIDs.compactMap { id in
+                    store.config.remotes.first { $0.id == id }
+                }
+                if candidates.isEmpty {
+                    Text("未添加模型，请在面板中拖入")
                 } else {
-                    ForEach(groups) { group in
-                        Section(group.provider) {
-                            ForEach(group.remotes) { remote in
-                                Button(modelLabel(remote, fake: fake)) {
-                                    store.setRoute(fakeID: fake.id, remoteID: remote.id)
-                                }
-                            }
+                    ForEach(candidates) { remote in
+                        Button(modelLabel(remote, fake: fake)) {
+                            store.selectRouteModel(fakeID: fake.id, remoteID: remote.id)
                         }
                     }
                 }
             } label: {
-                Text(fake.fakeModelID)
-                    + Text(gray("  " + (store.routeRemote(fake)?.routeLabel ?? "未绑定")))
+                TimelineView(.periodic(from: .now, by: 2)) { _ in
+                    Text(fake.fakeModelID)
+                        + Text(gray("  " + menuRouteLabel(fake)))
+                }
             }
         }
 
@@ -191,8 +190,13 @@ struct MenuView: View {
         }
     }
 
+    private func menuRouteLabel(_ fake: FakeModel) -> String {
+        let activeID = store.router.activeRemoteID(fakeID: fake.id)
+        return store.config.remotes.first(where: { $0.id == activeID })?.routeLabel ?? "未绑定"
+    }
+
     private func modelLabel(_ remote: RemoteModel, fake: FakeModel) -> String {
-        remote.routeLabel + (fake.remoteID == remote.id ? "  ✓" : "")
+        remote.routeLabel + (store.router.activeRemoteID(fakeID: fake.id) == remote.id ? "  ✓" : "")
     }
 
     /// 菜单项文本的灰色部分（menu 里 AttributedString 的颜色才能保留）

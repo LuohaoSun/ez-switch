@@ -17,13 +17,48 @@ struct EndpointSettingsEditor: View {
     var body: some View {
         ForEach(EndpointKind.allCases, id: \.self) { kind in
             VStack(alignment: .leading, spacing: 6) {
-                Toggle(kind.displayName, isOn: enabledBinding(kind))
-                TextField("Base URL", text: baseURLBinding(kind),
-                          prompt: Text(verbatim: exampleURL(kind)))
-                    .font(.system(.body, design: .monospaced))
-                    .disabled(!settings[kind].enabled)
+                if kind == .responses {
+                    HStack(spacing: 16) {
+                        Text("Responses").font(.subheadline.weight(.medium))
+                        Spacer(minLength: 8)
+                        Picker("Responses 接入方式", selection: responsesModeBinding) {
+                            Text("关闭").tag(ResponsesMode.disabled)
+                            Text("开启").tag(ResponsesMode.native)
+                            Text("转发到 Chat").tag(ResponsesMode.chatCompletions)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .accessibilityLabel("Responses 接入方式")
+                        .frame(width: 360)
+                        // Form gives custom picker rows extra trailing space; match the native toggles.
+                        .offset(x: 38)
+                    }
+                    .frame(maxWidth: .infinity)
+                    if settings.responsesMode == .native {
+                        TextField("Responses Base URL", text: baseURLBinding(.responses),
+                                  prompt: Text(verbatim: exampleURL(.responses)))
+                            .font(.system(.body, design: .monospaced))
+                    } else if settings.responsesMode == .chatCompletions {
+                        Text("使用上方 Chat Completions 地址。需要完整会话历史，不支持远程上下文压缩。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Toggle(kind.displayName, isOn: enabledBinding(kind))
+                    TextField("Base URL", text: baseURLBinding(kind),
+                              prompt: Text(verbatim: exampleURL(kind)))
+                        .font(.system(.body, design: .monospaced))
+                        .disabled(!settings[kind].enabled)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var responsesModeBinding: Binding<ResponsesMode> {
+        Binding(
+            get: { settings.responsesMode },
+            set: { settings.setResponsesMode($0) }
+        )
     }
 
     private func enabledBinding(_ kind: EndpointKind) -> Binding<Bool> {

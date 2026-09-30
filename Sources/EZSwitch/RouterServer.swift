@@ -107,7 +107,7 @@ enum RequestProcessor {
         let parsed: Any? = try? JSONSerialization.jsonObject(with: bodyData)
         let requested: String? = (parsed as? [String: Any])?["model"] as? String
 
-        guard let (fake, remote) = router.route(fakeModelID: requested) else {
+        guard let route = router.candidates(fakeModelID: requested), !route.remotes.isEmpty else {
             // 无兜底：id 不存在 → 404（附 known_models）；存在但未绑可用远端 → 502
             if let req = requested, router.hasFake(fakeModelID: req) {
                 Log.shared.log("502 [\(endpoint.rawValue)] model=\(req) 未绑定可用远端")
@@ -126,9 +126,11 @@ enum RequestProcessor {
             return
         }
 
-        guard remote.supports(endpoint) else {
-            let message = "model '\(fake.fakeModelID)' 的供应商未启用 \(endpoint.displayName)"
-            Log.shared.log("502 [\(endpoint.rawValue)] model=\(fake.fakeModelID) → \(remote.name) 未启用")
+        let fake = route.fake
+        let compatible = router.candidates(fakeModelID: requested, endpoint: endpoint)?.remotes ?? []
+        guard !compatible.isEmpty else {
+            let message = "model '\(fake.fakeModelID)' 的候选模型均未启用 \(endpoint.displayName)"
+            Log.shared.log("502 [\(endpoint.rawValue)] model=\(fake.fakeModelID) 无兼容上游")
             await writeJSON(channel: channel, status: 502,
                             object: ["error": ["message": message,
                                                "type": "router_error",
@@ -137,20 +139,52 @@ enum RequestProcessor {
             return
         }
 
-        let endpointBaseURL = remote.endpointSetting(for: endpoint).baseURL
-        Log.shared.log("[\(endpoint.rawValue)] \(head.method) \(path) model=\(fake.fakeModelID) → \(remote.name) \(hostOf(endpointBaseURL))/\(remote.model)")
-
         let started = Date()
         var headWritten = false
-        let upstream: UpstreamResponse
-        do {
-            upstream = try await Forwarder.makeRequest(clientHead: head, body: bodyData,
-                                                       endpoint: endpoint, remote: remote, query: query)
-        } catch {
-            Log.shared.log("[\(endpoint.rawValue)] upstream failed: \(error)")
-            await writeJSON(channel: channel, status: 502,
-                            object: ["error": ["message": "upstream: \(error)"]])
+        var selected: (remote: RemoteModel, upstream: UpstreamResponse)?
+        var lastError: Error?
+        for (index, remote) in compatible.enumerated() {
+            let endpointBaseURL = remote.endpointSetting(for: endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint).baseURL
+            Log.shared.log("[\(endpoint.rawValue)] \(head.method) \(path) model=\(fake.fakeModelID) → \(remote.name) \(hostOf(endpointBaseURL))/\(remote.model)")
+            do {
+                let upstream = try await Forwarder.makeRequest(clientHead: head, body: bodyData,
+                                                               endpoint: endpoint, remote: remote, query: query)
+                let status = upstream.response.statusCode
+                if index < compatible.count - 1 && (status == 429 || [500, 502, 503, 504].contains(status)) {
+                    let body = await FallbackDiagnostics.readErrorBody(upstream)
+                    let reason = FallbackDiagnostics.summary(response: upstream.response, body: body, remote: remote)
+                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(index + 1)/\(compatible.count) failed=\(remote.name) reason=\(reason) → next=\(compatible[index + 1].name)")
+                    router.recordFailure(remoteID: remote.id)
+                    upstream.cancel()
+                    if Task.isCancelled { return }
+                    continue
+                }
+                selected = (remote, upstream)
+                if (200..<300).contains(status) {
+                    router.recordAttempt(fakeID: fake.id, remoteID: remote.id)
+                }
+                break
+            } catch {
+                lastError = error
+                if (error as? ResponseTranslationError)?.clientError == true { break }
+                if Task.isCancelled { return }
+                let nsError = error as NSError
+                let reason = FallbackDiagnostics.clean("\(nsError.domain)(\(nsError.code)): \(error)", remote: remote)
+                let next = index + 1 < compatible.count ? "next=\(compatible[index + 1].name)" : "候选耗尽"
+                Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(index + 1)/\(compatible.count) failed=\(remote.name) reason=\(reason) → \(next)")
+                router.recordFailure(remoteID: remote.id)
+            }
+        }
+        guard let (remote, upstream) = selected else {
+            let status = (lastError as? ResponseTranslationError)?.clientError == true ? 400 : 502
+            await writeJSON(channel: channel, status: status,
+                            object: ["error": ["message": "upstream: \(lastError.map(String.init(describing:)) ?? "no usable remote")"]])
             return
+        }
+        var errorBody = Data()
+        let retryableFailure = upstream.response.statusCode == 429 || [500, 502, 503, 504].contains(upstream.response.statusCode)
+        if retryableFailure {
+            router.recordFailure(remoteID: remote.id)
         }
 
         // Codex 的 Responses 流若被上游交错输出项事件，Codex 会丢弃 output_text.delta
@@ -158,7 +192,8 @@ enum RequestProcessor {
         let isSSE = (upstream.response.value(forHTTPHeaderField: "content-type") ?? "")
             .lowercased().contains("text/event-stream")
         let isSuccess = (200..<300).contains(upstream.response.statusCode)
-        let reorderer: SSEReorderer? = (endpoint == .responses && isSuccess && isSSE) ? SSEReorderer() : nil
+        let converting = endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions
+        let reorderer: SSEReorderer? = (endpoint == .responses && isSuccess && isSSE && !converting) ? SSEReorderer() : nil
 
         func write(_ chunk: ByteBuffer) async throws -> Int {
             guard let reorderer else {
@@ -184,6 +219,12 @@ enum RequestProcessor {
             var iterator = upstream.body.makeAsyncIterator()
             while let chunk = try await iterator.next() {
                 if Task.isCancelled { break }
+                if retryableFailure, errorBody.count < FallbackDiagnostics.bodyLimit {
+                    let count = min(chunk.readableBytes, FallbackDiagnostics.bodyLimit - errorBody.count)
+                    if let data = chunk.getBytes(at: chunk.readerIndex, length: count) {
+                        errorBody.append(contentsOf: data)
+                    }
+                }
                 bytes += try await write(chunk)
             }
             if let reorderer {
@@ -202,6 +243,11 @@ enum RequestProcessor {
                 upstream.cancel()
             } else {
                 try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
+                if isSuccess { router.recordSuccess(fakeID: fake.id, remoteID: remote.id) }
+            }
+            if retryableFailure {
+                let reason = FallbackDiagnostics.summary(response: upstream.response, body: errorBody, remote: remote)
+                Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) failed=\(remote.name) reason=\(reason)；无后续候选，返回上游错误")
             }
             Log.shared.log("[\(endpoint.rawValue)] \(fake.fakeModelID) \(upstream.response.statusCode) \(Log.size(bytes)) \(Log.seconds(Date().timeIntervalSince(started)))")
         } catch {

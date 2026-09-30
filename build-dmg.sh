@@ -33,6 +33,8 @@ rm -rf "$STAGING_DIR" "$DMG_PATH" "$DMG_PATH.sha256"
 mkdir -p "$STAGING_DIR"
 ditto "$APP_BUNDLE" "$STAGING_DIR/$APP_NAME.app"
 ln -s /Applications "$STAGING_DIR/Applications"
+# Standalone command for users who want to install ezs on PATH.
+cp "$APP_BUNDLE/Contents/MacOS/ezs" "$STAGING_DIR/ezs"
 
 echo "==> 生成 $DMG_NAME"
 hdiutil create \

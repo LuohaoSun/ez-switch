@@ -146,13 +146,14 @@ enum Forwarder {
 
     static func buildRequest(clientHead: HTTPRequestHead, body: Data,
                              endpoint: EndpointKind, remote: RemoteModel, query: String) throws -> URLRequest {
-        guard remote.apiEndpoints[endpoint].enabled else {
-            throw ForwarderError.endpointDisabled(endpoint)
+        let upstreamEndpoint: EndpointKind = endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
+        guard remote.apiEndpoints[upstreamEndpoint].enabled else {
+            throw ForwarderError.endpointDisabled(upstreamEndpoint)
         }
-        guard !remote.apiEndpoints[endpoint].baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !remote.apiEndpoints[upstreamEndpoint].baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ForwarderError.missingEndpointBaseURL(endpoint)
         }
-        guard let url = upstreamURL(remote: remote, endpoint: endpoint, query: query) else {
+        guard let url = upstreamURL(remote: remote, endpoint: upstreamEndpoint, query: query) else {
             throw ForwarderError.badResponse
         }
         var req = URLRequest(url: url)
@@ -197,8 +198,27 @@ enum Forwarder {
     static func makeRequest(clientHead: HTTPRequestHead, body: Data,
                             endpoint: EndpointKind, remote: RemoteModel,
                             query: String) async throws -> UpstreamResponse {
-        let req = try buildRequest(clientHead: clientHead, body: body,
+        var req = try buildRequest(clientHead: clientHead, body: body,
                                    endpoint: endpoint, remote: remote, query: query)
+        if endpoint == .responses, remote.apiEndpoints.responsesTransport == .chatCompletions {
+            let translator = try ResponseTranslator()
+            do {
+                req.httpBody = try await translator.prepare(body, model: remote.model)
+                let upstream = try await perform(req)
+                guard (200..<300).contains(upstream.response.statusCode) else {
+                    translator.stop()
+                    return upstream
+                }
+                return translatedResponse(upstream, translator: translator)
+            } catch {
+                translator.stop()
+                throw error
+            }
+        }
+        return try await perform(req)
+    }
+
+    private static func perform(_ req: URLRequest) async throws -> UpstreamResponse {
         let (stream, continuation) = AsyncThrowingStream<ByteBuffer, Error>.makeStream()
         let bridge = UpstreamBridge(continuation: continuation)
         let task = session.dataTask(with: req)
@@ -208,12 +228,72 @@ enum Forwarder {
         task.resume()
 
         do {
-            let response = try await bridge.response()
+            let response = try await withTaskCancellationHandler {
+                try await bridge.response()
+            } onCancel: { task.cancel() }
             return UpstreamResponse(response: response, body: stream, cancel: { task.cancel() })
         } catch {
             task.cancel()
             throw error
         }
+    }
+
+    private static func translatedResponse(_ upstream: UpstreamResponse, translator: ResponseTranslator) -> UpstreamResponse {
+        let isSSE = (upstream.response.value(forHTTPHeaderField: "content-type") ?? "")
+            .lowercased().contains("text/event-stream")
+        var headers: [String: String] = [:]
+        for (key, value) in upstream.response.allHeaderFields {
+            guard let name = key as? String, let value = value as? String,
+                  !droppedResponseHeaders.contains(name.lowercased()) else { continue }
+            headers[name] = value
+        }
+        for name in headers.keys where name.lowercased() == "content-type" { headers.removeValue(forKey: name) }
+        headers["Content-Type"] = isSSE ? "text/event-stream" : "application/json"
+        let response = HTTPURLResponse(url: upstream.response.url!, statusCode: upstream.response.statusCode,
+                                       httpVersion: "HTTP/1.1", headerFields: headers)!
+        let (stream, continuation) = AsyncThrowingStream<ByteBuffer, Error>.makeStream()
+        let producer = Task {
+            defer { translator.stop() }
+            do {
+                var buffered = Data()
+                for try await chunk in upstream.body {
+                    try Task.checkCancellation()
+                    let data = Data(chunk.readableBytesView)
+                    if isSSE {
+                        for block in try await translator.consume(data) {
+                            var buffer = ByteBufferAllocator().buffer(capacity: block.count)
+                            buffer.writeBytes(block)
+                            continuation.yield(buffer)
+                        }
+                    } else {
+                        buffered.append(data)
+                        guard buffered.count <= 64 * 1024 * 1024 else {
+                            throw ResponseTranslationError(description: "Chat response too large")
+                        }
+                    }
+                }
+                let blocks = isSSE ? try await translator.finish() : [try await translator.response(buffered)]
+                for block in blocks {
+                    var buffer = ByteBufferAllocator().buffer(capacity: block.count)
+                    buffer.writeBytes(block)
+                    continuation.yield(buffer)
+                }
+                continuation.finish()
+            } catch {
+                upstream.cancel()
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in
+            producer.cancel()
+            translator.stop()
+            upstream.cancel()
+        }
+        return UpstreamResponse(response: response, body: stream, cancel: {
+            producer.cancel()
+            translator.stop()
+            upstream.cancel()
+        })
     }
 
     static let droppedResponseHeaders: Set<String> = [
