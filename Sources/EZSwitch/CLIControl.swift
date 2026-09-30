@@ -130,7 +130,7 @@ extension ConfigStore {
         case "list":
             let remotes = Dictionary(uniqueKeysWithValues: config.remotes.map { ($0.id, $0) })
             let routes: [[String: String]] = config.fakes.map { fake in
-                let remote = fake.remoteID.flatMap { remotes[$0] }
+                let remote = router.activeRemoteID(fakeID: fake.id).flatMap { remotes[$0] }
                 return ["modelID": fake.fakeModelID,
                         "provider": remote.map { splitProviderModel($0.name).provider } ?? "",
                         "model": remote?.model ?? ""]
@@ -162,7 +162,11 @@ extension ConfigStore {
             guard matches.count == 1, let remote = matches.first else {
                 return ["ok": false, "message": matches.isEmpty ? "upstream model not found" : "ambiguous upstream model; use --remote-id"]
             }
-            setRoute(fakeID: fake.id, remoteID: remote.id)
+            if fake.orderedRemoteIDs.contains(remote.id) {
+                selectRouteModel(fakeID: fake.id, remoteID: remote.id)
+            } else {
+                setRoute(fakeID: fake.id, remoteID: remote.id)
+            }
             return ["ok": true, "message": "\(fakeID) → \(splitProviderModel(remote.name).provider) / \(remote.model)"]
         default:
             return ["ok": false, "message": "unknown command"]

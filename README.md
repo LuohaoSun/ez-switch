@@ -18,7 +18,7 @@ EZ Switch 在本机提供 OpenAI / Anthropic 兼容接口。Codex、Claude Code 
 
 ## 使用
 
-首次启动会打开设置窗口，并预置 `DeepSeek官方 · deepseek-flash` 和 `OpenCode Go · deepseek-v4.1-flash` 两个供应商示例；`main` 默认指向 OpenCode Go。进入“供应商”页，选择对应供应商并填写自己的 API Key（Go 需要订阅密钥）；默认模型和 Base URL 可以按需修改。已有配置不会被更新为新示例。
+首次启动会打开设置窗口，并预置 `DeepSeek官方 · deepseek-flash` 和 `OpenCode Go · deepseek-v4.1-flash` 两个供应商示例；`main` 默认指向 OpenCode Go。在“路由与模型”页左侧编辑供应商并填写自己的 API Key（Go 需要订阅密钥）；默认模型和 Base URL 可以按需修改。已有配置不会被更新为新示例。
 
 OpenCode Go 使用 Chat Completions 地址 `https://opencode.ai/zen/go/v1`，要求请求包含每个对话稳定的 `x-opencode-session` 和客户端 `User-Agent`。EZ Switch 转发客户端传入的会话头，并在没有 `User-Agent` 时使用自身标识；不在供应商的额外请求头中设置固定会话 ID。客户端不发送会话头时，EZ Switch 无法推断对话归属，Go 的会话路由和缓存效果可能受影响。
 
@@ -32,14 +32,16 @@ http://127.0.0.1:8788
 
 ### 1. 配置供应商
 
-在“供应商”页添加或编辑供应商：
+在“路由与模型”页左侧添加供应商时，先填写连接信息：
 
-- 供应商名称和模型 ID
+- 供应商名称
 - Chat Completions、Responses、Messages 三类接口是否启用
 - 每类接口对应的完整 Base URL
 - API Key 和可选额外请求头
 
-同一供应商的 API Key 和接口配置统一生效，供应商下的全部模型共用。
+点击“获取模型列表”后，应用自动请求供应商接口，由用户选择要添加的模型，再保存供应商。无需输入首个模型；获取失败可修改设置后重试，未选模型时不会创建供应商。
+
+同一供应商的 API Key 和接口配置统一生效，供应商下的全部模型共用。在供应商的「⋯」菜单中选择“获取模型列表”可请求当前接口的 `/models`，选择返回的模型 ID 加入本地模型库；不支持列表接口的供应商仍可手动添加模型。供应商和路由均用圆角卡片分组，点击标题展开或收起，拖动标题调整卡片顺序；拖动时周围卡片平滑让位，松手后保存顺序。收起的路由仍显示当前模型。两侧列表隐藏滚动指示条，滚动操作仍可用。
 
 ### 2. 配置路由
 
@@ -49,7 +51,7 @@ http://127.0.0.1:8788
 main
 ```
 
-`main` 会绑定到需要的供应商模型。也可以在“路由”页添加多个本机模型 ID，并分别绑定上游模型。Codex 和 Claude Code 自动选择一个兼容 ID 作为默认模型，其余兼容 ID 可在工具中显式指定；OpenCode 的提示词会包含全部本机模型 ID。
+在“路由与模型”页右侧可为每个本机模型 ID 排列候选模型：从左侧拖入模型，在右侧拖动调整自动切换顺序；点击某个模型即可将它设为当前模型，列表顺序不变。每条路由可单独开关自动切换。当前模型遇到 HTTP 429、临时上游错误（500、502、503、504）或连接失败时，服务在响应开始前尝试下一个兼容模型；失败模型冷却约一分钟后重新参与选择。401、400 等请求或凭据错误不会触发切换。已开始输出的流无法中途切换。旧配置的单模型绑定保持可用。活动日志会记录切换时的路由、失败模型、尝试序号、HTTP 状态或连接错误、上游错误摘要与下一个模型；摘要限长并遮蔽该供应商的凭据。Codex 和 Claude Code 自动选择一个兼容 ID 作为默认模型，其余兼容 ID 可在工具中显式指定；OpenCode 的提示词会包含全部本机模型 ID。
 
 ### 3. 接入工具
 
@@ -117,7 +119,7 @@ ezs set main --remote-id <UUID>
 
 ![EZ Switch 菜单栏菜单](Resources/MenuBar.png)
 
-点击菜单栏中的 EZ Switch 图标，选择某个本机模型 ID 对应的供应商模型即可。切换立即写盘并生效；正在运行的请求不会被中断。
+点击菜单栏中的 EZ Switch 图标，可在每个本机模型 ID 已添加的候选模型之间切换；菜单不会显示其他未绑定模型，也不会修改候选列表顺序。切换立即写盘并生效；正在运行的请求不会被中断。
 
 ## 支持的接口
 
@@ -127,7 +129,7 @@ ezs set main --remote-id <UUID>
 | `/v1/responses` | OpenAI Responses / Codex | Base URL + `/responses` |
 | `/v1/messages` | Anthropic Messages / Claude Code | Base URL + `/v1/messages` |
 
-每类接口需在供应商设置中单独启用并填写 Base URL。EZ Switch 不做协议转换；上游不支持某类接口时，会原样返回上游错误。
+默认按原协议转发；上游不支持某类接口时，会原样返回上游错误。供应商的 Responses 也可设为“转发到 Chat”，通过内置转换器对接仅支持 Chat Completions 的上游，具体限制见下文。
 
 ## 配置与限制
 
@@ -139,19 +141,21 @@ ezs set main --remote-id <UUID>
 
 - 服务只监听本机，不提供远程访问和鉴权。
 - 修改端口后需要重启应用。
-- 一个路由同一时间绑定一个上游模型，暂无负载均衡、重试和熔断。
-- 不翻译 API 协议，不隐藏上游错误。
+- 每条路由有独立的有序候选模型列表，按需在可重试的上游失败后切换；不做负载均衡。
+- 不翻译 API 协议；Responses → Chat 转换模式需单独启用。
 
 ## 许可证
 
 [MIT License](LICENSE)
 
-## Responses → Chat 转换预览
+## Responses → Chat 转换
 
-`./build-feature.sh` 构建独立的 `dist/EZSwitch-ChatPreview.app`（不安装，也不覆盖当前 `/Applications/EZSwitch.app`）。构建需要 Swift 与 Go 1.26+；可通过 `GO_BIN=/path/to/go ./build-feature.sh` 指定 Go。预览版使用同一份 EZ Switch 配置时会影响同一组路由，因此建议测试时设置独立的 `EZSWITCH_CONFIG` 和不同服务端口，再启动预览 App。预览版签名与正式版不同，不自动注册开机启动。
+v0.2.0 的正式应用包含 Responses → Chat 转换器，构建需要 Swift 与 Go 1.26+；可通过 `GO_BIN=/path/to/go ./build-app.sh` 指定 Go。
+
+`./build-feature.sh` 构建独立的 `dist/EZSwitch-ChatPreview.app`（不安装，也不覆盖当前 `/Applications/EZSwitch.app`）。建议测试时设置独立的 `EZSWITCH_CONFIG` 和不同服务端口，再启动预览 App。预览版签名与正式版不同，不自动注册开机启动。
 
 运行 `./run-feature.sh` 可启动独立预览实例：首次将现有配置复制到 `~/Library/Application Support/EZSwitch-ChatPreview/config.json`，监听 `18988`，后续不会覆盖这份预览配置。Codex 测试客户端的 Base URL 应指向 `http://127.0.0.1:18988/v1`。可通过 `EZSWITCH_PREVIEW_PORT` 修改预览端口。
 
-在供应商设置里，将 Responses 设为“转发到 Chat”，并启用 Chat Completions、填写其 Base URL；无需另填转发地址。Codex 仍请求 EZ Switch 的 `/v1/responses`；预览版经 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 转换器生成 Chat 请求，并把上游 Chat 响应转换为 Responses 流或 JSON。未选转换的路由保持原生 Responses 转发。第三方组件的许可证和版本见 [ThirdParty/README.md](ThirdParty/README.md)。
+在供应商设置里，将 Responses 设为“转发到 Chat”，并启用 Chat Completions、填写其 Base URL；无需另填转发地址。Codex 仍请求 EZ Switch 的 `/v1/responses`；应用经 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 转换器生成 Chat 请求，并把上游 Chat 响应转换为 Responses 流或 JSON。未选转换的路由保持原生 Responses 转发。第三方组件的许可证和版本见 [ThirdParty/README.md](ThirdParty/README.md)。
 
 此模式要求 Codex 在 `input` 中发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩；遇到这些功能应使用原生 Responses 上游。已验证普通请求、流式结束、工具调用与结果续接。协议转换不是无损的，正式使用前仍需在目标供应商和具体 Codex 版本上测试长会话、并行工具和压缩行为。
