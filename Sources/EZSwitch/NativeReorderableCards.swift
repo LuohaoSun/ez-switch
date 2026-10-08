@@ -2,9 +2,13 @@ import SwiftUI
 import CoreTransferable
 import UniformTypeIdentifiers
 
+struct CardReorderID<Value: Hashable & Codable & Sendable>: Hashable, Codable, Sendable {
+    let value: Value
+}
+
 private struct CardDragItem<Item: Identifiable>: Identifiable, Transferable where Item.ID: Hashable & Codable & Sendable {
     let item: Item
-    var id: Item.ID { item.id }
+    var id: CardReorderID<Item.ID> { CardReorderID(value: item.id) }
 
     static var transferRepresentation: some TransferRepresentation {
         DataRepresentation(exportedContentType: .data) { card in
@@ -13,14 +17,14 @@ private struct CardDragItem<Item: Identifiable>: Identifiable, Transferable wher
     }
 }
 
-struct NativeCardDragHandle<ID: Hashable & Sendable>: ViewModifier {
+struct NativeCardDragHandle<ID: Hashable & Codable & Sendable>: ViewModifier {
     let id: ID
     var enabled = true
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(macOS 27, *), enabled {
-            content.draggable(containerItemID: id)
+            content.draggable(containerItemID: CardReorderID(value: id))
         } else {
             content
         }
@@ -40,20 +44,22 @@ struct NativeReorderableCards<Item: Identifiable, Row: View>: View where Item.ID
             ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: spacing) {
                     ForEach(items.map { CardDragItem(item: $0) }) { card in
-                        row(card.item)
+                        row(card.item).frame(minWidth: 0, maxWidth: .infinity)
                     }
                     .reorderable()
                 }
+                .frame(minWidth: 0, maxWidth: .infinity)
                 .padding(.bottom, 20)
             }
             .scrollIndicators(.never)
             .dragContainer(for: CardDragItem<Item>.self) { ids in
-                items.filter { ids.contains($0.id) }.map { CardDragItem(item: $0) }
+                let sourceIDs = Set(ids.map(\.value))
+                return items.filter { sourceIDs.contains($0.id) }.map { CardDragItem(item: $0) }
             }
             .reorderContainer(for: CardDragItem<Item>.self, isEnabled: enabled) { difference in
                 switch difference.destination.position {
-                case .before(let target): move(difference.sources, target)
-                case .end: move(difference.sources, nil)
+                case .before(let target): move(difference.sources.map(\.value), target.value)
+                case .end: move(difference.sources.map(\.value), nil)
                 }
             }
         } else {

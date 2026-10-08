@@ -4,46 +4,103 @@ import NIOPosix
 import NIOHTTP1
 
 final class RouterServer {
+    /// 单连接上允许同时存在的请求上限（1 个在途 + 其余排队）。
+    static let defaultMaxPendingRequests = 32
+
     private let router: Router
+    private let recordUsage: UsageRecorder?
+    private let session: URLSession
+    private let maxPendingRequests: Int
     private let group: MultiThreadedEventLoopGroup
     private var channel: Channel?
 
-    init(router: Router) {
+    /// 生产入口：注入可选 store（nil = 不统计）与上游 URLSession（默认生产单例）。
+    /// 测试可改为传 `recordUsage:` + `session:` 的 mock，不触碰全局状态。
+    init(router: Router, usageStore: UsageStore? = nil, recordUsage: UsageRecorder? = nil,
+         session: URLSession = Forwarder.session,
+         maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests) {
         self.router = router
+        if let recordUsage {
+            self.recordUsage = recordUsage
+        } else if let store = usageStore {
+            self.recordUsage = { @Sendable record in store.record(record) }
+        } else {
+            self.recordUsage = nil
+        }
+        self.session = session
+        self.maxPendingRequests = maxPendingRequests
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     }
 
     func start(port: Int) throws {
         let router = self.router
+        let recordUsage = self.recordUsage
+        let session = self.session
+        let maxPendingRequests = self.maxPendingRequests
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { ch in
-                // NOTE: swift-nio 2.103 里 addHTTPServerPipeline() 已改名为 configureHTTPServerPipeline()
-                ch.pipeline.configureHTTPServerPipeline().flatMap {
-                    ch.pipeline.addHandler(ProxyHandler(router: router))
+                // 关闭 NIO pipelining assistance：`HTTPServerPipelineHandler` 在 `.responseEndPending`
+                // （请求已收完、响应未写完）期间挂起 read，SSE 长响应时读不到客户端 FIN，
+                // 导致 channelInactive 不触发、上游无法取消。串行化改由 ProxyHandler 负责。
+                ch.pipeline.configureHTTPServerPipeline(withPipeliningAssistance: false).flatMap {
+                    ch.pipeline.addHandler(ProxyHandler(router: router, recordUsage: recordUsage,
+                                                        session: session,
+                                                        maxPendingRequests: maxPendingRequests))
                 }
             }
         channel = try bootstrap.bind(host: "127.0.0.1", port: port).wait()
     }
+
+    /// 实际绑定的端口（port 传 0 时用于测试）。
+    var boundPort: Int? { channel?.localAddress?.port }
+
+    func stop() {
+        try? channel?.close().wait()
+        channel = nil
+        try? group.syncShutdownGracefully()
+    }
 }
 
-/// 收完一个请求（head+body+end）就交给 RequestProcessor；连接断开则取消上游。
-final class ProxyHandler: ChannelInboundHandler {
+/// 每连接串行处理请求（同一时刻只处理一个），在关闭 NIO pipelining assistance 后仍保证
+/// 响应顺序与 keep-alive；积压超限则停止接收并在在途响应结束后关连接。
+/// 所有可变状态只在 channel 的 event loop 上访问，故声明 `@unchecked Sendable`。
+final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
-    private let router: Router
-    private var head: HTTPRequestHead?
-    private var body: ByteBuffer?
-    private var task: Task<Void, Never>?
-
-    init(router: Router) {
-        self.router = router
+    private struct PendingRequest {
+        let head: HTTPRequestHead
+        let body: ByteBuffer
+        let closeAfter: Bool
     }
 
+    private let router: Router
+    private let recordUsage: UsageRecorder?
+    private let session: URLSession
+    private let maxPendingRequests: Int
+
+    private var head: HTTPRequestHead?
+    private var body: ByteBuffer?
+    private var queue: [PendingRequest] = []
+    private var task: Task<Void, Never>?
+    private var closing = false
+    private var disconnected = false
+
+    init(router: Router, recordUsage: UsageRecorder?, session: URLSession,
+         maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests) {
+        self.router = router
+        self.recordUsage = recordUsage
+        self.session = session
+        self.maxPendingRequests = max(1, maxPendingRequests)
+    }
+
+    // MARK: ChannelInboundHandler
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !disconnected, !closing else { return }
         let part = unwrapInboundIn(data)
         switch part {
         case .head(let h):
@@ -53,27 +110,74 @@ final class ProxyHandler: ChannelInboundHandler {
             body?.writeBuffer(&chunk)
         case .end:
             guard let h = head, let buf = body else { return }
-            let channel = context.channel
-            let router = self.router
-            task = Task {
-                await RequestProcessor.process(channel: channel, head: h, body: buf, router: router)
-            }
+            head = nil
+            body = nil
+            enqueue(channel: context.channel, head: h, body: buf)
         }
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        task?.cancel()
+        tearDown()
         context.fireChannelInactive()
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
+        tearDown()
+    }
+
+    // MARK: 队列（仅 event loop）
+
+    private func enqueue(channel: Channel, head h: HTTPRequestHead, body buf: ByteBuffer) {
+        let outstanding = queue.count + (task == nil ? 0 : 1)
+        guard outstanding < maxPendingRequests else {
+            Log.shared.log("pipeline: 单连接积压超过 \(maxPendingRequests)，将在响应结束后关闭连接")
+            stopAcceptingAndCloseWhenIdle(channel: channel)
+            return
+        }
+        queue.append(PendingRequest(head: h, body: buf, closeAfter: !h.isKeepAlive))
+        startNextIfIdle(channel: channel)
+    }
+
+    private func startNextIfIdle(channel: Channel) {
+        guard !disconnected, !closing, channel.isActive, task == nil, !queue.isEmpty else { return }
+        let next = queue.removeFirst()
+        task = Task {
+            await RequestProcessor.process(channel: channel, head: next.head, body: next.body,
+                                           router: router, recordUsage: recordUsage, session: session)
+            // 回到 event loop 串行化下一个请求（连接已关闭则不再调度）。
+            guard channel.isActive else { return }
+            channel.eventLoop.execute {
+                self.task = nil
+                if self.disconnected { return }
+                if next.closeAfter { self.stopAcceptingAndCloseWhenIdle(channel: channel); return }
+                if self.closing { channel.close(promise: nil); return }
+                self.startNextIfIdle(channel: channel)
+            }
+        }
+    }
+
+    private func stopAcceptingAndCloseWhenIdle(channel: Channel) {
+        closing = true
+        queue.removeAll()
+        if task == nil { channel.close(promise: nil) }
+    }
+
+    private func tearDown() {
+        disconnected = true
+        closing = true
+        queue.removeAll()
+        head = nil
+        body = nil
         task?.cancel()
+        task = nil
     }
 }
 
 enum RequestProcessor {
 
-    static func process(channel: Channel, head: HTTPRequestHead, body: ByteBuffer, router: Router) async {
+    static func process(channel: Channel, head: HTTPRequestHead, body: ByteBuffer,
+                        router: Router, recordUsage: UsageRecorder? = nil,
+                        session: URLSession = Forwarder.session) async {
         let rawURI = head.uri
         let split = rawURI.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
         let path = String(split[0])
@@ -139,40 +243,67 @@ enum RequestProcessor {
             return
         }
 
-        let started = Date()
+        // 一次客户端模型请求 = 一个 requestID；所有 attempt 记录共用请求开始时间，
+        // 保证按时间分组时同一次请求的多次尝试归到同一桶。
+        let requestID = UUID()
+        let requestStarted = Date()
         var headWritten = false
         var selected: (remote: RemoteModel, upstream: UpstreamResponse)?
+        var selectedAttempt = 0
+        var selectedStarted = requestStarted
         var lastError: Error?
         for (index, remote) in compatible.enumerated() {
+            let attempt = index + 1
+            let attemptStarted = Date()
             let endpointBaseURL = remote.endpointSetting(for: endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint).baseURL
             Log.shared.log("[\(endpoint.rawValue)] \(head.method) \(path) model=\(fake.fakeModelID) → \(remote.name) \(hostOf(endpointBaseURL))/\(remote.model)")
             do {
                 let upstream = try await Forwarder.makeRequest(clientHead: head, body: bodyData,
-                                                               endpoint: endpoint, remote: remote, query: query)
+                                                               endpoint: endpoint, remote: remote, query: query,
+                                                               session: session)
                 let status = upstream.response.statusCode
                 if index < compatible.count - 1 && (status == 429 || [500, 502, 503, 504].contains(status)) {
                     let body = await FallbackDiagnostics.readErrorBody(upstream)
                     let reason = FallbackDiagnostics.summary(response: upstream.response, body: body, remote: remote)
-                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(index + 1)/\(compatible.count) failed=\(remote.name) reason=\(reason) → next=\(compatible[index + 1].name)")
+                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → next=\(compatible[index + 1].name)")
                     router.recordFailure(remoteID: remote.id)
+                    recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                                  fake: fake, remote: remote, endpoint: endpoint,
+                                  attempt: attempt, status: status, outcome: "httpError",
+                                  started: attemptStarted, tokens: upstream.usage?.tokens)
                     upstream.cancel()
                     if Task.isCancelled { return }
                     continue
                 }
                 selected = (remote, upstream)
+                selectedAttempt = attempt
+                selectedStarted = attemptStarted
                 if (200..<300).contains(status) {
                     router.recordAttempt(fakeID: fake.id, remoteID: remote.id)
                 }
                 break
             } catch {
                 lastError = error
+                // 翻译器在发往上游前就拒绝：没有 HTTP attempt，不算可计费，直接返回客户端错误
                 if (error as? ResponseTranslationError)?.clientError == true { break }
-                if Task.isCancelled { return }
+                if Task.isCancelled || error is CancellationError {
+                    // 取消不再 fallback 到下一个供应商，只记录这一次尝试
+                    recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                                  fake: fake, remote: remote, endpoint: endpoint,
+                                  attempt: attempt, status: nil, outcome: "cancelled",
+                                  started: attemptStarted, tokens: nil)
+                    return
+                }
                 let nsError = error as NSError
                 let reason = FallbackDiagnostics.clean("\(nsError.domain)(\(nsError.code)): \(error)", remote: remote)
                 let next = index + 1 < compatible.count ? "next=\(compatible[index + 1].name)" : "候选耗尽"
-                Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(index + 1)/\(compatible.count) failed=\(remote.name) reason=\(reason) → \(next)")
+                Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → \(next)")
                 router.recordFailure(remoteID: remote.id)
+                // 连接失败（没有响应头）也必须记录，且只记一次
+                recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                              fake: fake, remote: remote, endpoint: endpoint,
+                              attempt: attempt, status: nil, outcome: "networkError",
+                              started: attemptStarted, tokens: nil)
             }
         }
         guard let (remote, upstream) = selected else {
@@ -211,46 +342,58 @@ enum RequestProcessor {
             return written
         }
 
+        var outcome = isSuccess ? "success" : "httpError"
+        let cancelUpstream = upstream.cancel
         do {
-            try await writeUpstreamHead(channel: channel, response: upstream.response)
-            headWritten = true
+            // 客户端断开（ProxyHandler.channelInactive）会取消本任务；但流式迭代器
+            // 在挂起等待上游 chunk 时不一定因此返回，所以这里显式取消上游，让迭代器
+            // 结束，避免客户端已断开还继续消费/计费。
+            try await withTaskCancellationHandler {
+                try await writeUpstreamHead(channel: channel, response: upstream.response)
+                headWritten = true
 
-            var bytes = 0
-            var iterator = upstream.body.makeAsyncIterator()
-            while let chunk = try await iterator.next() {
-                if Task.isCancelled { break }
-                if retryableFailure, errorBody.count < FallbackDiagnostics.bodyLimit {
-                    let count = min(chunk.readableBytes, FallbackDiagnostics.bodyLimit - errorBody.count)
-                    if let data = chunk.getBytes(at: chunk.readerIndex, length: count) {
-                        errorBody.append(contentsOf: data)
+                var bytes = 0
+                var iterator = upstream.body.makeAsyncIterator()
+                while let chunk = try await iterator.next() {
+                    if Task.isCancelled { break }
+                    if retryableFailure, errorBody.count < FallbackDiagnostics.bodyLimit {
+                        let count = min(chunk.readableBytes, FallbackDiagnostics.bodyLimit - errorBody.count)
+                        if let data = chunk.getBytes(at: chunk.readerIndex, length: count) {
+                            errorBody.append(contentsOf: data)
+                        }
+                    }
+                    bytes += try await write(chunk)
+                }
+                if let reorderer {
+                    for block in reorderer.finish() {
+                        var buf = channel.allocator.buffer(capacity: block.count)
+                        buf.writeBytes(block)
+                        try await channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf))).get()
+                        bytes += block.count
+                    }
+                    let s = reorderer.stats
+                    if s.releasedAtFinish > 0 || s.overflowFlushes > 0 {
+                        Log.shared.log("[\(endpoint.rawValue)] SSE reorder: 流结束时仍有 \(s.releasedAtFinish) 个事件被扣住（上游流不完整），强制放行 \(s.overflowFlushes) 次")
                     }
                 }
-                bytes += try await write(chunk)
-            }
-            if let reorderer {
-                for block in reorderer.finish() {
-                    var buf = channel.allocator.buffer(capacity: block.count)
-                    buf.writeBytes(block)
-                    try await channel.writeAndFlush(HTTPServerResponsePart.body(.byteBuffer(buf))).get()
-                    bytes += block.count
+                if Task.isCancelled {
+                    outcome = "cancelled"
+                    upstream.cancel()
+                } else {
+                    try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
+                    if isSuccess { router.recordSuccess(fakeID: fake.id, remoteID: remote.id) }
+                    outcome = isSuccess ? "success" : "httpError"
                 }
-                let s = reorderer.stats
-                if s.releasedAtFinish > 0 || s.overflowFlushes > 0 {
-                    Log.shared.log("[\(endpoint.rawValue)] SSE reorder: 流结束时仍有 \(s.releasedAtFinish) 个事件被扣住（上游流不完整），强制放行 \(s.overflowFlushes) 次")
+                if retryableFailure {
+                    let reason = FallbackDiagnostics.summary(response: upstream.response, body: errorBody, remote: remote)
+                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) failed=\(remote.name) reason=\(reason)；无后续候选，返回上游错误")
                 }
+                Log.shared.log("[\(endpoint.rawValue)] \(fake.fakeModelID) \(upstream.response.statusCode) \(Log.size(bytes)) \(Log.seconds(Date().timeIntervalSince(requestStarted)))")
+            } onCancel: {
+                cancelUpstream()
             }
-            if Task.isCancelled {
-                upstream.cancel()
-            } else {
-                try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
-                if isSuccess { router.recordSuccess(fakeID: fake.id, remoteID: remote.id) }
-            }
-            if retryableFailure {
-                let reason = FallbackDiagnostics.summary(response: upstream.response, body: errorBody, remote: remote)
-                Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) failed=\(remote.name) reason=\(reason)；无后续候选，返回上游错误")
-            }
-            Log.shared.log("[\(endpoint.rawValue)] \(fake.fakeModelID) \(upstream.response.statusCode) \(Log.size(bytes)) \(Log.seconds(Date().timeIntervalSince(started)))")
         } catch {
+            outcome = Task.isCancelled ? "cancelled" : "streamError"
             if headWritten {
                 // 头已写出，不能中途换壳：只 log + 关连接
                 Log.shared.log("[\(endpoint.rawValue)] stream error after head: \(error)")
@@ -263,6 +406,33 @@ enum RequestProcessor {
                                 object: ["error": ["message": "upstream: \(error)"]])
             }
         }
+        // 选中的那次尝试在“结束时”恰好记一次（含取消 / 流中途错误 / body 错误）
+        recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                      fake: fake, remote: remote, endpoint: endpoint,
+                      attempt: selectedAttempt, status: upstream.response.statusCode, outcome: outcome,
+                      started: selectedStarted, tokens: upstream.usage?.tokens)
+    }
+
+    /// 记录一次上游尝试。record 非阻塞、不抛错；null-ish 计数字段保持 nil（不猜）。
+    private static func recordAttempt(_ recordUsage: UsageRecorder?, requestID: UUID, timestamp: Date,
+                                      fake: FakeModel, remote: RemoteModel, endpoint: EndpointKind,
+                                      attempt: Int, status: Int?, outcome: String,
+                                      started: Date, tokens: UsageTokens?) {
+        guard let recordUsage else { return }
+        let record = UsageRecord(requestID: requestID,
+                                 timestamp: timestamp,
+                                 routeID: fake.id.uuidString,
+                                 routeName: fake.displayName.isEmpty ? fake.fakeModelID : fake.displayName,
+                                 remoteID: remote.id.uuidString,
+                                 provider: splitProviderModel(remote.name).provider,
+                                 model: remote.model,
+                                 endpoint: endpoint.rawValue,
+                                 attempt: attempt,
+                                 status: status,
+                                 outcome: outcome,
+                                 durationMS: max(0, Int(Date().timeIntervalSince(started) * 1000)),
+                                 tokens: tokens ?? UsageTokens())
+        recordUsage(record)
     }
 
     // MARK: 响应写出

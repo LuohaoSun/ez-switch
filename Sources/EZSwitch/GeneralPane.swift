@@ -164,6 +164,7 @@ struct GeneralPane: View {
     @ObservedObject var store: ConfigStore
     @StateObject private var draft = GeneralDraft()
     @StateObject private var loginItem = LoginItemDraft()
+    @StateObject private var cli = CLIInstallModel()
     @ObservedObject private var updater = UpdateChecker.shared
     private let harnessManager = HarnessConfigManager()
 
@@ -295,6 +296,20 @@ struct GeneralPane: View {
                         .textSelection(.enabled)
                 }
             }
+            Section("命令行工具") {
+                Text("安装 ezs 到 \(cli.destinationPath)（系统标准 PATH），即可在终端运行 ezs list、ezs set。链接指向“应用程序”里已安装的 EZ Switch。")
+                    .font(.caption).foregroundStyle(.secondary)
+                cliStatusRow
+                Button {
+                    cli.install()
+                } label: {
+                    Label("安装命令行工具", systemImage: "terminal")
+                }
+                .disabled(!cli.canInstall)
+                if let detail = cli.detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
             Section("启动") {
                 Toggle("登录时启动", isOn: Binding(
                     get: { loginItem.isEnabled },
@@ -342,6 +357,7 @@ struct GeneralPane: View {
         .onAppear {
             draft.port = String(store.config.port)
             refreshLoginItemState()
+            cli.refresh()
         }
         .onChange(of: store.config.port) { port in draft.port = String(port) }
         .onChange(of: draft.harness) { _ in
@@ -363,6 +379,7 @@ struct GeneralPane: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshLoginItemState()
+            cli.refresh()
         }
     }
 
@@ -462,6 +479,30 @@ struct GeneralPane: View {
     private func clearLoginItemError() {
         loginItem.errorMessage = nil
         loginItem.retryEnabled = nil
+    }
+
+    @ViewBuilder
+    private var cliStatusRow: some View {
+        switch cli.phase {
+        case .appMissing:
+            Label("未检测到“应用程序”中的 EZ Switch。", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        case .notInstalled:
+            Label("尚未安装。", systemImage: "circle.dashed").foregroundStyle(.secondary)
+        case .installed:
+            Label("已安装：\(cli.destinationPath)", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+        case .conflict(let reason):
+            Label(reason, systemImage: "exclamationmark.octagon.fill")
+                .foregroundStyle(.red).textSelection(.enabled)
+        case .working:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("正在处理…")
+            }
+        case .failed(let message):
+            Label(message, systemImage: "xmark.circle.fill")
+                .foregroundStyle(.red).textSelection(.enabled)
+        }
     }
 
     @ViewBuilder

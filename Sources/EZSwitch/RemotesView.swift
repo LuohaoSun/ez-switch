@@ -629,17 +629,7 @@ struct RemoteEditSheet: View {
             Text("已获取 \(models.count) 个模型，选择要添加的条目。")
                 .font(.callout).foregroundStyle(.secondary)
             List(models, id: \.self) { model in
-                Button {
-                    if draft.selectedModels.contains(model) { draft.selectedModels.remove(model) }
-                    else { draft.selectedModels.insert(model) }
-                } label: {
-                    HStack {
-                        Image(systemName: draft.selectedModels.contains(model) ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(draft.selectedModels.contains(model) ? Color.accentColor : .secondary)
-                        Text(model).font(.system(.body, design: .monospaced))
-                        Spacer()
-                    }.contentShape(Rectangle())
-                }.buttonStyle(.plain)
+                ModelSelectionToggle(model: model, selection: $draft.selectedModels)
             }
             Text("已选择 \(draft.selectedModels.count) 个模型").font(.caption).foregroundStyle(.secondary)
         }.padding(20)

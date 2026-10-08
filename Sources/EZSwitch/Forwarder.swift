@@ -23,6 +23,9 @@ struct UpstreamResponse {
     let response: HTTPURLResponse
     let body: AsyncThrowingStream<ByteBuffer, Error>
     let cancel: @Sendable () -> Void
+    /// 原始上游 usage 采集器（在 Responses→Chat 翻译之前喂入原始字节）。
+    /// nil = 未采集。
+    var usage: UsageAccumulator? = nil
 }
 
 /// URLSession 数据回调 → AsyncThrowingStream<ByteBuffer> 的桥。
@@ -159,7 +162,12 @@ enum Forwarder {
         var req = URLRequest(url: url)
         req.httpMethod = clientHead.method.rawValue
         // 关键：把 fake model id 换成远端真实 model id，其余字段原样保留
-        req.httpBody = rewriteModel(body, to: remote.model)
+        var upstreamBody = rewriteModel(body, to: remote.model)
+        // 流式 Chat：请求上游在最后一个 chunk 附带 usage（不改响应，只改这一处请求字段）
+        if upstreamEndpoint == .chat {
+            upstreamBody = enablingStreamUsage(upstreamBody)
+        }
+        req.httpBody = upstreamBody
 
         let h = clientHead.headers
         req.setValue(h.first(name: "content-type") ?? "application/json", forHTTPHeaderField: "content-type")
@@ -194,31 +202,83 @@ enum Forwarder {
         return req
     }
 
-    /// 建请求 → 发出去 → 等第一版响应头 → 返回 (响应, 流, cancel)
+    /// 建请求 → 发出去 → 等第一版响应头 → 返回 (响应, 流, cancel)。
+    /// `session` 可注入（测试用 mock），默认走生产单例。
     static func makeRequest(clientHead: HTTPRequestHead, body: Data,
                             endpoint: EndpointKind, remote: RemoteModel,
-                            query: String) async throws -> UpstreamResponse {
+                            query: String, session: URLSession = Forwarder.session) async throws -> UpstreamResponse {
+        let upstreamEndpoint: EndpointKind = endpoint == .responses
+            && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
         var req = try buildRequest(clientHead: clientHead, body: body,
                                    endpoint: endpoint, remote: remote, query: query)
         if endpoint == .responses, remote.apiEndpoints.responsesTransport == .chatCompletions {
             let translator = try ResponseTranslator()
             do {
-                req.httpBody = try await translator.prepare(body, model: remote.model)
-                let upstream = try await perform(req)
+                let translated = try await translator.prepare(body, model: remote.model)
+                req.httpBody = enablingStreamUsage(translated)
+                let upstream = try await perform(req, session: session)
                 guard (200..<300).contains(upstream.response.statusCode) else {
                     translator.stop()
-                    return upstream
+                    return accumulating(upstream, endpoint: upstreamEndpoint)
                 }
-                return translatedResponse(upstream, translator: translator)
+                return translatedResponse(accumulating(upstream, endpoint: upstreamEndpoint), translator: translator)
             } catch {
                 translator.stop()
                 throw error
             }
         }
-        return try await perform(req)
+        return accumulating(try await perform(req, session: session), endpoint: upstreamEndpoint)
     }
 
-    private static func perform(_ req: URLRequest) async throws -> UpstreamResponse {
+    /// 在原始上游字节流上做 usage 采集（先于 Responses→Chat 翻译），每个 chunk
+    /// 原样透传，不改变时序、不重复消费。
+    private static func accumulating(_ upstream: UpstreamResponse, endpoint: EndpointKind) -> UpstreamResponse {
+        let parser = UsageAccumulator(endpoint: endpoint,
+                                      contentType: upstream.response.value(forHTTPHeaderField: "content-type"))
+        let (stream, continuation) = AsyncThrowingStream<ByteBuffer, Error>.makeStream()
+        let producer = Task {
+            do {
+                for try await chunk in upstream.body {
+                    parser.ingest(chunk)
+                    continuation.yield(chunk)
+                }
+                parser.finish()
+                continuation.finish()
+            } catch {
+                parser.finish()
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in
+            producer.cancel()
+            upstream.cancel()
+        }
+        return UpstreamResponse(response: upstream.response, body: stream,
+                                cancel: { producer.cancel(); upstream.cancel() },
+                                usage: parser)
+    }
+
+    /// 流式 Chat 请求附带 usage：仅在 body 为 `"stream":true` 且 `stream_options`
+    /// 未显式给出 `include_usage` 时补 `include_usage:true`；已有键与显式取值
+    /// （含 `false`）一律不覆盖，其他请求行为不变。
+    static func enablingStreamUsage(_ body: Data) -> Data {
+        guard var object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              object["stream"] as? Bool == true else { return body }
+        if let options = object["stream_options"] as? [String: Any] {
+            guard options["include_usage"] == nil else { return body }
+            var merged = options
+            merged["include_usage"] = true
+            object["stream_options"] = merged
+        } else if object["stream_options"] == nil {
+            object["stream_options"] = ["include_usage": true]
+        } else {
+            // stream_options 存在但不是对象：保持原样，别破坏包体
+            return body
+        }
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? body
+    }
+
+    private static func perform(_ req: URLRequest, session: URLSession) async throws -> UpstreamResponse {
         let (stream, continuation) = AsyncThrowingStream<ByteBuffer, Error>.makeStream()
         let bridge = UpstreamBridge(continuation: continuation)
         let task = session.dataTask(with: req)
@@ -227,11 +287,19 @@ enum Forwarder {
         continuation.onTermination = { _ in task.cancel() }
         task.resume()
 
+        // 取消也必须立刻结束这条流：仅 `task.cancel()` 时 URLSession 可能不马上
+        // 回调 didComplete，挂起在 next() 的消费端就醒不过来（客户端已断开仍继续
+        // 消费/计费）。显式 finish 一次，让上层迭代器立即返回；重复 finish 是 no-op。
+        let cancel: @Sendable () -> Void = {
+            task.cancel()
+            continuation.finish(throwing: CancellationError())
+        }
+
         do {
             let response = try await withTaskCancellationHandler {
                 try await bridge.response()
             } onCancel: { task.cancel() }
-            return UpstreamResponse(response: response, body: stream, cancel: { task.cancel() })
+            return UpstreamResponse(response: response, body: stream, cancel: cancel)
         } catch {
             task.cancel()
             throw error
@@ -293,7 +361,7 @@ enum Forwarder {
             producer.cancel()
             translator.stop()
             upstream.cancel()
-        })
+        }, usage: upstream.usage)
     }
 
     static let droppedResponseHeaders: Set<String> = [

@@ -35,12 +35,8 @@ final class Log {
         return buffer.joined(separator: "\n")
     }
 
-    /// "183.2KB" / "1.20MB" / "512B"
     static func size(_ n: Int) -> String {
-        let d = Double(n)
-        if d >= 1024 * 1024 { return String(format: "%.2fMB", d / 1048576) }
-        if d >= 1024 { return String(format: "%.1fKB", d / 1024) }
-        return "\(n)B"
+        ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .binary)
     }
 
     /// "5.4s"
