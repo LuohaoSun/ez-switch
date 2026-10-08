@@ -100,7 +100,7 @@ struct WindowActivator: NSViewRepresentable {
 // MARK: - 设置窗口骨架
 
 enum SettingsSection: Hashable {
-    case models, remotes, activity, general
+    case models, remotes, activity, usage, general
 }
 
 /// 侧栏当前页。不用 `@State`（本机只有 CommandLineTools，没有 SwiftUIMacros 插件，
@@ -116,90 +116,75 @@ struct SettingsView: View {
     @ObservedObject var nav: SettingsNav
 
     var body: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 2) {
-                SettingsSidebarRow(title: "路由与模型", systemImage: "arrow.triangle.branch",
-                                   section: .models, selection: nav.section) {
-                    nav.section = .models
+        Group {
+            if #available(macOS 14.0, *) {
+                NativeSettingsSplit(isSidebarVisible: $nav.sidebarVisible,
+                                    sidebar: sidebar,
+                                    detail: detail)
+                .ignoresSafeArea(.container, edges: .top)
+                .navigationTitle(navigationTitle)
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        Button {
+                            nav.sidebarVisible.toggle()
+                        } label: {
+                            Label(nav.sidebarVisible ? "隐藏侧栏" : "显示侧栏", systemImage: "sidebar.left")
+                        }
+                        .help(nav.sidebarVisible ? "隐藏侧栏" : "显示侧栏")
+                        .accessibilityLabel(nav.sidebarVisible ? "隐藏侧栏" : "显示侧栏")
+                        .keyboardShortcut("s", modifiers: [.command, .control])
+                    }
                 }
-                SettingsSidebarRow(title: "活动", systemImage: "waveform.path.ecg",
-                                   section: .activity, selection: nav.section) {
-                    nav.section = .activity
+            } else {
+                NavigationSplitView(columnVisibility: columnVisibility) {
+                    sidebar
+                } detail: {
+                    detail
                 }
-                SettingsSidebarRow(title: "通用", systemImage: "gearshape",
-                                   section: .general, selection: nav.section) {
-                    nav.section = .general
-                }
-                Spacer(minLength: 0)
+                .navigationSplitViewStyle(.automatic)
             }
-            .padding(.horizontal, 8)
-            .padding(.top, 12)
-            .frame(width: 190)
-            .frame(maxHeight: .infinity, alignment: .top)
-            .background(Color(nsColor: .windowBackgroundColor))
-            .frame(width: nav.sidebarVisible ? 190 : 0, alignment: .leading)
-            .clipped()
-            .opacity(nav.sidebarVisible ? 1 : 0)
-            .allowsHitTesting(nav.sidebarVisible)
-
-            Divider().opacity(nav.sidebarVisible ? 1 : 0)
-
-            NavigationStack {
-                switch nav.section {
-                case .models, .remotes: RouteWorkspaceView(store: store)
-                case .activity: LogWindowView()
-                case .general: GeneralPane(store: store)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(WindowActivator().frame(width: 0, height: 0))
-        // 侧栏展开时仍要给供应商页留出 260pt 列表 + 390pt 详情。
-        .frame(minWidth: 1020, minHeight: 620)
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        nav.sidebarVisible.toggle()
-                    }
-                } label: {
-                    Label(nav.sidebarVisible ? "隐藏侧栏" : "显示侧栏",
-                          systemImage: "sidebar.left")
-                }
-                .help(nav.sidebarVisible ? "隐藏侧栏" : "显示侧栏")
-                .keyboardShortcut("s", modifiers: [.command, .control])
-            }
+        .frame(minWidth: 1000, minHeight: 640)
+    }
+
+    private var sidebar: some View {
+        List(selection: Binding<SettingsSection?>(
+            get: { nav.section },
+            set: { if let section = $0 { nav.section = section } }
+        )) {
+            Label("路由与模型", systemImage: "arrow.triangle.branch").tag(SettingsSection.models)
+            Label("活动", systemImage: "waveform.path.ecg").tag(SettingsSection.activity)
+            Label("用量", systemImage: "chart.bar.xaxis").tag(SettingsSection.usage)
+            Label("通用", systemImage: "gearshape").tag(SettingsSection.general)
+        }
+        .listStyle(.sidebar)
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch nav.section {
+        case .models, .remotes: RouteWorkspaceView(store: store)
+        case .activity: LogWindowView()
+        case .usage: UsageView(store: store.usageStore)
+        case .general: GeneralPane(store: store)
         }
     }
-}
 
-private struct SettingsSidebarRow: View {
-    let title: String
-    let systemImage: String
-    let section: SettingsSection
-    let selection: SettingsSection
-    let action: () -> Void
-
-    private var selected: Bool { section == selection }
-
-    var body: some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.body)
-                .foregroundStyle(selected ? Color.primary : Color.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 9)
-                .frame(height: 30)
-                .background {
-                    if selected {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Color.accentColor.opacity(0.16))
-                    }
-                }
-                .contentShape(Rectangle())
+    private var navigationTitle: String {
+        switch nav.section {
+        case .models, .remotes: return "路由与模型"
+        case .activity: return "活动"
+        case .usage: return "用量"
+        case .general: return "通用"
         }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var columnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { nav.sidebarVisible ? .all : .detailOnly },
+            set: { nav.sidebarVisible = ($0 != .detailOnly) }
+        )
     }
 }
 

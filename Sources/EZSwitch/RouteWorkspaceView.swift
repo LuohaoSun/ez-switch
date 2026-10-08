@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 private enum WorkspaceSheet: Identifiable {
     case newProvider
@@ -26,7 +25,6 @@ private final class WorkspaceDraft: ObservableObject {
     @Published var query = ""
     @Published var collapsedProviders = Set<String>()
     @Published var collapsedRoutes = Set<UUID>()
-    @Published var dropTarget: String?
     @Published var sheet: WorkspaceSheet?
     @Published var providerToDelete: String?
     @Published var routeToDelete: UUID?
@@ -41,11 +39,8 @@ struct RouteWorkspaceView: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            supplierPanel.frame(minWidth: 260, idealWidth: 305, maxWidth: 350)
-            Divider()
-            routePanel.frame(minWidth: 440, maxWidth: .infinity)
-        }
+        NativeWorkspaceSplit(suppliers: supplierPanel, routes: routePanel)
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
         .navigationTitle("路由与模型")
         .sheet(item: $ui.sheet) { target in
             switch target {
@@ -122,24 +117,52 @@ struct RouteWorkspaceView: View {
 
     private func supplierGroup(_ group: RemoteGroup) -> some View {
         let expanded = !ui.query.isEmpty || !ui.collapsedProviders.contains(group.provider)
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption).foregroundStyle(.secondary).frame(width: 12)
-                    Text(group.provider).font(.subheadline.bold()).lineLimit(1)
-                    Spacer(minLength: 0)
+        return DisclosureGroup(isExpanded: Binding(
+            get: { !ui.query.isEmpty || !ui.collapsedProviders.contains(group.provider) },
+            set: { expanded in
+                guard ui.query.isEmpty else { return }
+                if expanded { ui.collapsedProviders.remove(group.provider) }
+                else { ui.collapsedProviders.insert(group.provider) }
+            }
+        )) {
+            Divider()
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(group.remotes) { remote in
+                    HStack(spacing: 8) {
+                        Text(remote.model).font(.system(.callout, design: .monospaced))
+                            .lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 0)
+                        if remote.needsCredentials {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundStyle(.orange).help("凭据待配置")
+                        }
+                    }
+                    .padding(.vertical, 7)
+                    .contentShape(Rectangle())
+                    .modifier(NativeModelDrag(item: ModelDragItem(id: remote.id)))
+                    .modifier(NativeModelDrop(enabled: ui.query.isEmpty, accept: { items in
+                        acceptModelDrop(items, provider: group.provider, before: remote.id)
+                    }))
+                    .contextMenu {
+                        Button("编辑模型…") { ui.sheet = .model(remote.id) }
+                    }
+                    .help("拖到右侧路由添加模型；在左侧拖到其他模型上方调整顺序")
                 }
-                .contentShape(Rectangle())
-                .onTapGesture { toggleProvider(group.provider) }
-                .accessibilityElement(children: .combine)
-                .accessibilityAddTraits(.isButton)
-                .accessibilityAction { toggleProvider(group.provider) }
-                .modifier(NativeCardDragHandle(id: group.id, enabled: ui.query.isEmpty))
-                .help("展开或收起；拖到其他供应商上方调整顺序")
-
-                Text("\(group.remotes.count)")
-                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+        } label: {
+            HStack(spacing: 8) {
+                Text(group.provider).font(.subheadline.bold()).lineLimit(1)
+                    .padding(.trailing, 50)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .modifier(NativeCardDragHandle(id: group.id, enabled: ui.query.isEmpty))
+                    .help("展开或收起；拖动标题调整供应商顺序")
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            HStack(spacing: 8) {
+                Text("\(group.remotes.count)").font(.caption).foregroundStyle(.secondary)
                 Menu {
                     Button("获取模型列表…") { ui.sheet = .catalog(group.provider) }
                     Button("添加模型…") {
@@ -151,72 +174,28 @@ struct RouteWorkspaceView: View {
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).help("管理 \(group.provider)")
             }
-            .padding(.horizontal, 12).padding(.vertical, 10)
-
-            if expanded {
-                Divider().padding(.horizontal, 12)
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(group.remotes) { remote in
-                        HStack(spacing: 8) {
-                            Text(remote.model).font(.system(.callout, design: .monospaced))
-                                .lineLimit(1).truncationMode(.middle)
-                            Spacer(minLength: 0)
-                            if remote.needsCredentials {
-                                Image(systemName: "exclamationmark.circle.fill")
-                                    .foregroundStyle(.orange).help("凭据待配置")
-                            }
-                        }
-                        .padding(.leading, 32).padding(.trailing, 12).padding(.vertical, 7)
-                        .contentShape(Rectangle())
-                        .onDrag { NSItemProvider(object: remote.id.uuidString as NSString) }
-                        .onDrop(of: [UTType.plainText.identifier], isTargeted: nil) { providers in
-                            guard ui.query.isEmpty else { return false }
-                            return acceptModelDrop(providers, provider: group.provider, before: remote.id)
-                        }
-                        .contextMenu {
-                            Button("编辑模型…") { ui.sheet = .model(remote.id) }
-                        }
-                        .help("拖到右侧路由添加模型；在左侧拖到其他模型上方调整顺序")
-                    }
-                }
-                .padding(.vertical, 4)
-            }
         }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .animation(.easeInOut(duration: 0.2), value: expanded)
         .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
         .overlay(RoundedRectangle(cornerRadius: 11)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
         .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
     }
 
-    private func toggleProvider(_ provider: String) {
-        guard ui.query.isEmpty else { return }
-        withAnimation(.easeInOut(duration: 0.2)) {
-            if ui.collapsedProviders.contains(provider) { ui.collapsedProviders.remove(provider) }
-            else { ui.collapsedProviders.insert(provider) }
-        }
-    }
-
-    private func toggleRoute(_ id: UUID) {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            if ui.collapsedRoutes.contains(id) { ui.collapsedRoutes.remove(id) }
-            else { ui.collapsedRoutes.insert(id) }
-        }
-    }
-
-    private func acceptModelDrop(_ providers: [NSItemProvider], provider: String, before target: UUID) -> Bool {
-        guard let item = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return false }
-        _ = item.loadObject(ofClass: NSString.self) { object, _ in
-            guard let value = object as? String, let source = UUID(uuidString: value) else { return }
-            DispatchQueue.main.async {
-                guard splitProviderModel(self.remoteByID[source]?.name ?? "").provider == provider else { return }
-                store.moveModels(provider: provider, sources: [source], before: target)
-            }
-        }
+    private func acceptModelDrop(_ items: [ModelDragItem], provider: String, before target: UUID) -> Bool {
+        guard ui.query.isEmpty, !items.isEmpty,
+              items.allSatisfy({ item in
+                  guard let remote = remoteByID[item.id] else { return false }
+                  return splitProviderModel(remote.name).provider == provider
+              }) else { return false }
+        store.moveModels(provider: provider, sources: items.map(\.id), before: target)
         return true
     }
 
     private var routePanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let modelsByID = remoteByID
+        return VStack(alignment: .leading, spacing: 12) {
             ServiceSummary(store: store)
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
@@ -235,69 +214,75 @@ struct RouteWorkspaceView: View {
             } else {
                 NativeReorderableCards(items: store.config.fakes, spacing: 14,
                                        move: { store.moveFakes(sources: $0, before: $1) }) { fake in
-                    routeCard(fake)
+                    routeCard(fake, modelsByID: modelsByID)
                 }
             }
         }.padding(20)
     }
 
-    private func routeCard(_ fake: FakeModel) -> some View {
+    private func routeCard(_ fake: FakeModel, modelsByID: [UUID: RemoteModel]) -> some View {
         let ids = fake.orderedRemoteIDs
         let expanded = !ui.collapsedRoutes.contains(fake.id)
         return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption).foregroundStyle(.secondary).frame(width: 12)
-                    Text(fake.fakeModelID).font(.system(.headline, design: .monospaced)).lineLimit(1)
-                    Spacer(minLength: 0)
+            DisclosureGroup(isExpanded: Binding(
+                get: { !ui.collapsedRoutes.contains(fake.id) },
+                set: { expanded in
+                    if expanded { ui.collapsedRoutes.remove(fake.id) }
+                    else { ui.collapsedRoutes.insert(fake.id) }
                 }
-                .contentShape(Rectangle())
-                .onTapGesture { toggleRoute(fake.id) }
-                .accessibilityElement(children: .combine)
-                .accessibilityAddTraits(.isButton)
-                .accessibilityAction { toggleRoute(fake.id) }
-                .modifier(NativeCardDragHandle(id: fake.id))
-                .help("展开或收起；拖动卡片调整路由顺序")
-                Toggle("自动切换", isOn: Binding(
-                    get: { store.config.fakes.first(where: { $0.id == fake.id })?.autoFallback ?? false },
-                    set: { store.setRouteTargets(fakeID: fake.id, remoteIDs: fake.orderedRemoteIDs, autoFallback: $0) }
-                )).toggleStyle(.switch).controlSize(.small)
-                Menu {
-                    Button("编辑路由 ID…") { ui.sheet = .route(fake.id) }
-                    Button("复制路由 ID") { copyText(fake.fakeModelID) }
-                    Divider()
-                    Button("删除路由…", role: .destructive) { ui.routeToDelete = fake.id }
-                } label: { Image(systemName: "ellipsis") }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden)
-            }
-            .padding(.horizontal, 14).padding(.vertical, 12)
-
-            if expanded {
-                Divider().padding(.horizontal, 14)
+            )) {
+                Divider()
                 VStack(alignment: .leading, spacing: 4) {
                     if ids.isEmpty {
                         dropSlot(fake: fake, index: 0, label: "拖入模型")
                     } else {
                         ForEach(Array(ids.enumerated()), id: \.element) { index, id in
-                            if let remote = remoteByID[id] {
+                            if let remote = modelsByID[id] {
                                 candidateRow(fake: fake, remote: remote, index: index)
                             }
                         }
                         dropSlot(fake: fake, index: ids.count, label: "拖入模型")
                     }
                 }
-                .padding(.horizontal, 8).padding(.top, 5).padding(.bottom, 9)
+                .padding(.top, 5)
                 .animation(.easeInOut(duration: 0.22), value: ids)
-            } else {
+            } label: {
+                HStack(spacing: 8) {
+                    Text(fake.fakeModelID).font(.system(.headline, design: .monospaced)).lineLimit(1)
+                        .padding(.trailing, 145)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .modifier(NativeCardDragHandle(id: fake.id))
+                        .help("展开或收起；拖动标题调整路由顺序")
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                HStack(spacing: 8) {
+                    Toggle("自动切换", isOn: Binding(
+                        get: { store.config.fakes.first(where: { $0.id == fake.id })?.autoFallback ?? false },
+                        set: { store.setRouteTargets(fakeID: fake.id, remoteIDs: fake.orderedRemoteIDs, autoFallback: $0) }
+                    )).toggleStyle(.switch).controlSize(.small)
+                    Menu {
+                        Button("编辑路由 ID…") { ui.sheet = .route(fake.id) }
+                        Button("复制路由 ID") { copyText(fake.fakeModelID) }
+                        Divider()
+                        Button("删除路由…", role: .destructive) { ui.routeToDelete = fake.id }
+                    } label: { Image(systemName: "ellipsis") }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 12)
+            if !expanded {
                 TimelineView(.periodic(from: .now, by: 2)) { _ in
-                    let current = store.router.activeRemoteID(fakeID: fake.id).flatMap { remoteByID[$0] }
+                    let current = store.router.activeRemoteID(fakeID: fake.id).flatMap { modelsByID[$0] }
                     Text(current.map { "当前 · \($0.routeLabel)" } ?? "未配置模型")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(.leading, 34).padding(.trailing, 14).padding(.bottom, 12)
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: expanded)
         .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
@@ -312,11 +297,12 @@ struct RouteWorkspaceView: View {
             } label: {
                 HStack(spacing: 8) {
                     Text(remote.routeLabel).lineLimit(1).truncationMode(.middle)
-                    Spacer(minLength: 4)
+                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                     TimelineView(.periodic(from: .now, by: 2)) { _ in
                         if store.router.activeRemoteID(fakeID: fake.id) == remote.id {
                             Label("当前", systemImage: "checkmark.circle.fill")
                                 .font(.caption).foregroundStyle(.tint)
+                                .fixedSize()
                         }
                     }
                 }
@@ -332,61 +318,46 @@ struct RouteWorkspaceView: View {
 
         }
         .padding(.horizontal, 6).padding(.vertical, 8)
-        .overlay(alignment: .top) {
-            if ui.dropTarget == "\(fake.id)-\(index)" {
-                Rectangle().fill(Color.accentColor).frame(height: 3)
-            }
-        }
         .contentShape(Rectangle())
-        .onDrag { NSItemProvider(object: remote.id.uuidString as NSString) }
-        .onDrop(of: [UTType.plainText.identifier], isTargeted: Binding(
-            get: { ui.dropTarget == "\(fake.id)-\(index)" },
-            set: { ui.dropTarget = $0 ? "\(fake.id)-\(index)" : nil }
-        )) { providers in
-            acceptDrop(providers, fakeID: fake.id, before: index)
-        }
+        .modifier(NativeModelDrag(item: ModelDragItem(id: remote.id)))
+        .modifier(NativeModelDrop(accept: { items in
+            acceptDrop(items, fakeID: fake.id, before: index)
+        }))
         .help("拖动调整尝试顺序，或将左侧模型拖到此位置")
     }
 
     private func dropSlot(fake: FakeModel, index: Int, label: String) -> some View {
-        let targeted = ui.dropTarget == "\(fake.id)-\(index)"
         return HStack {
             Image(systemName: "plus.circle.dashed")
             Text(label)
             Spacer()
         }
         .font(.caption)
-        .foregroundStyle(targeted ? Color.accentColor : Color.secondary.opacity(0.75))
+        .foregroundStyle(Color.secondary.opacity(0.75))
         .padding(10)
         .frame(maxWidth: .infinity)
         .background(RoundedRectangle(cornerRadius: 7)
-            .strokeBorder(targeted ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.12),
+            .strokeBorder(Color.primary.opacity(0.12),
                           style: StrokeStyle(lineWidth: 1, dash: [4])))
-        .onDrop(of: [UTType.plainText.identifier], isTargeted: Binding(
-            get: { ui.dropTarget == "\(fake.id)-\(index)" },
-            set: { ui.dropTarget = $0 ? "\(fake.id)-\(index)" : nil }
-        )) { providers in
-            acceptDrop(providers, fakeID: fake.id, before: index)
-        }
+        .modifier(NativeModelDrop(accept: { items in
+            acceptDrop(items, fakeID: fake.id, before: index)
+        }))
     }
 
-    private func acceptDrop(_ providers: [NSItemProvider], fakeID: UUID, before index: Int) -> Bool {
-        guard let provider = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return false }
-        _ = provider.loadObject(ofClass: NSString.self) { object, _ in
-            guard let string = object as? String, let remoteID = UUID(uuidString: string) else { return }
-            DispatchQueue.main.async {
-                guard self.remoteByID[remoteID] != nil,
-                      let fake = store.config.fakes.first(where: { $0.id == fakeID }) else { return }
-                var ids = fake.orderedRemoteIDs
-                let original = ids.firstIndex(of: remoteID)
-                if let original { ids.remove(at: original) }
-                let insertion = max(0, min(index - (original.map { $0 < index } == true ? 1 : 0), ids.count))
-                ids.insert(remoteID, at: insertion)
-                store.setRouteTargets(fakeID: fakeID, remoteIDs: ids, autoFallback: fake.autoFallback)
-            }
-        }
+    private func acceptDrop(_ items: [ModelDragItem], fakeID: UUID, before index: Int) -> Bool {
+        guard !items.isEmpty, items.allSatisfy({ remoteByID[$0.id] != nil }),
+              let fake = store.config.fakes.first(where: { $0.id == fakeID }) else { return false }
+        var seen = Set<UUID>()
+        let sources = items.map(\.id).filter { seen.insert($0).inserted }
+        let original = fake.orderedRemoteIDs
+        var ids = original.filter { !sources.contains($0) }
+        let removedBefore = original.prefix(max(0, index)).filter { sources.contains($0) }.count
+        let insertion = max(0, min(index - removedBefore, ids.count))
+        ids.insert(contentsOf: sources, at: insertion)
+        store.setRouteTargets(fakeID: fakeID, remoteIDs: ids, autoFallback: fake.autoFallback)
         return true
     }
+
 }
 
 @MainActor
@@ -423,19 +394,12 @@ private struct ModelCatalogSheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(draft.models, id: \.self) { model in
-                    Button {
-                        if draft.selected.contains(model) { draft.selected.remove(model) }
-                        else { draft.selected.insert(model) }
-                    } label: {
-                        HStack {
-                            Image(systemName: draft.selected.contains(model) ? "checkmark.circle.fill" : "circle")
-                            Text(model).font(.system(.body, design: .monospaced))
-                            Spacer()
-                            if existing.contains(model) {
-                                Text("已添加").font(.caption).foregroundStyle(.secondary)
-                            }
+                    HStack {
+                        ModelSelectionToggle(model: model, selection: $draft.selected)
+                        if existing.contains(model) {
+                            Text("已添加").font(.caption).foregroundStyle(.secondary)
                         }
-                    }.buttonStyle(.plain)
+                    }
                 }
                 Text("已返回 \(draft.models.count) 个模型；按需选择，已添加的条目会跳过。")
                     .font(.caption).foregroundStyle(.secondary)

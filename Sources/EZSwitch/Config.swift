@@ -510,6 +510,8 @@ final class ConfigStore: ObservableObject {
 
     let configURL: URL
     let router = Router()
+    /// 用量统计存储；数据库懒开，record 非阻塞不抛错（失败只影响统计，不影响代理）。
+    let usageStore: UsageStore
 
     private var server: RouterServer?
     private var cliServer: CLIControlServer?
@@ -523,6 +525,7 @@ final class ConfigStore: ObservableObject {
 
     init(configURL url: URL, startsWatching: Bool = false) {
         self.configURL = url
+        self.usageStore = UsageStore(url: UsageStore.databaseURL(for: url))
         let (loaded, shouldPersistMigration) = ConfigStore.loadOrCreate(at: url)
         let (baseNormalized, didNormalizeBaseURLs) = ConfigStore.normalizeBaseURLs(loaded)
         let (merged, didMerge) = ConfigStore.mergeDuplicateRemotes(baseNormalized)
@@ -1223,7 +1226,7 @@ final class ConfigStore: ObservableObject {
         let environment = ProcessInfo.processInfo.environment
         let port = (environment["EZSWITCH_PORT"] ?? environment["MODELROUTER_PORT"])
             .flatMap(Int.init) ?? config.port
-        let s = RouterServer(router: router)
+        let s = RouterServer(router: router, usageStore: usageStore)
         server = s
         do {
             try s.start(port: port)
