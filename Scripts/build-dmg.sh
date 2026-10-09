@@ -2,11 +2,12 @@
 # 构建可直接发布的 DMG。磁盘映像内包含 EZSwitch.app 和 /Applications 快捷方式，
 # 用户打开后可以把应用拖入 Applications。
 #
-#   ./build-dmg.sh             重新构建应用并生成 DMG
-#   ./build-dmg.sh --skip-build 复用 dist/EZSwitch.app 生成 DMG
+#   ./Scripts/build-dmg.sh             重新构建应用并生成 DMG
+#   ./Scripts/build-dmg.sh --skip-build 复用 dist/EZSwitch.app 生成 DMG
 set -euo pipefail
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 APP_NAME=EZSwitch
 DISPLAY_NAME="EZ Switch"
@@ -19,12 +20,12 @@ DMG_PATH="$DIST_DIR/$DMG_NAME"
 STAGING_DIR="$DIST_DIR/dmg-staging"
 
 if [[ "${1:-}" != "--skip-build" ]]; then
-    ./build-app.sh
+    "$SCRIPT_DIR/build-app.sh"
 fi
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
     echo "缺少应用包：$APP_BUNDLE" >&2
-    echo "请先运行 ./build-app.sh，或不要使用 --skip-build。" >&2
+    echo "请先运行 ./Scripts/build-app.sh，或不要使用 --skip-build。" >&2
     exit 1
 fi
 

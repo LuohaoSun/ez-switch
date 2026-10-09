@@ -74,7 +74,7 @@ struct ResponsesTransportTests {
 }
 
 @Suite("Responses translator process", .enabled(if: BridgeTestExecutable.available,
-      "Run ./build-translator.sh to enable bridge process tests"))
+      "Run ./Scripts/build-translator.sh to enable bridge process tests"))
 struct ResponseTranslatorTests {
     private var executable: URL { BridgeTestExecutable.url }
     @Test

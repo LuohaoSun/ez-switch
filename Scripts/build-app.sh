@@ -1,8 +1,8 @@
 #!/bin/bash
 # 构建 EZSwitch.app 并（可选）安装到 /Applications。
 #
-#   ./build-app.sh            只构建，产物在 dist/EZSwitch.app
-#   ./build-app.sh --install  构建后安装到 /Applications 并重启、验证服务
+#   ./Scripts/build-app.sh            只构建，产物在 dist/EZSwitch.app
+#   ./Scripts/build-app.sh --install  构建后安装到 /Applications 并重启、验证服务
 #
 # 两个关键点：
 #  1. Package.swift 显式把链接 SDK 标为 27.0，同时保持 macOS 13 最低版本；否则
@@ -10,7 +10,8 @@
 #  2. ad-hoc 签名必须重新做（改过二进制的 bundle 签名会失效，系统会拒绝启动）。
 set -euo pipefail
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 APP_NAME=EZSwitch
 OLD_APP_NAME=ModelRouter
 BUNDLE_ID=local.sunluohao.ezswitch
@@ -18,7 +19,7 @@ INSTALL_DIR=/Applications
 DIST=dist/$APP_NAME.app
 
 echo "==> Responses translator"
-./build-translator.sh
+"$SCRIPT_DIR/build-translator.sh"
 
 echo "==> swift build -c release"
 swift build -c release
