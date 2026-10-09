@@ -100,7 +100,8 @@ private final class CLIControlHandler: ChannelInboundHandler {
         let line = input.prefix(upTo: newline)
         let channel = context.channel
         Task { @MainActor [store] in
-            let reply = store.handleCLICommand(Data(line))
+            // `usage` 的 snapshot 查询在非阻塞的 await 路径上完成；list/set 仍同步处理。
+            let reply = await store.handleCLICommandAsync(Data(line))
             channel.eventLoop.execute {
                 Self.write(reply, to: channel)
             }
@@ -113,6 +114,12 @@ private final class CLIControlHandler: ChannelInboundHandler {
 
     private static func write(_ reply: [String: Any], to channel: Channel) {
         var data = (try? JSONSerialization.data(withJSONObject: reply)) ?? Data(#"{"ok":false,"message":"serialization failed"}"#.utf8)
+        // 守住 1 MiB 上限（含结尾换行）：过大的完整响应改为明确错误，绝不截断 JSON。
+        if data.count + 1 > CLIUsage.maxResponseBytes {
+            data = (try? JSONSerialization.data(withJSONObject:
+                ["ok": false, "message": "response too large; reduce limit or narrow the date range"]))
+                ?? Data(#"{"ok":false,"message":"response too large"}"#.utf8)
+        }
         data.append(10)
         var buffer = channel.allocator.buffer(capacity: data.count)
         buffer.writeBytes(data)

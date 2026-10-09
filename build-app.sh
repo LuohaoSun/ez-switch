@@ -23,6 +23,9 @@ echo "==> Responses translator"
 echo "==> swift build -c release"
 swift build -c release
 
+echo "==> 收集 Swift 依赖许可证"
+python3 Tools/collect-swift-licenses.py .build/swift-licenses
+
 echo "==> 组装 $DIST"
 rm -rf "$DIST"
 mkdir -p "$DIST/Contents/MacOS" "$DIST/Contents/Resources"
@@ -30,7 +33,9 @@ cp .build/release/$APP_NAME "$DIST/Contents/MacOS/$APP_NAME"
 cp .build/release/ezs "$DIST/Contents/MacOS/ezs"
 cp .build/ezs-responses-bridge "$DIST/Contents/MacOS/ezs-responses-bridge"
 cp -R .build/bridge-licenses "$DIST/Contents/Resources/ThirdPartyLicenses"
+cp -R .build/swift-licenses "$DIST/Contents/Resources/ThirdPartyLicenses/swift"
 cp ThirdParty/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/README.md"
+cp LICENSE "$DIST/Contents/Resources/LICENSE.txt"
 codesign --force -s - "$DIST/Contents/MacOS/ezs-responses-bridge"
 cp Resources/Info.plist "$DIST/Contents/Info.plist"
 cp Resources/AppIcon.icns "$DIST/Contents/Resources/AppIcon.icns"

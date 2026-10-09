@@ -380,25 +380,24 @@ struct ConfigStoreTests {
     func exampleUsesOfficialProviderDefaults() {
         let config = AppConfig.example()
 
-        #expect(config.remotes.map(\.name) == [
-            "DeepSeek官方 · deepseek-flash",
-            "OpenCode Go · deepseek-v4.1-flash"
-        ])
-        #expect(config.remotes.map(\.model) == ["deepseek-flash", "deepseek-v4.1-flash"])
+        #expect(config.remotes.map(\.name) == ["DeepSeek官方 · deepseek-flash"])
+        #expect(config.remotes.map(\.model) == ["deepseek-flash"])
         #expect(config.remotes.allSatisfy { $0.extraHeaders.isEmpty })
         #expect(config.remotes[0].apiEndpoints ==
                 .enabled([.chat], baseURL: "https://api.deepseek.com/v1"))
-        #expect(config.remotes[1].apiEndpoints ==
-                .enabled([.chat], baseURL: "https://opencode.ai/zen/go/v1"))
-        #expect(Forwarder.upstreamURL(remote: config.remotes[1], endpoint: .chat, query: "")?.absoluteString ==
-                "https://opencode.ai/zen/go/v1/chat/completions")
+        #expect(Forwarder.upstreamURL(remote: config.remotes[0], endpoint: .chat, query: "")?.absoluteString ==
+                "https://api.deepseek.com/v1/chat/completions")
         #expect(config.fakes.map(\.fakeModelID) == ["main"])
-        #expect(config.fakes[0].remoteID == config.remotes[1].id)
+        #expect(config.fakes[0].remoteID == config.remotes[0].id)
     }
 
     @Test
     func openCodeGoForwardsConversationHeadersWithoutStaticSession() throws {
-        let remote = AppConfig.example().remotes[1]
+        let remote = RemoteModel(
+            id: UUID(), name: "OpenCode Go · deepseek-v4.1-flash",
+            apiKey: "sk-REPLACE-ME", model: "deepseek-v4.1-flash", extraHeaders: [:],
+            apiEndpoints: .enabled([.chat], baseURL: "https://opencode.ai/zen/go/v1")
+        )
         let head = HTTPRequestHead(version: .http1_1, method: .POST, uri: "/v1/chat/completions",
                                    headers: HTTPHeaders([
                                     ("x-opencode-session", "conversation-1"),
