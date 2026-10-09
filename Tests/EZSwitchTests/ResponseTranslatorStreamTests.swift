@@ -5,7 +5,7 @@ import Testing
 @Suite("Responses translator streaming")
 struct ResponseTranslatorStreamTests {
     private var executable: URL { BridgeTestExecutable.url }
-    @Test(.enabled(if: BridgeTestExecutable.available, "Run ./build-translator.sh to enable bridge streaming tests"))
+    @Test(.enabled(if: BridgeTestExecutable.available, "Run ./Scripts/build-translator.sh to enable bridge streaming tests"))
     func streamSurvivesSplitEventsAndPreservesSingleCompletion() async throws {
         let translator = try ResponseTranslator(executable: executable)
         defer { translator.stop() }
@@ -30,7 +30,7 @@ struct ResponseTranslatorStreamTests {
         #expect(output.components(separatedBy: "event: response.completed").count == 2)
     }
 
-    @Test(.enabled(if: BridgeTestExecutable.available, "Run ./build-translator.sh to enable bridge streaming tests"))
+    @Test(.enabled(if: BridgeTestExecutable.available, "Run ./Scripts/build-translator.sh to enable bridge streaming tests"))
     func truncatedChatStreamDoesNotComplete() async throws {
         let translator = try ResponseTranslator(executable: executable)
         defer { translator.stop() }

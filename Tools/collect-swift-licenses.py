@@ -21,7 +21,7 @@ import sys
 
 LICENSE_PREFIXES = ("LICENSE", "LICENCE", "COPYING")
 NOTICE_PREFIXES = ("NOTICE",)
-# Mirrors the directory build-app.sh copies the collected tree into.
+# Mirrors the directory Scripts/build-app.sh copies the collected tree into.
 BUNDLE_SUBDIR = "ThirdPartyLicenses/swift"
 
 

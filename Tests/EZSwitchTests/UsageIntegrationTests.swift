@@ -442,7 +442,7 @@ struct UsageIntegrationTests {
         #expect(records[0].outcome == "success")
     }
 
-    @Test(.enabled(if: BridgeTestExecutable.available, "Run ./build-translator.sh to enable bridge integration"))
+    @Test(.enabled(if: BridgeTestExecutable.available, "Run ./Scripts/build-translator.sh to enable bridge integration"))
     func translatedResponsesCapturesRawChatUsage() async throws {
         // Route the bundled bridge test binary to ResponseTranslator (env path wins).
         setenv("EZSWITCH_TRANSLATOR", BridgeTestExecutable.url.path, 1)
