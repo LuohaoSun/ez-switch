@@ -34,6 +34,11 @@ let package = Package(
             name: "EZSwitchTests",
             dependencies: ["EZSwitch"],
             path: "Tests/EZSwitchTests"
+        ),
+        .testTarget(
+            name: "EZSCLITests",
+            dependencies: ["EZSCLI"],
+            path: "Tests/EZSCLITests"
         )
     ]
 )

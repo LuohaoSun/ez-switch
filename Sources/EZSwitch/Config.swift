@@ -365,16 +365,11 @@ extension AppConfig {
             apiKey: "sk-REPLACE-ME", model: "deepseek-flash", extraHeaders: [:],
             apiEndpoints: .enabled([.chat], baseURL: "https://api.deepseek.com/v1")
         )
-        let openCodeGo = RemoteModel(
-            id: UUID(), name: "OpenCode Go · deepseek-v4.1-flash",
-            apiKey: "sk-REPLACE-ME", model: "deepseek-v4.1-flash", extraHeaders: [:],
-            apiEndpoints: .enabled([.chat], baseURL: "https://opencode.ai/zen/go/v1")
-        )
-        let remotes = [deepSeek, openCodeGo]
+        let remotes = [deepSeek]
 
         let fakes = [
             FakeModel(id: UUID(), fakeModelID: "main",
-                      displayName: "main", remoteID: openCodeGo.id),
+                      displayName: "main", remoteID: deepSeek.id),
         ]
         return AppConfig(port: 8788, remotes: remotes, fakes: fakes)
     }
