@@ -126,29 +126,15 @@ struct RouteWorkspaceView: View {
             }
         )) {
             Divider()
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(group.remotes) { remote in
-                    HStack(spacing: 8) {
-                        Text(remote.model).font(.system(.callout, design: .monospaced))
-                            .lineLimit(1).truncationMode(.middle)
-                        Spacer(minLength: 0)
-                        if remote.needsCredentials {
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .foregroundStyle(.orange).help("凭据待配置")
-                        }
-                    }
-                    .padding(.vertical, 7)
-                    .contentShape(Rectangle())
-                    .modifier(NativeModelDrag(item: ModelDragItem(id: remote.id)))
-                    .modifier(NativeModelDrop(enabled: ui.query.isEmpty, accept: { items in
-                        acceptModelDrop(items, provider: group.provider, before: remote.id)
-                    }))
-                    .contextMenu {
-                        Button("编辑模型…") { ui.sheet = .model(remote.id) }
-                    }
-                    .help("拖到右侧路由添加模型；在左侧拖到其他模型上方调整顺序")
-                }
-            }
+            NativeSupplierModelList(
+                items: group.remotes.map {
+                    SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: $0.needsCredentials)
+                },
+                provider: group.provider,
+                sortEnabled: ui.query.isEmpty,
+                store: store,
+                onEdit: { ui.sheet = .model($0) }
+            )
             .padding(.vertical, 4)
         } label: {
             HStack(spacing: 8) {
@@ -183,16 +169,6 @@ struct RouteWorkspaceView: View {
         .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
     }
 
-    private func acceptModelDrop(_ items: [ModelDragItem], provider: String, before target: UUID) -> Bool {
-        guard ui.query.isEmpty, !items.isEmpty,
-              items.allSatisfy({ item in
-                  guard let remote = remoteByID[item.id] else { return false }
-                  return splitProviderModel(remote.name).provider == provider
-              }) else { return false }
-        store.moveModels(provider: provider, sources: items.map(\.id), before: target)
-        return true
-    }
-
     private var routePanel: some View {
         let modelsByID = remoteByID
         return VStack(alignment: .leading, spacing: 12) {
@@ -221,7 +197,6 @@ struct RouteWorkspaceView: View {
     }
 
     private func routeCard(_ fake: FakeModel, modelsByID: [UUID: RemoteModel]) -> some View {
-        let ids = fake.orderedRemoteIDs
         let expanded = !ui.collapsedRoutes.contains(fake.id)
         return VStack(alignment: .leading, spacing: 0) {
             DisclosureGroup(isExpanded: Binding(
@@ -232,20 +207,7 @@ struct RouteWorkspaceView: View {
                 }
             )) {
                 Divider()
-                VStack(alignment: .leading, spacing: 4) {
-                    if ids.isEmpty {
-                        dropSlot(fake: fake, index: 0, label: "拖入模型")
-                    } else {
-                        ForEach(Array(ids.enumerated()), id: \.element) { index, id in
-                            if let remote = modelsByID[id] {
-                                candidateRow(fake: fake, remote: remote, index: index)
-                            }
-                        }
-                        dropSlot(fake: fake, index: ids.count, label: "拖入模型")
-                    }
-                }
-                .padding(.top, 5)
-                .animation(.easeInOut(duration: 0.22), value: ids)
+                RouteCandidateList(store: store, fake: fake, modelsByID: modelsByID)
             } label: {
                 HStack(spacing: 8) {
                     Text(fake.fakeModelID).font(.system(.headline, design: .monospaced)).lineLimit(1)
@@ -289,75 +251,33 @@ struct RouteWorkspaceView: View {
         .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
     }
 
-    private func candidateRow(fake: FakeModel, remote: RemoteModel, index: Int) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary)
-            Button {
-                store.selectRouteModel(fakeID: fake.id, remoteID: remote.id)
-            } label: {
-                HStack(spacing: 8) {
-                    Text(remote.routeLabel).lineLimit(1).truncationMode(.middle)
-                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-                    TimelineView(.periodic(from: .now, by: 2)) { _ in
-                        if store.router.activeRemoteID(fakeID: fake.id) == remote.id {
-                            Label("当前", systemImage: "checkmark.circle.fill")
-                                .font(.caption).foregroundStyle(.tint)
-                                .fixedSize()
-                        }
-                    }
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("选择此模型用于后续请求")
-            Button {
-                let ids = fake.orderedRemoteIDs.filter { $0 != remote.id }
-                store.setRouteTargets(fakeID: fake.id, remoteIDs: ids, autoFallback: fake.autoFallback)
-            } label: { Image(systemName: "minus.circle") }
-                .buttonStyle(.borderless).help("从路由移除")
+}
 
+/// 单条路由的候选项列表：行几何、拖动发起与插入落点全部交给原生 `NSTableView`（见 `NativeRouteCandidateList`），
+/// 末尾占位行也由该表格提供；这里只把当前配置映射成行模型。
+private struct RouteCandidateList: View {
+    @ObservedObject var store: ConfigStore
+    let fake: FakeModel
+    let modelsByID: [UUID: RemoteModel]
+
+    var body: some View {
+        // 每 2s 取一次“当前”远端；行标识不变时代表层只就地更新指示，不会 reload 表格或打断拖动。
+        TimelineView(.periodic(from: .now, by: 2)) { _ in
+            NativeRouteCandidateList(
+                items: candidateItems,
+                activeRemoteID: store.router.activeRemoteID(fakeID: fake.id),
+                store: store,
+                fakeID: fake.id
+            )
+            .padding(.top, 4)
         }
-        .padding(.horizontal, 6).padding(.vertical, 8)
-        .contentShape(Rectangle())
-        .modifier(NativeModelDrag(item: ModelDragItem(id: remote.id)))
-        .modifier(NativeModelDrop(accept: { items in
-            acceptDrop(items, fakeID: fake.id, before: index)
-        }))
-        .help("拖动调整尝试顺序，或将左侧模型拖到此位置")
     }
 
-    private func dropSlot(fake: FakeModel, index: Int, label: String) -> some View {
-        return HStack {
-            Image(systemName: "plus.circle.dashed")
-            Text(label)
-            Spacer()
+    private var candidateItems: [RouteCandidateItem] {
+        fake.orderedRemoteIDs.map { id in
+            RouteCandidateItem(id: id, label: modelsByID[id]?.routeLabel ?? "未知模型")
         }
-        .font(.caption)
-        .foregroundStyle(Color.secondary.opacity(0.75))
-        .padding(10)
-        .frame(maxWidth: .infinity)
-        .background(RoundedRectangle(cornerRadius: 7)
-            .strokeBorder(Color.primary.opacity(0.12),
-                          style: StrokeStyle(lineWidth: 1, dash: [4])))
-        .modifier(NativeModelDrop(accept: { items in
-            acceptDrop(items, fakeID: fake.id, before: index)
-        }))
     }
-
-    private func acceptDrop(_ items: [ModelDragItem], fakeID: UUID, before index: Int) -> Bool {
-        guard !items.isEmpty, items.allSatisfy({ remoteByID[$0.id] != nil }),
-              let fake = store.config.fakes.first(where: { $0.id == fakeID }) else { return false }
-        var seen = Set<UUID>()
-        let sources = items.map(\.id).filter { seen.insert($0).inserted }
-        let original = fake.orderedRemoteIDs
-        var ids = original.filter { !sources.contains($0) }
-        let removedBefore = original.prefix(max(0, index)).filter { sources.contains($0) }.count
-        let insertion = max(0, min(index - removedBefore, ids.count))
-        ids.insert(contentsOf: sources, at: insertion)
-        store.setRouteTargets(fakeID: fakeID, remoteIDs: ids, autoFallback: fake.autoFallback)
-        return true
-    }
-
 }
 
 @MainActor
