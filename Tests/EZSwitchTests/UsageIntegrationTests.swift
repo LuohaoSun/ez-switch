@@ -83,6 +83,18 @@ private final class UsageRecordSpy: @unchecked Sendable {
     }
 }
 
+/// Thread-safe capture of the request the router actually sent upstream.
+private final class CapturedUpstreamRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: URLRequest?
+    func store(_ request: URLRequest) {
+        lock.lock(); storage = request; lock.unlock()
+    }
+    var request: URLRequest? {
+        lock.lock(); defer { lock.unlock() }; return storage
+    }
+}
+
 /// Minimal raw TCP HTTP client. Closing the socket is a real FIN, so the proxy's
 /// `channelInactive` fires deterministically (URLSession cancellation can be
 /// deferred by connection pooling).
@@ -515,5 +527,49 @@ struct UsageIntegrationTests {
         let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
         #expect(object["model"] as? String == "real")
         #expect((object["stream_options"] as? [String: Any])?["include_usage"] as? Bool == true)
+    }
+
+    // MARK: 请求头端到端透传（真实 RouterServer + mock 上游）
+
+    @Test func forwardsClientHeadersToUpstreamAndReplacesAuthEndToEnd() async throws {
+        let captured = CapturedUpstreamRequest()
+        let upstream = mockSession { request in
+            captured.store(request)
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let only = remote("Solo", "solo-model", baseURL: "https://solo.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main", remoteID: only.id)
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [only], fakes: [fake]))
+
+        let spy = UsageRecordSpy()
+        let server = RouterServer(router: router, recordUsage: { spy.record($0) }, session: upstream)
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue("sess-e2e", forHTTPHeaderField: "x-session-id")
+        request.setValue("custom-1", forHTTPHeaderField: "x-custom-header")
+        request.setValue("Bearer local-harness-token", forHTTPHeaderField: "authorization")
+        request.httpBody = Data(#"{"model":"main","stream":false}"#.utf8)
+        let client = URLSession(configuration: .ephemeral)
+        let (_, response) = try await client.data(for: request)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+
+        let records = await waitFor(spy, count: 1)
+        #expect(records.count == 1)
+
+        let seen = try #require(captured.request)
+        #expect(seen.value(forHTTPHeaderField: "x-session-id") == "sess-e2e")
+        #expect(seen.value(forHTTPHeaderField: "x-custom-header") == "custom-1")
+        // 客户端本机占位 token 不得泄露；替换为供应商 apiKey（remote 用 "test-key"）
+        #expect(seen.value(forHTTPHeaderField: "authorization") == "Bearer test-key")
     }
 }

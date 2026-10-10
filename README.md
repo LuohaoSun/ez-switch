@@ -101,6 +101,7 @@ ezs usage --json
 - 修改端口后需要重启应用。
 - 每条路由有独立的有序候选列表，按可回退的上游失败顺序尝试；不做负载均衡。
 - 默认按原协议转发；Responses → Chat 转换需在供应商中单独启用。
+- 客户端请求头按端到端语义透传（含会话头、SDK 头与自定义头）；hop-by-hop 字段（含 `Connection` 声明的字段）、`Host`、`Content-Length`、`Accept-Encoding` 由本机或 URLSession 重新生成，供应商鉴权头按端点替换为配置的 API Key。供应商 `extraHeaders` 最后应用，可覆盖以上任何值。
 
 ## 许可证
 
