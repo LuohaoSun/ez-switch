@@ -14,10 +14,15 @@ final class UsageStore: @unchecked Sendable {
     /// 当前 schema 版本；升级时必须写迁移，且不得清空已有数据。
     static let schemaVersion: Int32 = 1
 
+    /// 成功写入或清除后发布，作为"今日用量"等派生视图的失效信号。
+    /// 只发信号，不携带任何记录、token 数值、路径或凭证。
+    static let didChangeNotification = Notification.Name("com.ezswitch.usage-store.did-change")
+
     /// 打开失败后的重试冷却；避免热路径上反复尝试并刷日志。
     private static let openRetryCooldown: TimeInterval = 5
 
     private let url: URL
+    private let notificationCenter: NotificationCenter
     private let queue = DispatchQueue(label: "com.ezswitch.usage-store", qos: .utility)
 
     // 以下成员仅在 `queue` 上访问（init/deinit 除外）。
@@ -26,8 +31,9 @@ final class UsageStore: @unchecked Sendable {
     private var lastOpenAttempt: Date?
     private var writeError: Error?
 
-    init(url: URL) {
+    init(url: URL, notificationCenter: NotificationCenter = .default) {
         self.url = url
+        self.notificationCenter = notificationCenter
     }
 
     deinit {
@@ -45,6 +51,7 @@ final class UsageStore: @unchecked Sendable {
     /// 异步落盘，不抛错。打开/插入失败分别记入 `openError`/`writeError`。
     /// 打开失败已由查询路径暴露，故不重复登记。只记录首个写错误，避免日志风暴；
     /// 恢复策略：任意一次成功写入即清除 `writeError`（瞬时错误如 BUSY/FULL 解除后自动恢复）。
+    /// 仅在真正写入成功后发出失效通知；打开/写入失败不通知（避免误导观察者认为有新数据）。
     func record(_ record: UsageRecord) {
         queue.async { [self] in
             let db: OpaquePointer
@@ -56,6 +63,7 @@ final class UsageStore: @unchecked Sendable {
             do {
                 try insert(db, record)
                 writeError = nil
+                postDidChange()
             } catch {
                 if writeError == nil {
                     writeError = error
@@ -91,6 +99,7 @@ final class UsageStore: @unchecked Sendable {
             let db = try requireDB(force: true)
             try execute(db, "DELETE FROM usage_records;")
             writeError = nil
+            postDidChange()
         }
     }
 
@@ -118,6 +127,11 @@ final class UsageStore: @unchecked Sendable {
 
     private func throwPendingWriteError() throws {
         if let writeError { throw writeError }
+    }
+
+    /// 在 `queue` 上发出失效信号（NotificationCenter 线程安全）。通知不携带任何数据。
+    private func postDidChange() {
+        notificationCenter.post(name: Self.didChangeNotification, object: self)
     }
 
     // MARK: - 连接与 schema

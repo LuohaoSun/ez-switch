@@ -92,6 +92,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 struct RouterApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = ConfigStore.shared
+    /// 常驻的菜单栏用量摘要控制器；存活于 App 生命周期，独立于菜单内容视图。
+    @StateObject private var menuUsage = MenuUsageSummary(store: ConfigStore.shared.usageStore)
 
     init() {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -100,7 +102,7 @@ struct RouterApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarContent(store: store)
+            MenuBarContent(store: store, usage: menuUsage)
         } label: {
             MenuBarLabel(store: store)
         }
@@ -163,51 +165,17 @@ private struct MenuBarLabel: View {
     }
 }
 
-/// 菜单内容容器：首帧兜底起服务
+/// 菜单内容容器：首帧兜底起服务并触发一次摘要读取。
 private struct MenuBarContent: View {
     @ObservedObject var store: ConfigStore
-    @StateObject private var usage = MenuUsageSummary()
+    @ObservedObject var usage: MenuUsageSummary
 
     var body: some View {
         MenuView(store: store, usage: usage)
             .onAppear {
                 store.startServer()
+                usage.invalidate()
             }
-            // 只在菜单可见时异步读取一次；不在主线程读库，也不做全局定时轮询。
-            .task {
-                await usage.refresh(store: store.usageStore)
-            }
-    }
-}
-
-/// 菜单栏"今日用量"摘要。异步、按需刷新，可见时才触发。
-@MainActor
-final class MenuUsageSummary: ObservableObject {
-    @Published private(set) var todayTokens: Int?
-    @Published private(set) var isAvailable = true
-    /// 覆盖完整（已知用量 == 上游尝试数）时省略"（已知）"后缀。
-    @Published private(set) var isCompleteCoverage = true
-
-    var menuTitle: String {
-        guard isAvailable else { return "今日用量: 暂不可用" }
-        guard let tokens = todayTokens else { return "今日用量: 读取中…" }
-        let suffix = isCompleteCoverage ? "" : "（已知）"
-        return "今日用量: \(UsageFormat.compact(tokens)) Tokens\(suffix)"
-    }
-
-    func refresh(store: UsageStore, now: Date = Date()) async {
-        let calendar = Calendar.current
-        let from = calendar.startOfDay(for: now)
-        guard let to = calendar.date(byAdding: .day, value: 1, to: from) else { return }
-        do {
-            let snapshot = try await store.snapshot(from: from, to: to, grouping: .route)
-            todayTokens = snapshot.totals.total
-            isCompleteCoverage = snapshot.totals.knownAttempts >= snapshot.totals.attempts
-            isAvailable = true
-        } catch {
-            todayTokens = nil
-            isAvailable = false
-        }
     }
 }
 
