@@ -1221,7 +1221,11 @@ final class ConfigStore: ObservableObject {
         let environment = ProcessInfo.processInfo.environment
         let port = (environment["EZSWITCH_PORT"] ?? environment["MODELROUTER_PORT"])
             .flatMap(Int.init) ?? config.port
-        let s = RouterServer(router: router, usageStore: usageStore)
+        let notifications = AutoFallbackNotificationService.shared
+        let s = RouterServer(router: router, usageStore: usageStore,
+                             onAutoFallback: { event in
+                                 Task { @MainActor in notifications.receive(event) }
+                             })
         server = s
         do {
             try s.start(port: port)

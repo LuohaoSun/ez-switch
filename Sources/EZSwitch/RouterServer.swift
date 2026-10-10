@@ -9,6 +9,7 @@ final class RouterServer {
 
     private let router: Router
     private let recordUsage: UsageRecorder?
+    private let onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)?
     private let session: URLSession
     private let maxPendingRequests: Int
     private let group: MultiThreadedEventLoopGroup
@@ -16,9 +17,11 @@ final class RouterServer {
 
     /// 生产入口：注入可选 store（nil = 不统计）与上游 URLSession（默认生产单例）。
     /// 测试可改为传 `recordUsage:` + `session:` 的 mock，不触碰全局状态。
+    /// `onAutoFallback` 在每次真正开始下一个候选之前回调一次（默认 nil = 不通知）。
     init(router: Router, usageStore: UsageStore? = nil, recordUsage: UsageRecorder? = nil,
          session: URLSession = Forwarder.session,
-         maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests) {
+         maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests,
+         onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) {
         self.router = router
         if let recordUsage {
             self.recordUsage = recordUsage
@@ -27,6 +30,7 @@ final class RouterServer {
         } else {
             self.recordUsage = nil
         }
+        self.onAutoFallback = onAutoFallback
         self.session = session
         self.maxPendingRequests = maxPendingRequests
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
@@ -35,6 +39,7 @@ final class RouterServer {
     func start(port: Int) throws {
         let router = self.router
         let recordUsage = self.recordUsage
+        let onAutoFallback = self.onAutoFallback
         let session = self.session
         let maxPendingRequests = self.maxPendingRequests
         let bootstrap = ServerBootstrap(group: group)
@@ -48,7 +53,8 @@ final class RouterServer {
                 ch.pipeline.configureHTTPServerPipeline(withPipeliningAssistance: false).flatMap {
                     ch.pipeline.addHandler(ProxyHandler(router: router, recordUsage: recordUsage,
                                                         session: session,
-                                                        maxPendingRequests: maxPendingRequests))
+                                                        maxPendingRequests: maxPendingRequests,
+                                                        onAutoFallback: onAutoFallback))
                 }
             }
         channel = try bootstrap.bind(host: "127.0.0.1", port: port).wait()
@@ -79,6 +85,7 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
 
     private let router: Router
     private let recordUsage: UsageRecorder?
+    private let onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)?
     private let session: URLSession
     private let maxPendingRequests: Int
 
@@ -90,9 +97,11 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
     private var disconnected = false
 
     init(router: Router, recordUsage: UsageRecorder?, session: URLSession,
-         maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests) {
+         maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests,
+         onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) {
         self.router = router
         self.recordUsage = recordUsage
+        self.onAutoFallback = onAutoFallback
         self.session = session
         self.maxPendingRequests = max(1, maxPendingRequests)
     }
@@ -143,7 +152,8 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
         let next = queue.removeFirst()
         task = Task {
             await RequestProcessor.process(channel: channel, head: next.head, body: next.body,
-                                           router: router, recordUsage: recordUsage, session: session)
+                                           router: router, recordUsage: recordUsage, session: session,
+                                           onAutoFallback: onAutoFallback)
             // 回到 event loop 串行化下一个请求（连接已关闭则不再调度）。
             guard channel.isActive else { return }
             channel.eventLoop.execute {
@@ -177,7 +187,8 @@ enum RequestProcessor {
 
     static func process(channel: Channel, head: HTTPRequestHead, body: ByteBuffer,
                         router: Router, recordUsage: UsageRecorder? = nil,
-                        session: URLSession = Forwarder.session) async {
+                        session: URLSession = Forwarder.session,
+                        onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) async {
         let rawURI = head.uri
         let split = rawURI.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
         let path = String(split[0])
@@ -252,7 +263,18 @@ enum RequestProcessor {
         var selectedAttempt = 0
         var selectedStarted = requestStarted
         var lastError: Error?
+        // 上一次 attempt 失败留下的回退：正式开始下一个候选前发事件，避免取消/候选耗尽误报。
+        var pendingFallback: (from: String, reason: AutoFallbackEvent.Reason)?
         for (index, remote) in compatible.enumerated() {
+            if let pending = pendingFallback {
+                pendingFallback = nil
+                // 连接已取消/断开就不再启动下一个候选，也不通知。
+                guard !Task.isCancelled, channel.isActive else { return }
+                onAutoFallback?(AutoFallbackEvent(requestID: requestID, route: fake.fakeModelID,
+                                                  from: pending.from,
+                                                  to: remote.routeLabel,
+                                                  reason: pending.reason))
+            }
             let attempt = index + 1
             let attemptStarted = Date()
             let endpointBaseURL = remote.endpointSetting(for: endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint).baseURL
@@ -273,6 +295,8 @@ enum RequestProcessor {
                                   started: attemptStarted, tokens: upstream.usage?.tokens)
                     upstream.cancel()
                     if Task.isCancelled { return }
+                    pendingFallback = (from: remote.routeLabel,
+                                       reason: .httpStatus(status))
                     continue
                 }
                 selected = (remote, upstream)
@@ -304,6 +328,11 @@ enum RequestProcessor {
                               fake: fake, remote: remote, endpoint: endpoint,
                               attempt: attempt, status: nil, outcome: "networkError",
                               started: attemptStarted, tokens: nil)
+                // 仅当确实还有下一个候选要开始时，才留下回退事件。
+                if index + 1 < compatible.count {
+                    pendingFallback = (from: remote.routeLabel,
+                                       reason: .connectionFailure)
+                }
             }
         }
         guard let (remote, upstream) = selected else {
