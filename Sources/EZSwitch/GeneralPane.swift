@@ -166,6 +166,7 @@ struct GeneralPane: View {
     @StateObject private var loginItem = LoginItemDraft()
     @StateObject private var cli = CLIInstallModel()
     @ObservedObject private var updater = UpdateChecker.shared
+    @ObservedObject private var notifications = AutoFallbackNotificationService.shared
     private let harnessManager = HarnessConfigManager()
 
     private var validPort: Int? {
@@ -347,6 +348,20 @@ struct GeneralPane: View {
                 ))
                 updateContent
             }
+            Section("通知") {
+                Toggle("自动切换通知", isOn: Binding(
+                    get: { notifications.isEnabled },
+                    set: { notifications.setEnabled($0) }
+                ))
+                Text(notificationStatusText)
+                    .font(.caption).foregroundStyle(.secondary)
+                if notifications.authorization == .denied {
+                    Button("打开通知设置") { openNotificationSettings() }
+                }
+                if let error = notifications.deliveryError {
+                    Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                }
+            }
             Section("配置文件") {
                 Text(store.configURL.path).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([store.configURL]) }
@@ -358,6 +373,7 @@ struct GeneralPane: View {
             draft.port = String(store.config.port)
             refreshLoginItemState()
             cli.refresh()
+            Task { await notifications.refreshAuthorization() }
         }
         .onChange(of: store.config.port) { port in draft.port = String(port) }
         .onChange(of: draft.harness) { _ in
@@ -380,7 +396,25 @@ struct GeneralPane: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshLoginItemState()
             cli.refresh()
+            Task { await notifications.refreshAuthorization() }
         }
+    }
+
+    private var notificationStatusText: String {
+        if !notifications.isEnabled { return "已关闭自动切换通知。" }
+        switch notifications.authorization {
+        case .authorized, .provisional:
+            return "自动回退到下一个候选模型时通知。"
+        case .denied:
+            return "macOS 未允许通知，请在系统设置中开启。"
+        case .notDetermined:
+            return "等待系统授权结果。"
+        }
+    }
+
+    private func openNotificationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private func savePort() {

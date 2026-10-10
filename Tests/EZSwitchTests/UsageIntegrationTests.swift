@@ -15,6 +15,9 @@ private final class UsageMockURLProtocol: URLProtocol {
         var headDelay: TimeInterval = 0
         var chunkDelay: TimeInterval = 0
         var finishDelay: TimeInterval = 0
+        /// When set, fail the load with this error instead of delivering a response
+        /// (simulates a connection failure before any response head).
+        var error: URLError?
     }
 
     private static let handlerLock = NSLock()
@@ -43,6 +46,10 @@ private final class UsageMockURLProtocol: URLProtocol {
         let reply = handler(request)
         sender.asyncAfter(deadline: .now() + reply.headDelay) { [weak self] in
             guard let self, !self.cancelled else { return }
+            if let error = reply.error {
+                self.client?.urlProtocol(self, didFailWithError: error)
+                return
+            }
             let response = HTTPURLResponse(url: url, statusCode: reply.status,
                                            httpVersion: "HTTP/1.1", headerFields: reply.headers)!
             self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -91,6 +98,30 @@ private final class CapturedUpstreamRequest: @unchecked Sendable {
         lock.lock(); storage = request; lock.unlock()
     }
     var request: URLRequest? {
+        lock.lock(); defer { lock.unlock() }; return storage
+    }
+}
+
+/// Thread-safe capture of auto-fallback events emitted by the router.
+private final class AutoFallbackSpy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [AutoFallbackEvent] = []
+    func record(_ event: AutoFallbackEvent) {
+        lock.lock(); storage.append(event); lock.unlock()
+    }
+    var events: [AutoFallbackEvent] {
+        lock.lock(); defer { lock.unlock() }; return storage
+    }
+}
+
+/// Thread-safe capture of upstream hosts the mock was asked for.
+private final class StringListSpy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+    func append(_ value: String) {
+        lock.lock(); storage.append(value); lock.unlock()
+    }
+    var values: [String] {
         lock.lock(); defer { lock.unlock() }; return storage
     }
 }
@@ -225,6 +256,23 @@ struct UsageIntegrationTests {
             try? await Task.sleep(nanoseconds: 25_000_000)
         }
         return spy.records
+    }
+
+    private func waitForEvents(_ spy: AutoFallbackSpy, count: Int, timeout: TimeInterval = 5) async -> [AutoFallbackEvent] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let events = spy.events
+            if events.count >= count { return events }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return spy.events
+    }
+
+    /// Fallback 事件用的远端：name 只放 provider，model 单独给出，
+    /// 于是候选展示名 = "provider · model"，便于断言不丢模型。
+    private func providerRemote(_ provider: String, _ model: String, baseURL: String) -> RemoteModel {
+        RemoteModel(id: UUID(), name: provider, apiKey: "test-key", model: model,
+                    extraHeaders: [:], apiEndpoints: .all(baseURL: baseURL))
     }
 
     private func post(_ session: URLSession, port: Int, path: String, body: String) async throws -> HTTPURLResponse {
@@ -571,5 +619,307 @@ struct UsageIntegrationTests {
         #expect(seen.value(forHTTPHeaderField: "x-custom-header") == "custom-1")
         // 客户端本机占位 token 不得泄露；替换为供应商 apiKey（remote 用 "test-key"）
         #expect(seen.value(forHTTPHeaderField: "authorization") == "Bearer test-key")
+    }
+
+    // MARK: 自动回退事件（真实 RouterServer + mock 上游）
+
+    /// 记录一次自动回退：503 → 200，事件只有一个，reason = httpStatus(503)，
+    /// from/to 带上 provider 与模型，且与 usage 记录同一 requestID。
+    @Test func httpRetryableFallbackEmitsOneEventBeforeNextCandidate() async throws {
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 503,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let usage = UsageRecordSpy()
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, recordUsage: { usage.record($0) }, session: upstream,
+                                  onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 200)
+
+        let captured = await waitForEvents(events, count: 1)
+        #expect(captured.count == 1)
+        let event = try #require(captured.first)
+        #expect(event.route == "main")
+        #expect(event.from == "FailCo · model-a")
+        #expect(event.to == "GoodCo · model-b")
+        #expect(event.reason == .httpStatus(503))
+
+        let records = await waitFor(usage, count: 2)
+        #expect(records.map(\.requestID) == [event.requestID, event.requestID])
+    }
+
+    /// 连接失败（未拿到响应头）→ 回退成功：事件 reason = connectionFailure。
+    @Test func connectionFailureFallbackEmitsOneEvent() async throws {
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(error: URLError(.cannotConnectToHost))
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let usage = UsageRecordSpy()
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, recordUsage: { usage.record($0) }, session: upstream,
+                                  onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 200)
+
+        let captured = await waitForEvents(events, count: 1)
+        #expect(captured.count == 1)
+        let event = try #require(captured.first)
+        #expect(event.reason == .connectionFailure)
+        #expect(event.from == "FailCo · model-a")
+        #expect(event.to == "GoodCo · model-b")
+
+        let records = await waitFor(usage, count: 2)
+        #expect(records.map(\.outcome) == ["networkError", "success"])
+    }
+
+    /// 三个候选、前两个 503：每次真正切换发一条，共 2 条。
+    @Test func threeCandidatesEmitTwoEvents() async throws {
+        let upstream = mockSession { request in
+            let host = request.url?.host ?? ""
+            if host == "fail.test" || host == "mid.test" {
+                return UsageMockURLProtocol.Reply(status: 503,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[]}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("MidCo", "model-b", baseURL: "https://mid.test/v1")
+        let third = providerRemote("GoodCo", "model-c", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id, third.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second, third], fakes: [fake]))
+
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, session: upstream, onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 200)
+
+        let captured = await waitForEvents(events, count: 2)
+        #expect(captured.count == 2)
+        #expect(captured.map(\.from) == ["FailCo · model-a", "MidCo · model-b"])
+        #expect(captured.map(\.to) == ["MidCo · model-b", "GoodCo · model-c"])
+        #expect(captured.allSatisfy { $0.reason == .httpStatus(503) && $0.route == "main" })
+    }
+
+    /// 候选耗尽：唯一候选连接失败，没有“下一个候选”可开始，不发事件，返回 502。
+    @Test func exhaustedCandidatesEmitNoEvent() async throws {
+        let upstream = mockSession { _ in
+            UsageMockURLProtocol.Reply(error: URLError(.cannotConnectToHost))
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let only = providerRemote("Solo", "solo-model", baseURL: "https://solo.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main", remoteID: only.id)
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [only], fakes: [fake]))
+
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, session: upstream, onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 502)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        #expect(events.events.isEmpty)
+    }
+
+    /// 不可重试状态码（400）不触发回退：直接选中并把上游错误透传给客户端。
+    @Test func nonRetryableStatusEmitsNoEvent() async throws {
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 400,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"bad request"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[]}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, session: upstream, onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 400)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        #expect(events.events.isEmpty)
+    }
+
+    /// 关闭自动回退：候选只剩第一个，失败也不会有“下一个候选”，不发事件。
+    @Test func autoFallbackDisabledEmitsNoEvent() async throws {
+        let upstream = mockSession { _ in
+            UsageMockURLProtocol.Reply(status: 503,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        var fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        fake.autoFallback = false
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, session: upstream, onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 503)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        #expect(events.events.isEmpty)
+    }
+
+    /// name 已含模型（真实 addProvider 的 "Provider · model" 形态）时，
+    /// from/to 复用 routeLabel，不再重复模型段。
+    @Test func eventLabelsDoNotDuplicateModelWhenNameAlreadyContainsIt() async throws {
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 503,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[]}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = remote("DeepSeek官方", "deepseek-flash", baseURL: "https://fail.test/v1")
+        let second = remote("DeepSeek官方", "deepseek-pro", baseURL: "https://good.test/v1")
+        #expect(first.name == "DeepSeek官方 · deepseek-flash")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, session: upstream, onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 200)
+
+        let captured = await waitForEvents(events, count: 1)
+        let event = try #require(captured.first)
+        #expect(event.from == "DeepSeek官方 · deepseek-flash")
+        #expect(event.to == "DeepSeek官方 · deepseek-pro")
+    }
+
+    /// 客户端在客户端断开（读 errorBody 期间）→ 取消，不回退、不发事件，也不启动下一个候选。
+    @Test func clientDisconnectDuringFallbackEmitsNoEvent() async throws {
+        // 第一个候选 503：首块立即给出，后续块很慢 → 代理停在 readErrorBody；客户端此时断开。
+        let hosts = StringListSpy()
+        let upstream = mockSession { request in
+            hosts.append(request.url?.host ?? "")
+            return UsageMockURLProtocol.Reply(status: 503,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8), Data("\n".utf8)],
+                chunkDelay: 10)
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let events = AutoFallbackSpy()
+        let server = RouterServer(router: router, session: upstream, onAutoFallback: { events.record($0) })
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let client = try #require(RawSocketClient(port: port))
+        client.send(Data(rawRequest(path: "/v1/chat/completions",
+                                    body: #"{"model":"main","stream":false}"#).utf8))
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        client.closeSocket()
+
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        #expect(events.events.isEmpty)
+        #expect(hosts.values == ["fail.test"]) // 未启动下一个候选
     }
 }

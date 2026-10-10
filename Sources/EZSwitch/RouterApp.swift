@@ -77,9 +77,14 @@ private final class AppWindowCoordinator {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         UpdateChecker.shared.startAutomaticChecks()
+        AutoFallbackNotificationService.shared.activate()
         if AppLaunchContext.shouldShowPanel(for: NSAppleEventManager.shared().currentAppleEvent) {
             AppWindowCoordinator.shared.showSettings(store: ConfigStore.shared)
         }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        AutoFallbackNotificationService.shared.activate()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -222,10 +227,9 @@ struct MenuView: View {
                     }
                 }
             } label: {
-                TimelineView(.periodic(from: .now, by: 2)) { _ in
-                    Text(fake.fakeModelID)
-                        + Text(gray("  " + menuRouteLabel(fake)))
-                }
+                // 原生菜单标签不承载 TimelineView 的定时更新。
+                Text(fake.fakeModelID)
+                    + Text(gray("  " + menuRouteLabel(fake)))
             }
         }
 
