@@ -147,6 +147,34 @@ enum Forwarder {
         return (try? JSONSerialization.data(withJSONObject: mutable)) ?? data
     }
 
+    /// 客户端请求头里不应原样转发的名字（小写）：
+    /// - hop-by-hop：连接层字段，逐跳有效，不属于端到端语义。
+    /// - Host / Content-Length：URLSession 会依据真实 URL 与重写后的 body 重新生成，
+    ///   转发客户端旧值会导致长度不符（body 我们改过 model / stream_options）。
+    /// - 供应商鉴权头：客户端凭据（本机 harness 占位 token 等）不能泄露给上游，
+    ///   必须由路由器按端点替换成远端 apiKey。
+    /// - Accept-Encoding：URLSession 负责协商与透明解压（响应侧已丢弃 Content-Encoding），
+    ///   手动设置会破坏其自动解压，故不转发。
+    static let excludedRequestHeaders: Set<String> = [
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailer", "transfer-encoding", "upgrade",
+        "host", "content-length",
+        "authorization", "x-api-key", "api-key", "x-goog-api-key",
+        "accept-encoding",
+    ]
+
+    /// Connection 头里逐个声明的字段同样是 hop-by-hop，需一并排除。
+    static func hopByHopTokens(in headers: HTTPHeaders) -> Set<String> {
+        var tokens: Set<String> = []
+        for value in headers[canonicalForm: "connection"] {
+            for token in value.split(separator: ",") {
+                let name = token.trimmingCharacters(in: .whitespaces).lowercased()
+                if !name.isEmpty { tokens.insert(name) }
+            }
+        }
+        return tokens
+    }
+
     static func buildRequest(clientHead: HTTPRequestHead, body: Data,
                              endpoint: EndpointKind, remote: RemoteModel, query: String) throws -> URLRequest {
         let upstreamEndpoint: EndpointKind = endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
@@ -169,10 +197,17 @@ enum Forwarder {
         }
         req.httpBody = upstreamBody
 
+        // 端到端透传客户端请求头：普通头（SDK/会话/自定义头…）原样转发，只剔除
+        // hop-by-hop、URLSession 接管的 Host/Content-Length/Accept-Encoding，以及必须
+        // 按端点替换的供应商鉴权头。重复出现的头由 URLRequest 逐值追加重建。
         let h = clientHead.headers
-        req.setValue(h.first(name: "content-type") ?? "application/json", forHTTPHeaderField: "content-type")
-        if let accept = h.first(name: "accept") {
-            req.setValue(accept, forHTTPHeaderField: "accept")
+        let excluded = excludedRequestHeaders.union(hopByHopTokens(in: h))
+        for (name, value) in h {
+            guard !excluded.contains(name.lowercased()) else { continue }
+            req.addValue(value, forHTTPHeaderField: name)
+        }
+        if req.value(forHTTPHeaderField: "content-type") == nil {
+            req.setValue("application/json", forHTTPHeaderField: "content-type")
         }
 
         switch endpoint {
@@ -180,20 +215,20 @@ enum Forwarder {
             req.setValue("Bearer \(remote.apiKey)", forHTTPHeaderField: "authorization")
         case .messages:
             req.setValue(remote.apiKey, forHTTPHeaderField: "x-api-key")
-            req.setValue(h.first(name: "anthropic-version") ?? "2023-06-01", forHTTPHeaderField: "anthropic-version")
-            let betas = h[canonicalForm: "anthropic-beta"]
-            if !betas.isEmpty {
-                req.setValue(betas.joined(separator: ","), forHTTPHeaderField: "anthropic-beta")
+            // anthropic 默认版本：客户端显式带则原样透传，否则补默认值
+            if req.value(forHTTPHeaderField: "anthropic-version") == nil {
+                req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             }
         }
 
         if url.host == "opencode.ai", url.path.hasPrefix("/zen/go/v1/") {
-            // Go uses a per-conversation session for routing/cache; a static provider header would mix conversations.
-            for name in ["x-opencode-session", "x-opencode-request", "x-opencode-client", "x-opencode-project"] {
-                if let value = h.first(name: name) { req.setValue(value, forHTTPHeaderField: name) }
+            // Go uses a per-conversation session for routing/cache; 客户端会话头已在
+            // 上方透传，这里只在客户端未提供 user-agent 时补 EZSwitch 默认值，
+            // 绝不生成固定 session（否则会把不同会话混在一起）。
+            if req.value(forHTTPHeaderField: "user-agent") == nil {
+                let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+                req.setValue("EZSwitch/\(version)", forHTTPHeaderField: "user-agent")
             }
-            let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
-            req.setValue(h.first(name: "user-agent") ?? "EZSwitch/\(version)", forHTTPHeaderField: "user-agent")
         }
 
         for (k, v) in remote.extraHeaders {
