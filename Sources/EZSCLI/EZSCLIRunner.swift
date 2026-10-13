@@ -119,11 +119,20 @@ struct EZSCLIRunner {
     private func runUsage(_ args: [String]) throws -> String {
         let options = try UsageArgumentParser.parse(args)
         let payload = UsageArgumentParser.requestPayload(options)
-        let parsed = try UsageResponseParser.parse(client.send(payload))
+        let parsed = try UsageResponseParser.parse(client.send(payload),
+                                                   expectPerformance: options.performance)
         if options.json {
+            if let performance = parsed.performanceJSONObject {
+                return try UsageTextFormatter.renderCombinedJSON(usage: parsed.jsonObject,
+                                                                 performance: performance)
+            }
             return try UsageTextFormatter.renderJSON(parsed.jsonObject)
         }
-        return UsageTextFormatter.render(parsed.report, options: options)
+        var text = UsageTextFormatter.render(parsed.report, options: options)
+        if let performance = parsed.performance {
+            text += "\n\n" + UsageTextFormatter.renderPerformance(performance, options: options)
+        }
+        return text
     }
 
     // MARK: Helpers

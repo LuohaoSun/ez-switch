@@ -100,7 +100,7 @@ struct WindowActivator: NSViewRepresentable {
 // MARK: - 设置窗口骨架
 
 enum SettingsSection: Hashable {
-    case models, remotes, activity, usage, general
+    case models, remotes, activity, usage, performance, general
 }
 
 /// 侧栏当前页。不用 `@State`（本机只有 CommandLineTools，没有 SwiftUIMacros 插件，
@@ -153,9 +153,10 @@ struct SettingsView: View {
             get: { nav.section },
             set: { if let section = $0 { nav.section = section } }
         )) {
-            Label("路由与模型", systemImage: "arrow.triangle.branch").tag(SettingsSection.models)
-            Label("活动", systemImage: "waveform.path.ecg").tag(SettingsSection.activity)
+            Label("供应商与路由", systemImage: "arrow.triangle.branch").tag(SettingsSection.models)
             Label("用量", systemImage: "chart.bar.xaxis").tag(SettingsSection.usage)
+            Label("性能", systemImage: "speedometer").tag(SettingsSection.performance)
+            Label("活动", systemImage: "waveform.path.ecg").tag(SettingsSection.activity)
             Label("通用", systemImage: "gearshape").tag(SettingsSection.general)
         }
         .listStyle(.sidebar)
@@ -166,16 +167,19 @@ struct SettingsView: View {
         switch nav.section {
         case .models, .remotes: RouteWorkspaceView(store: store)
         case .activity: LogWindowView()
-        case .usage: UsageView(store: store.usageStore)
+        // 两个入口需独立身份，避免 StateObject 在页面之间复用。
+        case .usage: UsageView(store: store.usageStore, initialSection: .usage).id(SettingsSection.usage)
+        case .performance: UsageView(store: store.usageStore, initialSection: .performance).id(SettingsSection.performance)
         case .general: GeneralPane(store: store)
         }
     }
 
     private var navigationTitle: String {
         switch nav.section {
-        case .models, .remotes: return "路由与模型"
+        case .models, .remotes: return "供应商与路由"
         case .activity: return "活动"
         case .usage: return "用量"
+        case .performance: return "性能"
         case .general: return "通用"
         }
     }

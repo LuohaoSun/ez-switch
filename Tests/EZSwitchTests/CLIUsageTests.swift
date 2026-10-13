@@ -48,14 +48,16 @@ struct CLIUsageTests {
         output: Int? = 5,
         cachedInput: Int? = nil,
         cacheWrite: Int? = nil,
-        reasoning: Int? = nil
+        reasoning: Int? = nil,
+        performance: UsagePerformance? = nil
     ) -> UsageRecord {
         UsageRecord(id: id, requestID: requestID, timestamp: timestamp, routeID: routeID,
                     routeName: routeName, remoteID: remoteID, provider: provider, model: model,
                     endpoint: endpoint, attempt: attempt, status: status, outcome: outcome,
                     durationMS: durationMS,
                     tokens: UsageTokens(input: input, output: output, cachedInput: cachedInput,
-                                        cacheWrite: cacheWrite, reasoning: reasoning))
+                                        cacheWrite: cacheWrite, reasoning: reasoning),
+                    performance: performance)
     }
 
     /// 通过 async dispatch 返回纯字典，便于直接断言；不经过 UDS。
@@ -84,6 +86,24 @@ struct CLIUsageTests {
 
     private func days(_ payload: [String: Any]) throws -> [[String: Any]] {
         try #require(payload["days"] as? [[String: Any]])
+    }
+
+    private func performancePayload(_ reply: [String: Any]) throws -> [String: Any] {
+        try #require(reply["performance"] as? [String: Any])
+    }
+
+    private func performanceSummary(_ performance: [String: Any]) throws -> [String: Any] {
+        try #require(performance["summary"] as? [String: Any])
+    }
+
+    private func performanceGroups(_ performance: [String: Any]) throws -> [[String: Any]] {
+        try #require(performance["groups"] as? [[String: Any]])
+    }
+
+    private func streamingPerformance(ttftMS: Double, requestTTFTMS: Double? = nil,
+                                      generationMS: Double) -> UsagePerformance {
+        UsagePerformance(streaming: true, ttftMS: ttftMS, requestTTFTMS: requestTTFTMS,
+                         generationMS: generationMS, outputDeltaCount: 5)
     }
 
     private func dateString(_ date: Date) -> String {
@@ -573,6 +593,141 @@ struct CLIUsageTests {
         let unknown = try await send(store, ["command": "nope"], now: Date())
         #expect(unknown["ok"] as? Bool == false)
         #expect(unknown["message"] as? String == "unknown command")
+    }
+
+    // MARK: - 性能统计（--performance）
+
+    @Test
+    func performanceRequestWithoutRecordsReturnsZeroSummaryAndKeepsUsage() async throws {
+        let (store, directory) = try makeStore()
+        defer { cleanup(directory) }
+
+        let reply = try await send(store, ["command": "usage", "performance": "true", "group": "model"],
+                                   now: day(2026, 5, 10))
+        #expect(reply["ok"] as? Bool == true)
+
+        // usage 契约保持不变，performance 作为可选对象附加。
+        let usage = try usagePayload(reply)
+        #expect(usage["grouping"] as? String == "model")
+        #expect(usage["groupCount"] as? Int == 0)
+
+        let performance = try performancePayload(reply)
+        #expect(performance["grouping"] as? String == "model")
+        #expect(performance["limit"] as? Int == 100)
+        #expect(performance["groupCount"] as? Int == 0)
+        #expect(performance["truncated"] as? Bool == false)
+        #expect(try performanceGroups(performance).isEmpty)
+
+        let summary = try performanceSummary(performance)
+        #expect(summary["attempts"] as? Int == 0)
+        #expect(summary["successfulStreamingAttempts"] as? Int == 0)
+        #expect(summary["ttftSamples"] as? Int == 0)
+        #expect(summary["requestTTFTSamples"] as? Int == 0)
+        #expect(summary["tpsSamples"] as? Int == 0)
+        // 缺失统计序列化为 JSON null（而非省略），保证形状稳定。
+        #expect(summary["ttftP50MS"] is NSNull)
+        #expect(summary["ttftP95MS"] is NSNull)
+        #expect(summary["requestTTFTP50MS"] is NSNull)
+        #expect(summary["requestTTFTP95MS"] is NSNull)
+        #expect(summary["tpsP50"] is NSNull)
+
+        #expect((try? JSONSerialization.data(withJSONObject: reply)) != nil)
+    }
+
+    @Test
+    func performanceFlagAcceptsStringAndBoolAndRejectsWrongTypes() async throws {
+        let (store, directory) = try makeStore()
+        defer { cleanup(directory) }
+        let now = day(2026, 5, 10)
+
+        for command in [["command": "usage", "performance": "true"] as [String: Any],
+                        ["command": "usage", "performance": true] as [String: Any]] {
+            let reply = try await send(store, command, now: now)
+            #expect(reply["ok"] as? Bool == true)
+            #expect(reply["performance"] != nil)
+        }
+
+        // 显式 false 等价于未请求。
+        let off = try await send(store, ["command": "usage", "performance": "false"], now: now)
+        #expect(off["ok"] as? Bool == true)
+        #expect(off["performance"] == nil)
+
+        for command in [["command": "usage", "performance": "yes"],
+                        ["command": "usage", "performance": 1],
+                        ["command": "usage", "performance": ["true"]]] as [[String: Any]] {
+            let reply = try await send(store, command, now: now)
+            #expect(reply["ok"] as? Bool == false)
+            #expect(reply["usage"] == nil)
+            #expect(reply["performance"] == nil)
+        }
+    }
+
+    @Test
+    func usageWithoutPerformanceRequestOmitsPerformanceObject() async throws {
+        let (store, directory) = try makeStore()
+        defer { cleanup(directory) }
+        let reply = try await send(store, ["command": "usage"], now: day(2026, 5, 10))
+        #expect(reply["ok"] as? Bool == true)
+        #expect(reply["performance"] == nil)
+        #expect(try usagePayload(reply)["grouping"] as? String == "route")
+    }
+
+    @Test
+    func performanceAggregatesStreamingSamples() async throws {
+        let (store, directory) = try makeStore()
+        defer { cleanup(directory) }
+        let store1 = store.usageStore
+        // 同一模型四次成功流式尝试：TTFT 100/200/300/400 ms，输出 100 tokens / 2000 ms。
+        for (index, ttft) in [100.0, 200.0, 300.0, 400.0].enumerated() {
+            store1.record(record(timestamp: day(2026, 5, 10, hour: 9, minute: index),
+                                 provider: "OpenAI", model: "gpt-4o", output: 100,
+                                 performance: streamingPerformance(ttftMS: ttft,
+                                                                   requestTTFTMS: ttft + 10,
+                                                                   generationMS: 2000)))
+        }
+        try await store1.flush()
+
+        let reply = try await send(store, ["command": "usage", "performance": "true", "group": "model"],
+                                   now: day(2026, 5, 10))
+        let summary = try performanceSummary(try performancePayload(reply))
+        #expect(summary["attempts"] as? Int == 4)
+        #expect(summary["successfulStreamingAttempts"] as? Int == 4)
+        #expect(summary["ttftSamples"] as? Int == 4)
+        #expect(summary["requestTTFTSamples"] as? Int == 4)
+        #expect(summary["tpsSamples"] as? Int == 4)
+        // nearest-rank P50 / P95 of [100, 200, 300, 400]。
+        #expect(summary["ttftP50MS"] as? Double == 200)
+        #expect(summary["ttftP95MS"] as? Double == 400)
+        #expect(summary["requestTTFTP50MS"] as? Double == 210)
+        #expect(summary["requestTTFTP95MS"] as? Double == 410)
+        // TPS = 100 tokens * 1000 / 2000 ms = 50 tok/s。
+        #expect(summary["tpsP50"] as? Double == 50)
+    }
+
+    @Test
+    func performanceLimitTruncatesGroupsButKeepsFullSummary() async throws {
+        let (store, directory) = try makeStore()
+        defer { cleanup(directory) }
+        let store1 = store.usageStore
+        for (index, model) in ["alpha", "beta", "gamma"].enumerated() {
+            store1.record(record(timestamp: day(2026, 5, 10, hour: 9, minute: index),
+                                 provider: "OpenAI", model: model, output: 10,
+                                 performance: streamingPerformance(ttftMS: Double(100 * (index + 1)),
+                                                                   generationMS: 1000)))
+        }
+        try await store1.flush()
+
+        let reply = try await send(store,
+                                   ["command": "usage", "performance": "true", "group": "model", "limit": "2"],
+                                   now: day(2026, 5, 10))
+        let performance = try performancePayload(reply)
+        #expect(performance["limit"] as? Int == 2)
+        #expect(performance["groupCount"] as? Int == 3)
+        #expect(performance["truncated"] as? Bool == true)
+        #expect(try performanceGroups(performance).count == 2)
+        // summary 是全量，不受 limit 影响。
+        #expect(try performanceSummary(performance)["attempts"] as? Int == 3)
+        #expect(try performanceSummary(performance)["ttftSamples"] as? Int == 3)
     }
 
     // MARK: - 原始 sqlite 辅助（仅测试）

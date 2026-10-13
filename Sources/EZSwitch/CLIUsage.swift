@@ -25,6 +25,8 @@ enum CLIUsage {
         var range: UsageDateRange
         var grouping: UsageGrouping
         var limit: Int
+        /// 是否附带 TTFT/TPS 性能统计。默认 false，保持既有 usage 调用不变。
+        var performance: Bool = false
     }
 
     // MARK: - 解析
@@ -40,6 +42,8 @@ enum CLIUsage {
             throw CLIUsageError("invalid group: expected one of route, provider, model")
         }
         let limit = try parseLimit(try optionalString(request, "limit"))
+        // 可选开关：CLI 以字符串 "true" 发送，也接受 JSON 布尔；缺失即关闭。
+        let performance = try optionalBool(request, "performance") ?? false
 
         let hasFrom = request["from"] != nil
         let hasTo = request["to"] != nil
@@ -70,7 +74,7 @@ enum CLIUsage {
             range = UsageRangeResolver.resolve(preset: preset, customStart: now, customEnd: now,
                                                now: now, calendar: calendar)
         }
-        return Request(range: range, grouping: grouping, limit: limit)
+        return Request(range: range, grouping: grouping, limit: limit, performance: performance)
     }
 
     /// 可选字符串：缺失返回 nil，存在但非字符串报错。
@@ -80,6 +84,25 @@ enum CLIUsage {
             throw CLIUsageError("invalid \(key): expected a string")
         }
         return value
+    }
+
+    /// 可选布尔：缺失返回 nil；接受 JSON 布尔或控制协议用的字符串 "true"/"false"；其余报错。
+    /// JSON 数字 1/0 会桥接成 Bool，这里用 CFBoolean 类型精确区分，拒绝纯数字。
+    private static func optionalBool(_ request: [String: Any], _ key: String) throws -> Bool? {
+        guard let raw = request[key] else { return nil }
+        if let number = raw as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return number.boolValue }
+            throw CLIUsageError("invalid \(key): expected a boolean")
+        }
+        if let value = raw as? Bool { return value }
+        if let value = raw as? String {
+            switch value {
+            case "true": return true
+            case "false": return false
+            default: throw CLIUsageError("invalid \(key): expected a boolean")
+            }
+        }
+        throw CLIUsageError("invalid \(key): expected a boolean")
     }
 
     /// 必填字符串：键已确认存在，非字符串报错。
@@ -149,10 +172,20 @@ enum CLIUsage {
             return ["ok": false, "message": "usage query failed: \(error.localizedDescription)"]
         }
 
-        let reply: [String: Any] = [
+        var reply: [String: Any] = [
             "ok": true,
             "usage": payload(snapshot: snapshot, request: parsed, calendar: calendar),
         ]
+        if parsed.performance {
+            let performance: PerformanceSnapshot
+            do {
+                performance = try await store.performanceSnapshot(from: parsed.range.from, to: parsed.range.to,
+                                                                  grouping: parsed.grouping)
+            } catch {
+                return ["ok": false, "message": "performance query failed: \(error.localizedDescription)"]
+            }
+            reply["performance"] = performancePayload(performance, request: parsed)
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: reply) else {
             return ["ok": false, "message": "usage response could not be encoded"]
         }
@@ -196,6 +229,44 @@ enum CLIUsage {
             "days": days,
             "groups": groups,
         ]
+    }
+
+    /// 性能统计响应。与 usage 一样：`limit` 只截取 groups，summary/groupCount 始终是全量。
+    private static func performancePayload(_ snapshot: PerformanceSnapshot, request: Request) -> [String: Any] {
+        let groupCount = snapshot.groups.count
+        let groups: [[String: Any]] = snapshot.groups.prefix(request.limit).map {
+            ["id": $0.id, "title": $0.title, "subtitle": $0.subtitle,
+             "summary": performanceSummaryPayload($0.summary)]
+        }
+        return [
+            "grouping": request.grouping.rawValue,
+            "limit": request.limit,
+            "groupCount": groupCount,
+            "truncated": groupCount > request.limit,
+            "summary": performanceSummaryPayload(snapshot.summary),
+            "groups": groups,
+        ]
+    }
+
+    private static func performanceSummaryPayload(_ summary: PerformanceSummary) -> [String: Any] {
+        [
+            "attempts": summary.attempts,
+            "successfulStreamingAttempts": summary.successfulStreamingAttempts,
+            "ttftSamples": summary.ttftSamples,
+            "requestTTFTSamples": summary.requestTTFTSamples,
+            "tpsSamples": summary.tpsSamples,
+            "ttftP50MS": finiteNumber(summary.ttftP50MS),
+            "ttftP95MS": finiteNumber(summary.ttftP95MS),
+            "requestTTFTP50MS": finiteNumber(summary.requestTTFTP50MS),
+            "requestTTFTP95MS": finiteNumber(summary.requestTTFTP95MS),
+            "tpsP50": finiteNumber(summary.tpsP50),
+        ]
+    }
+
+    /// 缺失或非有限值一律序列化为 null（而非省略），保证 JSON 形状稳定、可被类型化解码。
+    private static func finiteNumber(_ value: Double?) -> Any {
+        guard let value, value.isFinite else { return NSNull() }
+        return value
     }
 
     private static func totalsPayload(_ totals: UsageTotals) -> [String: Any] {

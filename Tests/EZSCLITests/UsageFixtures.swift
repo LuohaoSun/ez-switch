@@ -53,6 +53,66 @@ enum UsageFixture {
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
+    /// Envelope that may also carry the optional `performance` object.
+    static func envelope(usage: [String: Any]? = nil, performance: [String: Any]? = nil,
+                         ok: Bool = true, message: String? = nil) -> Data {
+        var object: [String: Any] = ["ok": ok]
+        if let message { object["message"] = message }
+        if let usage { object["usage"] = usage }
+        if let performance { object["performance"] = performance }
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    // MARK: Performance fixtures
+
+    static func numeric(_ value: Double?) -> Any {
+        guard let value else { return NSNull() }
+        return value
+    }
+
+    static func intOrNull(_ value: Int?) -> Any {
+        guard let value else { return NSNull() }
+        return value
+    }
+
+    static func performanceSummary(attempts: Int = 10, successfulStreamingAttempts: Int = 5,
+                                   ttftSamples: Int = 4, requestTTFTSamples: Int? = 4,
+                                   tpsSamples: Int = 3,
+                                   ttftP50MS: Double? = 1200, ttftP95MS: Double? = 2100,
+                                   requestTTFTP50MS: Double? = 1500, requestTTFTP95MS: Double? = 2400,
+                                   tpsP50: Double? = 42.3) -> [String: Any] {
+        [
+            "attempts": attempts,
+            "successfulStreamingAttempts": successfulStreamingAttempts,
+            "ttftSamples": ttftSamples,
+            "requestTTFTSamples": intOrNull(requestTTFTSamples),
+            "tpsSamples": tpsSamples,
+            "ttftP50MS": numeric(ttftP50MS),
+            "ttftP95MS": numeric(ttftP95MS),
+            "requestTTFTP50MS": numeric(requestTTFTP50MS),
+            "requestTTFTP95MS": numeric(requestTTFTP95MS),
+            "tpsP50": numeric(tpsP50),
+        ]
+    }
+
+    static func performanceObject(grouping: String = "model", limit: Int = 100,
+                                  groupCount: Int = 1, truncated: Bool = false,
+                                  summary: [String: Any]? = nil,
+                                  groups: [[String: Any]]? = nil) -> [String: Any] {
+        let resolvedSummary = summary ?? performanceSummary()
+        let resolvedGroups = groups ?? [[
+            "id": "gpt-4o", "title": "gpt-4o", "subtitle": "OpenAI", "summary": resolvedSummary,
+        ]]
+        return [
+            "grouping": grouping,
+            "limit": limit,
+            "groupCount": groupCount,
+            "truncated": truncated,
+            "summary": resolvedSummary,
+            "groups": resolvedGroups,
+        ]
+    }
+
     static func data(_ object: [String: Any]) -> Data {
         (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }

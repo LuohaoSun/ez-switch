@@ -424,6 +424,217 @@ struct ConfigStoreTests {
         #expect(withoutSession.value(forHTTPHeaderField: "user-agent")?.hasPrefix("EZSwitch/") == true)
     }
 
+    @Test
+    func catalogSelectionReconcilesOnlyChosenProvider() throws {
+        let alphaOne = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                                  baseURL: "https://alpha.example")
+        let alphaTwo = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                                  baseURL: "https://alpha.example")
+        let beta = makeRemote(name: "Beta · one", model: "one", apiKey: "b",
+                              baseURL: "https://beta.example")
+        let store = try makeStore(remotes: [alphaOne, alphaTwo, beta], fakes: [])
+
+        store.applyModelCatalogSelection(provider: "Alpha",
+                                         choices: ["one", "two", "three"],
+                                         selected: ["one", "three"])
+
+        // Alpha 保留勾选的 one、移除未勾选的 two、补建 three（追加末尾）；Beta 不受影响。
+        #expect(store.config.remotes.map(\.model) == ["one", "one", "three"])
+        #expect(store.config.remotes.map { splitProviderModel($0.name).provider } ==
+                ["Alpha", "Beta", "Alpha"])
+        #expect(store.config.remotes[0].id == alphaOne.id)
+        #expect(store.config.remotes[1] == beta)
+        #expect(!store.config.remotes.contains { $0.id == alphaTwo.id })
+        let added = try #require(store.config.remotes.first { $0.model == "three" })
+        #expect(added.name == "Alpha · three")
+        #expect(added.apiKey == alphaOne.apiKey)
+        #expect(added.apiEndpoints == alphaOne.apiEndpoints)
+
+        let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: store.configURL))
+        #expect(persisted.remotes.map(\.model) == ["one", "one", "three"])
+    }
+
+    @Test
+    func catalogSelectionPreservesModelsOutsideChoices() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let two = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let legacy = makeRemote(name: "Alpha · legacy", model: "legacy", apiKey: "a",
+                                baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [one, two, legacy], fakes: [])
+
+        store.applyModelCatalogSelection(provider: "Alpha",
+                                         choices: ["one", "two"],
+                                         selected: ["one"])
+
+        // legacy 不在 choices 内必须保留；two 未勾选被移除；one 保持原 UUID。
+        #expect(store.config.remotes.map(\.model) == ["one", "legacy"])
+        #expect(store.config.remotes[0].id == one.id)
+        #expect(store.config.remotes[1].id == legacy.id)
+    }
+
+    @Test
+    func catalogSelectionIgnoresSelectedOutsideChoices() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [one], fakes: [])
+
+        store.applyModelCatalogSelection(provider: "Alpha",
+                                         choices: ["one"],
+                                         selected: ["one", "ghost"])
+
+        // ghost 在 selected 但不在 choices 内，既不新增也不删除。
+        #expect(store.config.remotes.map(\.model) == ["one"])
+        #expect(store.config.remotes[0].id == one.id)
+    }
+
+    @Test
+    func catalogSelectionCleansRouteReferencesOnRemoval() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let two = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        var route = FakeModel(id: UUID(), fakeModelID: "chat", displayName: "chat",
+                              remoteID: two.id, fallbackRemoteIDs: [one.id])
+        route.selectedRemoteID = two.id
+        let store = try makeStore(remotes: [one, two], fakes: [route])
+
+        store.applyModelCatalogSelection(provider: "Alpha",
+                                         choices: ["one", "two"],
+                                         selected: ["one"])
+
+        // two 被移除后，路由落到剩余的 one，fallback 与 selected 一并清理。
+        let fake = try #require(store.config.fakes.first)
+        #expect(fake.remoteID == one.id)
+        #expect(fake.fallbackRemoteIDs.isEmpty)
+        #expect(fake.selectedRemoteID == nil)
+        #expect(store.router.route(fakeModelID: "chat")?.remote.id == one.id)
+    }
+
+    @Test
+    func catalogSelectionIsIdempotent() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let two = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [one, two], fakes: [])
+
+        store.applyModelCatalogSelection(provider: "Alpha",
+                                         choices: ["one", "three"],
+                                         selected: ["one", "three"])
+        let first = store.config
+
+        store.applyModelCatalogSelection(provider: "Alpha",
+                                         choices: ["one", "three"],
+                                         selected: ["one", "three"])
+
+        #expect(store.config.remotes == first.remotes)
+        #expect(store.config.fakes == first.fakes)
+        let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: store.configURL))
+        #expect(persisted.remotes == first.remotes)
+    }
+
+    @Test
+    func catalogSelectionWithEmptyChoicesIsNoOp() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let two = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [one, two], fakes: [])
+        let before = store.config
+
+        store.applyModelCatalogSelection(provider: "Alpha", choices: [], selected: ["one", "ghost"])
+
+        #expect(store.config.remotes == before.remotes)
+        #expect(store.config.remotes.map(\.model) == ["one", "two"])
+    }
+
+    @Test
+    func catalogSelectionReplacesAllProviderModels() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "secret",
+                             baseURL: "https://alpha.example", extraHeaders: ["X-Test": "yes"])
+        let two = makeRemote(name: "Alpha · two", model: "two", apiKey: "secret",
+                             baseURL: "https://alpha.example", extraHeaders: ["X-Test": "yes"])
+        var route = FakeModel(id: UUID(), fakeModelID: "chat", displayName: "chat",
+                              remoteID: two.id, fallbackRemoteIDs: [one.id])
+        route.selectedRemoteID = two.id
+        let store = try makeStore(remotes: [one, two], fakes: [route])
+
+        // 清空全部现存模型后新增，必须仍能成功（模板在删除前已捕获）。
+        let error = store.applyModelCatalogSelection(provider: "Alpha",
+                                                     choices: ["one", "two", "three"],
+                                                     selected: ["three"])
+
+        #expect(error == nil)
+        #expect(store.config.remotes.map(\.model) == ["three"])
+        let added = try #require(store.config.remotes.first)
+        #expect(added.name == "Alpha · three")
+        #expect(added.apiKey == "secret")
+        #expect(added.extraHeaders == ["X-Test": "yes"])
+        #expect(added.apiEndpoints == one.apiEndpoints)
+        let fake = try #require(store.config.fakes.first)
+        #expect(fake.remoteID == nil)
+        #expect(fake.fallbackRemoteIDs.isEmpty)
+        #expect(fake.selectedRemoteID == nil)
+        #expect(store.router.route(fakeModelID: "chat") == nil)
+    }
+
+    @Test
+    func catalogSelectionFailsWithoutMutationOnInconsistentProvider() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "one",
+                             baseURL: "https://alpha.example")
+        let two = makeRemote(name: "Alpha · two", model: "two", apiKey: "different",
+                             baseURL: "https://alpha.example")
+        let route = FakeModel(id: UUID(), fakeModelID: "chat", displayName: "chat", remoteID: one.id)
+        let store = try makeStore(remotes: [one, two], fakes: [route])
+        let before = store.config
+
+        let error = store.applyModelCatalogSelection(provider: "Alpha",
+                                                     choices: ["one", "two", "three"],
+                                                     selected: ["three"])
+
+        #expect(error == "该供应商的 API Key 不一致，请先在供应商设置中统一")
+        #expect(store.config.remotes == before.remotes)
+        #expect(store.config.fakes == before.fakes)
+        let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: store.configURL))
+        #expect(persisted.remotes == before.remotes)
+    }
+
+    @Test
+    func catalogSelectionRejectsNormalizedDuplicateWithoutMutation() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [one], fakes: [])
+        let before = store.config
+
+        // 两个选择 trim 后同为 "new"：必须在新增任何模型前整体拒绝。
+        let error = store.applyModelCatalogSelection(provider: "Alpha",
+                                                     choices: [" new ", "new"],
+                                                     selected: [" new ", "new"])
+
+        #expect(error == "模型 ID 重复")
+        #expect(store.config.remotes == before.remotes)
+        #expect(store.config.remotes.map(\.model) == ["one"])
+        let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: store.configURL))
+        #expect(persisted.remotes == before.remotes)
+    }
+
+    @Test
+    func catalogSelectionTreatsUntrimmedChoiceMatchingExistingAsPresent() throws {
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [one], fakes: [])
+
+        // choices/selected 带空格但 trim 后等于现存 "one"：视为已存在，不新增也不重复报错。
+        let error = store.applyModelCatalogSelection(provider: "Alpha",
+                                                     choices: [" one "],
+                                                     selected: [" one "])
+
+        #expect(error == nil)
+        #expect(store.config.remotes.map(\.model) == ["one"])
+    }
+
     private func makeStore(remotes: [RemoteModel], fakes: [FakeModel]) throws -> ConfigStore {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("EZSwitchTests-\(UUID().uuidString)", isDirectory: true)

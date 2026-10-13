@@ -4,7 +4,6 @@ private enum WorkspaceSheet: Identifiable {
     case newProvider
     case provider(String)
     case newModel(UUID)
-    case model(UUID)
     case route(UUID?)
     case catalog(String)
 
@@ -13,7 +12,6 @@ private enum WorkspaceSheet: Identifiable {
         case .newProvider: return "new-provider"
         case .provider(let name): return "provider-\(name)"
         case .newModel(let id): return "new-model-\(id)"
-        case .model(let id): return "model-\(id)"
         case .route(let id): return "route-\(id?.uuidString ?? "new")"
         case .catalog(let name): return "catalog-\(name)"
         }
@@ -28,6 +26,8 @@ private final class WorkspaceDraft: ObservableObject {
     @Published var sheet: WorkspaceSheet?
     @Published var providerToDelete: String?
     @Published var routeToDelete: UUID?
+    /// 跨所有供应商卡片共享的单个选中模型；任一时刻最多一张卡片显示选中。
+    @Published var selectedModelID: UUID?
 }
 
 struct RouteWorkspaceView: View {
@@ -37,11 +37,17 @@ struct RouteWorkspaceView: View {
     private var remoteByID: [UUID: RemoteModel] {
         Dictionary(uniqueKeysWithValues: store.config.remotes.map { ($0.id, $0) })
     }
+    /// 工作区共享选中只在模型仍存在时生效：模型被移除（删模型 / 删供应商 / 目录取消勾选）后自动清空。
+    private var selectedModelID: UUID? {
+        guard let id = ui.selectedModelID,
+              store.config.remotes.contains(where: { $0.id == id }) else { return nil }
+        return id
+    }
 
     var body: some View {
         NativeWorkspaceSplit(suppliers: supplierPanel, routes: routePanel)
             .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-        .navigationTitle("路由与模型")
+        .navigationTitle("供应商与路由")
         .sheet(item: $ui.sheet) { target in
             switch target {
             case .newProvider:
@@ -53,10 +59,6 @@ struct RouteWorkspaceView: View {
             case .newModel(let id):
                 if let template = remoteByID[id] {
                     RemoteEditSheet(store: store, source: nil, template: template)
-                }
-            case .model(let id):
-                if let remote = remoteByID[id] {
-                    RemoteEditSheet(store: store, source: remote)
                 }
             case .route(let id):
                 FakeEditSheet(store: store, source: store.config.fakes.first { $0.id == id })
@@ -133,9 +135,14 @@ struct RouteWorkspaceView: View {
                 provider: group.provider,
                 sortEnabled: ui.query.isEmpty,
                 store: store,
-                onEdit: { ui.sheet = .model($0) }
+                onRename: { store.updateModel(id: $0, model: $1) },
+                onDelete: { id in
+                    store.removeRemote(id: id)
+                    if ui.selectedModelID == id { ui.selectedModelID = nil }
+                },
+                selectedModelID: selectedModelID,
+                onSelectionChange: { ui.selectedModelID = $0 }
             )
-            .padding(.vertical, 4)
         } label: {
             HStack(spacing: 8) {
                 Text(group.provider).font(.subheadline.bold()).lineLimit(1)
@@ -280,11 +287,38 @@ private struct RouteCandidateList: View {
     }
 }
 
+/// 目录选择只作用于当前展示的模型，接口未返回的现有模型不参与删除。
+enum ModelCatalogSelection {
+    /// 首次加载：勾选本次返回且本地已有（按当前配置）的模型。
+    static func initialSelection(models: [String], existing: Set<String>) -> Set<String> {
+        Set(models).intersection(existing)
+    }
+
+    /// 重新获取保留仍在列表中的草稿选择；新条目按当前配置初始化。
+    static func selectionAfterRefetch(models: [String], previouslyDisplayed: Set<String>,
+                                      previousSelection: Set<String>, existing: Set<String>) -> Set<String> {
+        var result = Set<String>()
+        for model in models {
+            if previouslyDisplayed.contains(model) {
+                if previousSelection.contains(model) { result.insert(model) }
+            } else if existing.contains(model) {
+                result.insert(model)
+            }
+        }
+        return result
+    }
+
+    static func hasPendingChanges(selected: Set<String>, choices: Set<String>, existing: Set<String>) -> Bool {
+        selected != choices.intersection(existing)
+    }
+}
+
 @MainActor
 private final class ModelCatalogDraft: ObservableObject {
     @Published var models: [String] = []
     @Published var selected = Set<String>()
     @Published var error: String?
+    @Published var applyError: String?
     @Published var loading = true
 }
 
@@ -295,14 +329,22 @@ private struct ModelCatalogSheet: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var draft = ModelCatalogDraft()
 
-    private var existing: Set<String> {
+    private var existingModelIDs: Set<String> {
         Set(store.config.remotes.filter { splitProviderModel($0.name).provider == provider }.map(\.model))
+    }
+
+    private var choices: Set<String> { Set(draft.models) }
+    private var canApply: Bool {
+        !draft.loading && draft.error == nil && !draft.models.isEmpty
+            && ModelCatalogSelection.hasPendingChanges(selected: draft.selected,
+                                                        choices: choices,
+                                                        existing: existingModelIDs)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("获取模型列表 · \(provider)").font(.title2.bold())
-            Text("从供应商接口读取模型 ID，选择要加入本地模型库的条目。")
+            Text("勾选加入本地模型库；取消勾选会删除本地已有条目；接口未返回的模型保持不变。")
                 .font(.callout).foregroundStyle(.secondary)
             if draft.loading {
                 ProgressView("正在获取模型列表…").frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -312,45 +354,67 @@ private struct ModelCatalogSheet: View {
                     Text(error)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if draft.models.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "tray").font(.title)
+                    Text("供应商未返回任何模型")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(draft.models, id: \.self) { model in
-                    HStack {
-                        ModelSelectionToggle(model: model, selection: $draft.selected)
-                        if existing.contains(model) {
-                            Text("已添加").font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
+                    ModelSelectionToggle(model: model, selection: $draft.selected)
                 }
-                Text("已返回 \(draft.models.count) 个模型；按需选择，已添加的条目会跳过。")
+                Text("已返回 \(draft.models.count) 个模型；勾选加入，取消勾选移除。")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if let applyError = draft.applyError {
+                Text(applyError).font(.caption).foregroundStyle(.red)
             }
             HStack {
                 Button("重新获取") { Task { await fetch() } }.disabled(draft.loading)
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("添加所选模型") {
-                    for model in draft.selected.sorted() where !existing.contains(model) {
-                        _ = store.addModel(provider: provider, model: model)
-                    }
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(draft.selected.subtracting(existing).isEmpty)
+                Button("应用更改") { apply() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canApply)
             }
         }
         .padding(20)
         .frame(width: 560, height: 550)
         .task { await fetch() }
+        .onChange(of: draft.selected) { _ in draft.applyError = nil }
     }
 
+    /// 重新获取只更新草稿视图：已展示过的 ID 沿用用户的勾选，新 ID 按当前配置初始化；不写配置。
     private func fetch() async {
+        let previouslyDisplayed = Set(draft.models)
+        let previousSelection = draft.selected
         draft.loading = true
         draft.error = nil
+        draft.applyError = nil
         do {
-            draft.models = try await ProviderModelCatalog.fetch(for: remote)
+            let fetched = try await ProviderModelCatalog.fetch(for: remote)
+            draft.models = fetched
+            draft.selected = previouslyDisplayed.isEmpty
+                ? ModelCatalogSelection.initialSelection(models: fetched, existing: existingModelIDs)
+                : ModelCatalogSelection.selectionAfterRefetch(
+                    models: fetched,
+                    previouslyDisplayed: previouslyDisplayed,
+                    previousSelection: previousSelection,
+                    existing: existingModelIDs)
         } catch {
             draft.error = error.localizedDescription
         }
         draft.loading = false
+    }
+
+    private func apply() {
+        guard canApply else { return }
+        if let error = store.applyModelCatalogSelection(provider: provider, choices: choices,
+                                                       selected: draft.selected) {
+            draft.applyError = error
+            return
+        }
+        dismiss()
     }
 }

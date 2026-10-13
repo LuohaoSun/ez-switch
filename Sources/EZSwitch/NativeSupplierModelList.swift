@@ -52,15 +52,25 @@ extension ConfigStore {
 
 /// 单个供应商的原生模型行列表。行既是拖动源（写入与路由候选表相同的 `public.plain-text` JSON 载荷），
 /// 又是同供应商内部排序的落点；拖动会话、拖动源与插入行几何都由 `NSTableView` 持有。
-/// 外层 SwiftUI 滚动视图负责滚动，表格高度等于行数 × 行高。
+/// 外层 SwiftUI 滚动视图负责滚动；表格高度取原生 `.inset` 的真实内容高度（含样式顶部内缩），
+/// 容器可视高度只取行区净高，并把顶部内缩滚出可视区，使首行贴近分隔线、末行连同圆角完整可见。
 struct NativeSupplierModelList: NSViewRepresentable {
     let items: [SupplierModelItem]
     let provider: String
     /// 筛选供应商/模型时禁用内部排序；拖动源不受影响，模型仍可拖出到路由。
     let sortEnabled: Bool
     let store: ConfigStore
-    let onEdit: (UUID) -> Void
-    var rowHeight: CGFloat = 30
+    /// 内联重命名的提交闭包：返回 nil 表示写入成功，返回文案表示校验失败。
+    /// 协调器在 Return / 回车提交时调用；失败时保持编辑并就地展示该校验文案（无模态重命名面板）。
+    let onRename: (UUID, String) -> String?
+    /// 删除模型（右键菜单“删除”）；按稳定 UUID 精确清理。
+    var onDelete: (UUID) -> Void = { _ in }
+    /// 工作区共享的单选模型：跨卡片唯一选中的真源；本表据此显示/清除选中。
+    var selectedModelID: UUID? = nil
+    /// 用户在本表改变选中时回写工作区共享选中；程序化/同步选中不触发（避免回环）。
+    var onSelectionChange: (UUID?) -> Void = { _ in }
+    /// 紧凑行高（约 系统字号 + 11）：圆角内缩选中更贴合单行文本。
+    var rowHeight: CGFloat = 24
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -69,6 +79,7 @@ struct NativeSupplierModelList: NSViewRepresentable {
         wire(container.tableView, coordinator: context.coordinator)
         context.coordinator.apply(items: items)
         container.tableView.reloadData()
+        context.coordinator.applySelectedModelID(selectedModelID)
         return container
     }
 
@@ -87,6 +98,12 @@ struct NativeSupplierModelList: NSViewRepresentable {
         tableView.contextMenuProvider = { [weak coordinator] row in
             coordinator?.contextMenu(row: row)
         }
+        // Return / Enter：对选中行开始原生就地重命名；无有效选中交回默认按键处理。
+        tableView.onReturnKey = { [weak coordinator] in
+            coordinator?.activateSelectedRow() ?? false
+        }
+        // 编辑中的行不允许同一行的按下顺带发起拖动（该按下用于结束编辑）。
+        tableView.editingRowProvider = { [weak coordinator] in coordinator?.editingRow }
         coordinator.attach(tableView)
     }
 
@@ -96,16 +113,18 @@ struct NativeSupplierModelList: NSViewRepresentable {
             container.tableView.rowHeight = rowHeight
         }
         context.coordinator.apply(items: items)
+        context.coordinator.applySelectedModelID(selectedModelID)
     }
 
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: SupplierModelTableContainer,
+    /// 高度只取行区净高：原生 `.inset` 的固定顶部内缩由容器滚出可视区，不占外层布局高度。
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView container: SupplierModelTableContainer,
                       context: Context) -> CGSize? {
-        CGSize(width: proposal.width ?? 240, height: CGFloat(items.count) * rowHeight)
+        CGSize(width: proposal.width ?? 240, height: container.tightContentHeight)
     }
 
     /// 行模型由显示快照驱动：拖动期间不替换快照，落点行号始终对应用户看到的行。
     @MainActor
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
         var parent: NativeSupplierModelList
         private weak var tableView: NSTableView?
 
@@ -114,6 +133,21 @@ struct NativeSupplierModelList: NSViewRepresentable {
         private var latestItems: [SupplierModelItem] = []
         private var suppressReload = false
         private var pendingReload = false
+        /// 拖动会话进行中；此时不允许开始就地编辑。
+        private var draggingActive = false
+
+        /// 当前选中行的稳定 ID：reload / 重排后按 UUID 恢复，行被移除则清空。
+        private(set) var selectedID: UUID?
+        /// 程序化恢复选中期间抑制选中变化回写（reload 会先清空选中）。
+        private var suppressSelectionSync = false
+
+        /// 就地重命名会话：稳定 ID / 行号 / 原名 / 校验文案；`editingID != nil` 即“正在编辑”。
+        private(set) var editingID: UUID?
+        private(set) var editingRow: Int?
+        private(set) var editingError: String?
+        private var originalText = ""
+        /// 结束编辑期间抑制 `controlTextDidEndEditing` 的二次取消/回写。
+        private var isFinalizing = false
 
         init(_ parent: NativeSupplierModelList) { self.parent = parent }
 
@@ -132,11 +166,227 @@ struct NativeSupplierModelList: NSViewRepresentable {
             let cell = (tableView.makeView(withIdentifier: SupplierModelCell.reuseIdentifier, owner: nil)
                         as? SupplierModelCell) ?? SupplierModelCell()
             cell.configure(item: item)
+            // 就地编辑的提交/取消由协调器接管字段编辑器回调。
+            cell.textField?.delegate = self
             return cell
         }
 
-        // 行选中保留默认行为（无高亮，也无点击动作）：整行可拖由表格的行拖动负责，
-        // 不做 `shouldSelectRow` 限制，避免影响行拖动路径。
+        // MARK: 选中（单行、可见；工作区共享真源 + 按稳定 ID 跨 reload / 重排保留）
+
+        /// 记录选中行的稳定 ID 并回写工作区共享选中；reload / 同步恢复期间抑制回写。
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard !suppressSelectionSync else { return }
+            let row = tableView?.selectedRow ?? -1
+            let id = (row >= 0 && row < displayedItems.count) ? displayedItems[row].id : nil
+            selectedID = id
+            parent.onSelectionChange(id)
+        }
+
+        /// 仅显示行可选中。
+        func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+            row >= 0 && row < displayedItems.count
+        }
+
+        /// 选中某行并记录其稳定 ID；行号越界返回 false。
+        @discardableResult
+        func selectRow(_ row: Int) -> Bool {
+            guard let tableView, row >= 0, row < displayedItems.count else { return false }
+            let id = displayedItems[row].id
+            suppressSelectionSync = true
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            suppressSelectionSync = false
+            selectedID = id
+            parent.onSelectionChange(id)
+            return true
+        }
+
+        /// 由 `updateNSView` 推送工作区共享选中：只有变化时才动作，且不触发回写回调。
+        /// 共享选中不在本表（属于别的卡片）时清空本表选中，保证任一时刻最多一行被选中。
+        func applySelectedModelID(_ id: UUID?) {
+            guard let tableView else { selectedID = id; return }
+            let targetRow = id.flatMap { target in
+                displayedItems.firstIndex(where: { $0.id == target })
+            }
+            if let targetRow {
+                guard selectedID != id || tableView.selectedRow != targetRow else { return }
+            } else if selectedID == nil && tableView.selectedRow < 0 {
+                return
+            }
+            suppressSelectionSync = true
+            if let targetRow {
+                tableView.selectRowIndexes(IndexSet(integer: targetRow), byExtendingSelection: false)
+                selectedID = id
+            } else {
+                tableView.deselectAll(nil)
+                selectedID = nil
+            }
+            suppressSelectionSync = false
+        }
+
+        /// reload 会清空选中：按稳定 ID 重新选中同一行；ID 已消失（行被移除）则清空选中。
+        private func reloadPreservingSelection() {
+            guard let tableView else { return }
+            let keep = selectedID
+            suppressSelectionSync = true
+            tableView.reloadData()
+            if let keep, let row = displayedItems.firstIndex(where: { $0.id == keep }) {
+                tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                selectedID = keep
+            } else {
+                selectedID = nil
+                tableView.deselectAll(nil)
+            }
+            suppressSelectionSync = false
+        }
+
+        // MARK: 就地重命名（原生字段编辑器，无模态面板）
+
+        /// Return / Enter：对当前选中行开始就地重命名；无有效选中行返回 false。
+        @discardableResult
+        func activateSelectedRow() -> Bool {
+            guard let tableView else { return false }
+            return beginEditing(row: tableView.selectedRow)
+        }
+
+        /// 按稳定 ID 开始就地重命名（右键菜单“重命名”）。
+        @discardableResult
+        func beginEditing(id: UUID) -> Bool {
+            guard let row = displayedItems.firstIndex(where: { $0.id == id }) else { return false }
+            return beginEditing(row: row)
+        }
+
+        /// 对指定行开始原生就地 `NSTextField` 编辑并预选全部名称；拖动中或行号越界拒绝。
+        @discardableResult
+        func beginEditing(row: Int) -> Bool {
+            guard let tableView, !draggingActive,
+                  row >= 0, row < displayedItems.count else { return false }
+            // 结束可能残留的上一个会话（恢复原值，不写入）。
+            if editingID != nil { endEditingSession(restore: true) }
+            let item = displayedItems[row]
+            editingRow = row
+            originalText = item.label
+            editingError = nil
+            selectRow(row)
+            cell(at: row)?.beginEditing()
+            tableView.editColumn(0, row: row, with: nil, select: true)
+            // 会话在字段编辑器启动之后才生效：`editColumn` 期间若同步派发
+            // `controlTextDidEndEditing`（例如宿主窗口尚未成为 key window 时），此时 editingID 仍为 nil，
+            // 结束回调会被直接忽略，不会误清刚建立的编辑会话。
+            editingID = item.id
+            return true
+        }
+
+        /// 就地提交：返回 nil 表示成功写入或原文未变；返回文案表示校验失败。
+        @discardableResult
+        func commitEditing(withText text: String) -> String? {
+            guard let id = editingID else { return nil }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed != originalText else { return nil }
+            return parent.onRename(id, trimmed)
+        }
+
+        /// Return / Enter 提交：成功（或原文未变）结束编辑返回 true；校验失败保持编辑返回 false。
+        @discardableResult
+        func handleReturn(withText text: String) -> Bool {
+            guard editingID != nil else { return false }
+            if let error = commitEditing(withText: text) {
+                showEditingError(error)
+                return false
+            }
+            endEditingSession(restore: false)
+            return true
+        }
+
+        /// Escape / 失焦：取消编辑，不写入任何内容。
+        func cancelEditing() {
+            guard editingID != nil else { return }
+            endEditingSession(restore: true)
+        }
+
+        /// 校验失败：就地展示文案（仅此时占用额外宽度）并保持编辑。
+        private func showEditingError(_ message: String) {
+            editingError = message
+            guard let row = editingRow else { return }
+            cell(at: row)?.setValidation(message)
+            setFieldEditorValidationStyle(failed: true, row: row)
+        }
+
+        /// 校验文案出现/消失后，把字段编辑器收缩或恢复到文本域上：文案不被遮住，平时也不挤占行宽。
+        private func setFieldEditorValidationStyle(failed: Bool, row: Int) {
+            guard let editor = tableView?.currentEditor() as? NSTextView else { return }
+            editor.textColor = failed ? .systemRed : .labelColor
+            guard let cell = cell(at: row), let field = cell.textField,
+                  let host = editor.superview else { return }
+            cell.layoutSubtreeIfNeeded()
+            var frame = host.convert(field.bounds, from: field)
+            frame.origin.y = editor.frame.origin.y
+            frame.size.height = editor.frame.height
+            editor.frame = frame
+        }
+
+        /// 结束会话：`restore` 时把原名写回（取消语义）；无论成功/取消都不触碰 store。
+        private func endEditingSession(restore: Bool) {
+            guard let tableView else { clearEditingSession(); return }
+            let row = editingRow
+            let text = originalText
+            isFinalizing = true
+            if let row, let cell = cell(at: row) {
+                if restore { cell.textField?.stringValue = text }
+                cell.endEditing()
+            }
+            clearEditingSession()
+            if let editor = tableView.currentEditor() {
+                if restore { editor.string = text }
+                _ = tableView.window?.makeFirstResponder(tableView)
+            }
+            isFinalizing = false
+            applyPendingReloadIfNeeded()
+        }
+
+        private func clearEditingSession() {
+            editingID = nil
+            editingRow = nil
+            editingError = nil
+            originalText = ""
+        }
+
+        private func cell(at row: Int) -> SupplierModelCell? {
+            tableView?.view(atColumn: 0, row: row, makeIfNecessary: false) as? SupplierModelCell
+        }
+
+        // MARK: NSTextFieldDelegate（字段编辑器）
+
+        /// Return 提交（失败保持编辑），Escape 取消；其余按键交回字段编辑器。
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard editingID != nil else { return false }
+            switch commandSelector {
+            case #selector(NSResponder.insertNewline(_:)):
+                _ = handleReturn(withText: textView.string)
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                cancelEditing()
+                return true
+            default:
+                return false
+            }
+        }
+
+        /// 继续输入即清除上一次的校验提示，恢复完整行宽。
+        func controlTextDidChange(_ notification: Notification) {
+            guard editingID != nil, editingError != nil, let row = editingRow else { return }
+            editingError = nil
+            cell(at: row)?.clearValidation()
+            setFieldEditorValidationStyle(failed: false, row: row)
+        }
+
+        /// 失焦 / 切换行结束编辑：视为取消，不写入。
+        func controlTextDidEndEditing(_ notification: Notification) {
+            guard editingID != nil, !isFinalizing else { return }
+            if let field = notification.object as? NSTextField { field.stringValue = originalText }
+            if let row = editingRow { cell(at: row)?.endEditing() }
+            clearEditingSession()
+            applyPendingReloadIfNeeded()
+        }
 
         // MARK: 视图更新（不打断拖动）
 
@@ -148,17 +398,20 @@ struct NativeSupplierModelList: NSViewRepresentable {
                 refreshVisibleCells()
                 return
             }
-            guard !suppressReload else {
+            // 拖动或就地编辑期间冻结显示快照，避免推翻用户正在看的行/正在编辑的文本。
+            guard !suppressReload, editingID == nil else {
                 pendingReload = true
                 return
             }
             displayedItems = items
-            tableView?.reloadData()
+            reloadPreservingSelection()
         }
 
         private func refreshVisibleCells() {
             guard let tableView else { return }
             for row in 0..<min(displayedItems.count, tableView.numberOfRows) {
+                // 不打断正在编辑的行：字段编辑器持有其文本。
+                if row == editingRow { continue }
                 guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false)
                         as? SupplierModelCell else { continue }
                 cell.configure(item: displayedItems[row])
@@ -169,6 +422,10 @@ struct NativeSupplierModelList: NSViewRepresentable {
 
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
             guard row >= 0, row < displayedItems.count else { return nil }
+            // 编辑期间、或“结束编辑的同一次按下”都不发起拖动，避免拖动与就地编辑互相打断。
+            if editingID != nil { return nil }
+            if let table = tableView as? SupplierModelTableView,
+               table.suppressDragForCurrentInteraction { return nil }
             return ModelDragPayload.pasteboardItem(ModelDragItem(id: displayedItems[row].id))
         }
 
@@ -186,18 +443,24 @@ struct NativeSupplierModelList: NSViewRepresentable {
         /// 拖出到路由时本表只是源，仍在该结束路径解冻。
         func onDragStateChange(_ active: Bool) { dragStateChanged(active) }
 
-        /// 冻结 = 不替换显示快照、不 reload；解冻时应用拖动期间积压的数据。
+        /// 冻结 = 不替换显示快照、不 reload；解冻时应用期间积压的数据。
         /// 成功（conclude）/失败（perform 返回 false）/取消（exited/ended）各路径都会调用。
         func dragStateChanged(_ active: Bool) {
+            draggingActive = active
             if active {
                 suppressReload = true
                 return
             }
             suppressReload = false
-            guard pendingReload, let tableView else { return }
+            applyPendingReloadIfNeeded()
+        }
+
+        /// 会话（拖动/编辑）真正结束后，才把积压的最新行数据落回表格。
+        private func applyPendingReloadIfNeeded() {
+            guard pendingReload, !suppressReload, editingID == nil else { return }
             pendingReload = false
             displayedItems = latestItems
-            tableView.reloadData()
+            reloadPreservingSelection()
         }
 
         // MARK: 落点（同供应商排序；筛选时禁用）
@@ -245,21 +508,31 @@ struct NativeSupplierModelList: NSViewRepresentable {
             Dictionary(uniqueKeysWithValues: parent.store.config.remotes.map { ($0.id, $0) })
         }
 
-        // MARK: 右键菜单（编辑模型）
+        // MARK: 右键菜单（重命名 / 删除）
 
         func contextMenu(row: Int) -> NSMenu? {
             guard row >= 0, row < displayedItems.count else { return nil }
-            let item = NSMenuItem(title: "编辑模型…", action: #selector(editMenuItemClicked(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = displayedItems[row].id
+            let id = displayedItems[row].id
+            let rename = NSMenuItem(title: "重命名", action: #selector(renameMenuItemClicked(_:)), keyEquivalent: "")
+            rename.target = self
+            rename.representedObject = id
+            let delete = NSMenuItem(title: "删除", action: #selector(deleteMenuItemClicked(_:)), keyEquivalent: "")
+            delete.target = self
+            delete.representedObject = id
             let menu = NSMenu()
-            menu.addItem(item)
+            menu.addItem(rename)
+            menu.addItem(delete)
             return menu
         }
 
-        @objc private func editMenuItemClicked(_ sender: NSMenuItem) {
+        @objc func renameMenuItemClicked(_ sender: NSMenuItem) {
             guard let id = sender.representedObject as? UUID else { return }
-            parent.onEdit(id)
+            beginEditing(id: id)
+        }
+
+        @objc func deleteMenuItemClicked(_ sender: NSMenuItem) {
+            guard let id = sender.representedObject as? UUID else { return }
+            parent.onDelete(id)
         }
     }
 }
@@ -272,6 +545,25 @@ final class SupplierModelTableView: NSTableView {
     var onDragStateChange: ((Bool) -> Void)?
     /// 右键时按命中行构造菜单。
     var contextMenuProvider: ((Int) -> NSMenu?)?
+    /// Return / Enter：返回是否已处理。
+    var onReturnKey: (() -> Bool)?
+    /// 当前正在就地编辑的行号；同一行的按下用于结束编辑，不能顺带发起拖动。
+    var editingRowProvider: (() -> Int?)?
+    /// 本次鼠标交互是“落在正在编辑行上的按下”：在抬起前一律抑制拖动发起。
+    private(set) var suppressDragForCurrentInteraction = false
+
+    override func mouseDown(with event: NSEvent) {
+        if let editingRow = editingRowProvider?(), editingRow >= 0,
+           row(at: convert(event.locationInWindow, from: nil)) == editingRow {
+            suppressDragForCurrentInteraction = true
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        suppressDragForCurrentInteraction = false
+    }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         onDragStateChange?(true)
@@ -299,17 +591,78 @@ final class SupplierModelTableView: NSTableView {
         super.draggingEnded(sender)
     }
 
+    /// Return(36) / Enter(76)：对选中行开始就地重命名，否则交回默认处理。
+    override func keyDown(with event: NSEvent) {
+        if (event.keyCode == 36 || event.keyCode == 76), onReturnKey?() == true { return }
+        super.keyDown(with: event)
+    }
+
+    /// 右键命中行：先选中该行，再按该行构造菜单；未命中行不弹菜单。
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         let row = self.row(at: point)
         guard row >= 0 else { return nil }
+        selectRowForContextMenu(row)
         return contextMenuProvider?(row)
+    }
+
+    /// 右键命中行的选择：菜单作用在确切命中行。
+    /// 直接走原生选中（非抑制路径），由协调器回写工作区共享选中。
+    func selectRowForContextMenu(_ row: Int) {
+        guard row >= 0, row < numberOfRows else { return }
+        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
     }
 }
 
-/// 非滚动的 NSScrollView + NSTableView：外层 SwiftUI 滚动视图负责滚动，表格高度等于行数 × 行高。
+/// 非滚动表格的 clip view：把垂直偏移钉在顶部内缩上；原生选中/重绘在 layout 之外改动 bounds 时同样夹紧。
+final class PinnedTopInsetClipView: NSClipView {
+    /// 期望的固定垂直偏移（= 顶部内缩）；由容器在 layout 写入。
+    var pinnedOffsetY: CGFloat = 0
+
+    override var bounds: NSRect {
+        get { super.bounds }
+        set { super.bounds = NSRect(x: 0, y: clampedPinnedY(forHeight: newValue.height),
+                                    width: newValue.width, height: newValue.height) }
+    }
+
+    override func setBoundsOrigin(_ newOrigin: NSPoint) {
+        super.setBoundsOrigin(NSPoint(x: 0, y: clampedPinnedY(forHeight: bounds.height)))
+    }
+
+    override func scroll(to newOrigin: NSPoint) {
+        super.scroll(to: NSPoint(x: 0, y: clampedPinnedY(forHeight: bounds.height)))
+    }
+
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        rect.origin = NSPoint(x: 0, y: clampedPinnedY(forHeight: rect.height))
+        return rect
+    }
+
+    private func clampedPinnedY(forHeight height: CGFloat) -> CGFloat {
+        let maxY = max(0, (documentView?.frame.height ?? 0) - height)
+        return min(max(0, pinnedOffsetY), maxY)
+    }
+}
+
+/// 非滚动的 NSScrollView + NSTableView：外层 SwiftUI 滚动视图负责滚动。
+/// `.inset` 在首行上方加固定内缩（无公开 API 可改），故文档高度取全高、可视高度只取行区净高，
+/// 并把内缩滚出可视区：首行贴近分隔线，末行连同圆角完整可见。
 final class SupplierModelTableContainer: NSScrollView {
     let tableView = SupplierModelTableView()
+    private let pinnedClip = PinnedTopInsetClipView()
+
+    /// `.inset` 样式在首行上方加入的固定内缩（由 `rect(ofRow:)` 实测得出，而非硬编码）。
+    var topInset: CGFloat {
+        tableView.numberOfRows > 0 ? tableView.rect(ofRow: 0).minY : 0
+    }
+
+    /// 行区净高（不含样式顶部内缩）：由首/末行实测矩形之差得出，外层 SwiftUI 布局高度，保证末行不被裁。
+    var tightContentHeight: CGFloat {
+        let rows = tableView.numberOfRows
+        guard rows > 0 else { return 0 }
+        return tableView.rect(ofRow: rows - 1).maxY - tableView.rect(ofRow: 0).minY
+    }
 
     init(rowHeight: CGFloat) {
         super.init(frame: .zero)
@@ -320,19 +673,23 @@ final class SupplierModelTableContainer: NSScrollView {
         autohidesScrollers = true
         verticalScrollElasticity = .none
         horizontalScrollElasticity = .none
-        contentView.drawsBackground = false
+        // 用钉住偏移的 clip view：选中/重绘在 layout 之外改动 bounds 时也会被重新夹紧。
+        pinnedClip.drawsBackground = false
+        contentView = pinnedClip
 
         tableView.headerView = nil
         tableView.usesAutomaticRowHeights = false
         tableView.rowHeight = rowHeight
+        // 先定样式：`.inset` 由 AppKit 绘制原生圆角内缩选中（macOS 11+），不手绘蓝色矩形。
+        tableView.style = .inset
+        tableView.selectionHighlightStyle = .regular
+        // 归零行间距让行紧贴；`.inset` 样式仍在首行上方保留固定内缩，由容器统一处理。
         tableView.intercellSpacing = NSSize(width: 0, height: 0)
-        tableView.selectionHighlightStyle = .none
         tableView.allowsMultipleSelection = false
         tableView.allowsEmptySelection = true
         tableView.backgroundColor = .clear
         tableView.gridStyleMask = []
         tableView.focusRingType = .none
-        tableView.style = .plain
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("supplier-model"))
         column.resizingMask = .autoresizingMask
         tableView.addTableColumn(column)
@@ -345,20 +702,29 @@ final class SupplierModelTableContainer: NSScrollView {
     override func layout() {
         super.layout()
         let width = contentSize.width
-        tableView.frame = NSRect(x: 0, y: 0, width: width,
-                                 height: CGFloat(tableView.numberOfRows) * tableView.rowHeight)
+        let inset = topInset
+        let tight = tightContentHeight
+        // 先写回钉住值，再设文档高度，避免文档变化触发的 reflect 用到过期偏移。
+        pinnedClip.pinnedOffsetY = inset
+        tableView.frame = NSRect(x: 0, y: 0, width: width, height: inset + tight)
         tableView.sizeLastColumnToFit()
+        // 夹在文档可滚范围内（容器偏高时不产生额外空白）；写入会经 bounds 覆写被钉住。
+        pinnedClip.bounds.origin = NSPoint(x: 0, y: max(0, min(inset, tableView.frame.height - contentSize.height)))
     }
 }
 
-/// 单行 cell：模型名（等宽）+ 凭据待配置提示。文本与图标让出命中测试，
-/// 让表格统一处理行拖动；右键菜单由表格的 `menu(for:)` 提供。
+/// 单行 cell：模型名（等宽，编辑时就地变成 `NSTextField` 字段编辑器）+ 凭据待配置提示 +
+/// 校验文案槽位。文本与图标让出命中测试，让表格统一处理行拖动；右键菜单由表格的 `menu(for:)` 提供。
 final class SupplierModelCell: NSTableCellView {
     static let reuseIdentifier = NSUserInterfaceItemIdentifier("SupplierModelCell")
 
     private let title = SupplierPassthroughTextField(labelWithString: "")
     private let warning = SupplierPassthroughImageView()
+    /// 校验文案槽位：仅在校验失败期间显示，平时完全让出宽度给模型名。
+    private let validation = SupplierPassthroughTextField(labelWithString: "")
     private let stack = NSStackView()
+    private var needsCredentials = false
+    private var isEditingRow = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -369,12 +735,64 @@ final class SupplierModelCell: NSTableCellView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func configure(item: SupplierModelItem) {
+        needsCredentials = item.needsCredentials
         title.stringValue = item.label
         title.setAccessibilityTitle(item.label)
         title.setAccessibilityHelp("拖到右侧路由添加模型；在左侧拖到其他模型上方调整顺序")
         title.setAccessibilityIdentifier("supplier-model-\(item.id.uuidString)")
-        warning.isHidden = !item.needsCredentials
+        // 复用中的 cell 可能是上一次编辑的残留外观；正在编辑的行不重置。
+        if !isEditingRow {
+            title.isEditable = false
+            title.textColor = .labelColor
+            validation.isHidden = true
+            warning.isHidden = !item.needsCredentials
+        }
     }
+
+    /// 进入就地编辑：文本域可编辑（预选由 `editColumn(_:row:with:select:)` 完成），不预留校验宽度。
+    func beginEditing() {
+        isEditingRow = true
+        title.isEditable = true
+        title.isSelectable = true
+        title.textColor = .labelColor
+        warning.isHidden = true
+        validation.stringValue = ""
+        validation.setAccessibilityHelp(nil)
+        validation.isHidden = true
+    }
+
+    /// 校验失败：显示文案（占必要宽度）并保持编辑。
+    func setValidation(_ message: String) {
+        validation.stringValue = message
+        validation.isHidden = false
+        validation.setAccessibilityHelp(message)
+    }
+
+    /// 用户继续输入：清掉上一次的校验文案，恢复完整行宽。
+    func clearValidation() {
+        validation.stringValue = ""
+        validation.setAccessibilityHelp(nil)
+        validation.isHidden = true
+    }
+
+    /// 结束就地编辑：恢复只读外观与凭据提示。
+    func endEditing() {
+        isEditingRow = false
+        title.isEditable = false
+        title.textColor = .labelColor
+        validation.stringValue = ""
+        validation.isHidden = true
+        warning.isHidden = !needsCredentials
+    }
+
+    /// 当前就地校验文案；无错误时为空串。
+    var validationMessage: String { validation.stringValue }
+
+    /// 校验文案当前是否可见。
+    var isShowingValidation: Bool { !validation.isHidden }
+
+    /// 文本域当前是否可编辑（正在就地编辑）。
+    var isTitleEditable: Bool { title.isEditable }
 
     private func build() {
         title.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
@@ -383,6 +801,8 @@ final class SupplierModelCell: NSTableCellView {
         title.toolTip = "拖到右侧路由添加模型；在左侧拖到其他模型上方调整顺序"
         title.setContentHuggingPriority(.defaultLow, for: .horizontal)
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // NSTableView 的就地编辑取 `textField` 作为字段编辑器宿主。
+        textField = title
 
         warning.image = NSImage(systemSymbolName: "exclamationmark.circle.fill",
                                 accessibilityDescription: "凭据待配置")
@@ -390,11 +810,20 @@ final class SupplierModelCell: NSTableCellView {
         warning.toolTip = "凭据待配置"
         warning.setContentHuggingPriority(.required, for: .horizontal)
 
+        validation.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        validation.textColor = .systemRed
+        validation.lineBreakMode = .byTruncatingTail
+        validation.usesSingleLineMode = true
+        validation.maximumNumberOfLines = 1
+        validation.isHidden = true
+        validation.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        validation.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.setViews([title, warning], in: .leading)
+        stack.setViews([title, warning, validation], in: .leading)
         addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -412,5 +841,9 @@ private final class SupplierPassthroughImageView: NSImageView {
 }
 
 private final class SupplierPassthroughTextField: NSTextField {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    /// 非编辑时命中测试直接让出（点击/拖动落到表格本身）；就地编辑时正常参与命中，
+    /// 以便字段编辑器/文本选择照常工作。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        isEditable ? super.hitTest(point) : nil
+    }
 }

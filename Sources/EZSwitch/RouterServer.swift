@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 import NIOCore
 import NIOPosix
 import NIOHTTP1
@@ -256,8 +257,11 @@ enum RequestProcessor {
 
         // 一次客户端模型请求 = 一个 requestID；所有 attempt 记录共用请求开始时间，
         // 保证按时间分组时同一次请求的多次尝试归到同一桶。
+        // requestStartMonotonic 是「完整请求已收到、路由器开始处理」的单调起点，
+        // 用于 requestTTFT（含 fallback 等待）；不是客户端发起请求的瞬间。
         let requestID = UUID()
         let requestStarted = Date()
+        let requestStartMonotonic = DispatchTime.now()
         var headWritten = false
         var selected: (remote: RemoteModel, upstream: UpstreamResponse)?
         var selectedAttempt = 0
@@ -277,12 +281,17 @@ enum RequestProcessor {
             }
             let attempt = index + 1
             let attemptStarted = Date()
+            // 单调起点在建请求之前捕获：TTFT 覆盖连接/建包/桥接准备，且不会
+            // 因上游 body 被 URLSession 后台预读而失真。
+            let attemptStartMonotonic = DispatchTime.now()
             let endpointBaseURL = remote.endpointSetting(for: endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint).baseURL
             Log.shared.log("[\(endpoint.rawValue)] \(head.method) \(path) model=\(fake.fakeModelID) → \(remote.name) \(hostOf(endpointBaseURL))/\(remote.model)")
             do {
                 let upstream = try await Forwarder.makeRequest(clientHead: head, body: bodyData,
                                                                endpoint: endpoint, remote: remote, query: query,
-                                                               session: session)
+                                                               session: session,
+                                                               requestStart: requestStartMonotonic,
+                                                               attemptStart: attemptStartMonotonic)
                 let status = upstream.response.statusCode
                 if index < compatible.count - 1 && (status == 429 || [500, 502, 503, 504].contains(status)) {
                     let body = await FallbackDiagnostics.readErrorBody(upstream)
@@ -292,7 +301,8 @@ enum RequestProcessor {
                     recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
                                   fake: fake, remote: remote, endpoint: endpoint,
                                   attempt: attempt, status: status, outcome: "httpError",
-                                  started: attemptStarted, tokens: upstream.usage?.tokens)
+                                  started: attemptStarted, tokens: upstream.usage?.tokens,
+                                  performance: upstream.performance?.performance)
                     upstream.cancel()
                     if Task.isCancelled { return }
                     pendingFallback = (from: remote.routeLabel,
@@ -315,7 +325,7 @@ enum RequestProcessor {
                     recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
                                   fake: fake, remote: remote, endpoint: endpoint,
                                   attempt: attempt, status: nil, outcome: "cancelled",
-                                  started: attemptStarted, tokens: nil)
+                                  started: attemptStarted, tokens: nil, performance: nil)
                     return
                 }
                 let nsError = error as NSError
@@ -327,7 +337,7 @@ enum RequestProcessor {
                 recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
                               fake: fake, remote: remote, endpoint: endpoint,
                               attempt: attempt, status: nil, outcome: "networkError",
-                              started: attemptStarted, tokens: nil)
+                              started: attemptStarted, tokens: nil, performance: nil)
                 // 仅当确实还有下一个候选要开始时，才留下回退事件。
                 if index + 1 < compatible.count {
                     pendingFallback = (from: remote.routeLabel,
@@ -439,16 +449,18 @@ enum RequestProcessor {
         recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
                       fake: fake, remote: remote, endpoint: endpoint,
                       attempt: selectedAttempt, status: upstream.response.statusCode, outcome: outcome,
-                      started: selectedStarted, tokens: upstream.usage?.tokens)
+                      started: selectedStarted, tokens: upstream.usage?.tokens,
+                      performance: upstream.performance?.performance)
     }
 
     /// 记录一次上游尝试。record 非阻塞、不抛错；null-ish 计数字段保持 nil（不猜）。
     private static func recordAttempt(_ recordUsage: UsageRecorder?, requestID: UUID, timestamp: Date,
                                       fake: FakeModel, remote: RemoteModel, endpoint: EndpointKind,
                                       attempt: Int, status: Int?, outcome: String,
-                                      started: Date, tokens: UsageTokens?) {
+                                      started: Date, tokens: UsageTokens?,
+                                      performance: UsagePerformance? = nil) {
         guard let recordUsage else { return }
-        let record = UsageRecord(requestID: requestID,
+        var record = UsageRecord(requestID: requestID,
                                  timestamp: timestamp,
                                  routeID: fake.id.uuidString,
                                  routeName: fake.displayName.isEmpty ? fake.fakeModelID : fake.displayName,
@@ -461,6 +473,8 @@ enum RequestProcessor {
                                  outcome: outcome,
                                  durationMS: max(0, Int(Date().timeIntervalSince(started) * 1000)),
                                  tokens: tokens ?? UsageTokens())
+        // 成功 / 失败 / 取消都记可观测的性能字段；统计层自行排除失败与取消。
+        record.performance = performance
         recordUsage(record)
     }
 

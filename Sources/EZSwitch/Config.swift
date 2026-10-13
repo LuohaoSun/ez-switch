@@ -967,20 +967,27 @@ final class ConfigStore: ObservableObject {
         return nil
     }
 
-    /// 新增供应商下的模型：凭据和三协议配置完整复制该供应商当前的统一配置。
-    /// 旧配置中这些字段不一致时拒绝新增，必须先通过供应商设置统一。
+    /// 供应商下所有模型共用同一份连接配置；不存在或不一致时返回可展示的错误。
+    private func unifiedProviderConfig(_ provider: String)
+        -> (template: RemoteModel?, members: [RemoteModel], error: String?) {
+        let members = config.remotes.filter { splitProviderModel($0.name).provider == provider }
+        guard let first = members.first else { return (nil, members, "供应商已不存在，请重新打开设置") }
+        guard members.allSatisfy({ $0.apiEndpoints == first.apiEndpoints })
+        else { return (nil, members, "该供应商的接口配置不一致，请先在供应商设置中统一") }
+        guard members.allSatisfy({ $0.apiKey == first.apiKey })
+        else { return (nil, members, "该供应商的 API Key 不一致，请先在供应商设置中统一") }
+        guard members.allSatisfy({ $0.extraHeaders == first.extraHeaders })
+        else { return (nil, members, "该供应商的额外请求头不一致，请先在供应商设置中统一") }
+        return (first, members, nil)
+    }
+
+    /// 新增供应商下的模型：凭据和三协议配置复制该供应商的统一配置。
     @discardableResult
     func addModel(provider: String, model: String) -> String? {
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else { return "模型 ID 不能为空" }
-        let members = config.remotes.filter { splitProviderModel($0.name).provider == provider }
-        guard let first = members.first else { return "供应商已不存在，请重新打开设置" }
-        guard members.allSatisfy({ $0.apiEndpoints == first.apiEndpoints })
-        else { return "该供应商的接口配置不一致，请先在供应商设置中统一" }
-        guard members.allSatisfy({ $0.apiKey == first.apiKey })
-        else { return "该供应商的 API Key 不一致，请先在供应商设置中统一" }
-        guard members.allSatisfy({ $0.extraHeaders == first.extraHeaders })
-        else { return "该供应商的额外请求头不一致，请先在供应商设置中统一" }
+        let (template, members, error) = unifiedProviderConfig(provider)
+        guard let first = template else { return error }
         guard !members.contains(where: { $0.model == model }) else { return "该供应商下模型 ID 已存在" }
 
         let remote = RemoteModel(id: UUID(), name: "\(provider) · \(model)",
@@ -1091,6 +1098,48 @@ final class ConfigStore: ObservableObject {
             Log.shared.log("provider: 解绑 \(unbound.joined(separator: ", "))")
         }
         return unbound
+    }
+
+    /// 供应商模型目录选择对账：只处理该供应商、且 model ID 在 choices 内的模型。
+    /// 未勾选的现存模型按 removeRemote 清理，勾选但缺失的用 addModel 补建；
+    /// 预校验失败时不做任何改动。返回可展示的错误，nil = 成功。
+    @discardableResult
+    func applyModelCatalogSelection(provider: String, choices: Set<String>, selected: Set<String>) -> String? {
+        let trim: (String) -> String = { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let wanted = selected.intersection(choices)
+        let canonicalWanted = wanted.map(trim)
+        let wantedSet = Set(canonicalWanted)
+        let choiceSet = Set(choices.map(trim))
+        let members = config.remotes.filter { splitProviderModel($0.name).provider == provider }
+        let existingModels = Set(members.map { trim($0.model) })
+
+        guard canonicalWanted.allSatisfy({ !$0.isEmpty }) else { return "模型 ID 不能为空" }
+        var toAdd: [String] = []
+        var seen = Set<String>()
+        for id in canonicalWanted where !existingModels.contains(id) {
+            guard seen.insert(id).inserted else { return "模型 ID 重复" }
+            toAdd.append(id)
+        }
+        toAdd.sort()
+        let toRemove = members.filter {
+            let id = trim($0.model)
+            return choiceSet.contains(id) && !wantedSet.contains(id)
+        }
+        guard !toAdd.isEmpty || !toRemove.isEmpty else { return nil }
+
+        if !toAdd.isEmpty {
+            let (template, _, error) = unifiedProviderConfig(provider)
+            guard template != nil else { return error }
+        }
+
+        // 先新增（模板尚在），再清理；预校验已保证 addModel 不会失败。
+        for model in toAdd {
+            if let error = addModel(provider: provider, model: model) { return error }
+        }
+        for remote in toRemove {
+            removeRemote(id: remote.id)
+        }
+        return nil
     }
 
     /// 供应商页：全部远端按供应商分组（组序 = 首次出现），query 对名称、模型、协议和 URL 过滤

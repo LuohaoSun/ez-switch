@@ -6,9 +6,16 @@ import Charts
 struct UsageView: View {
     let store: UsageStore
 
-    @StateObject private var model = UsageViewModel()
+    @StateObject private var model: UsageViewModel
 
     private let columnWidth: CGFloat = 72
+
+    /// `initialSection` 由侧栏入口决定：用量入口传 .usage，性能入口传 .performance。
+    /// 在 init 里写入 ViewModel，配合调用方的稳定视图身份，不依赖 onAppear 重置。
+    init(store: UsageStore, initialSection: UsageSection = .usage) {
+        self.store = store
+        _model = StateObject(wrappedValue: UsageViewModel(section: initialSection))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,7 +28,7 @@ struct UsageView: View {
                     Text(model.actionError ?? "")
                 }
         }
-        .navigationTitle("用量")
+        .navigationTitle(model.section == .usage ? "用量" : "性能")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -66,12 +73,7 @@ struct UsageView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("用量统计").font(.title2.bold())
-                    Text("仅统计本机转发的 Token 与请求数，不含费用估算，数据只保存在本机。")
-                        .font(.callout).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text(sectionTitle).font(.title2.bold())
                 Spacer(minLength: 8)
                 if model.isExporting || model.isClearing {
                     ProgressView().controlSize(.small)
@@ -111,6 +113,10 @@ struct UsageView: View {
         .padding(.bottom, 14)
     }
 
+    private var sectionTitle: String {
+        model.section == .usage ? "用量统计" : "性能统计"
+    }
+
     private var rangeSummary: String {
         let range = model.range
         return "\(UsageFormat.day(range.from)) – \(UsageFormat.day(range.inclusiveEnd))（含结束日）"
@@ -127,6 +133,15 @@ struct UsageView: View {
 
     @ViewBuilder
     private var content: some View {
+        if model.section == .performance {
+            PerformanceView(model: model, store: store)
+        } else {
+            usageContent
+        }
+    }
+
+    @ViewBuilder
+    private var usageContent: some View {
         switch model.phase {
         case .failed(let message):
             errorState(message)
@@ -169,34 +184,24 @@ struct UsageView: View {
 
     private var overviewCard: some View {
         let totals = model.snapshot.totals
-        return VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
-                metricTile(title: "输入", value: totals.input, reported: totals.inputAttempts,
-                           attempts: totals.attempts, unit: "Tokens")
-                metricTile(title: "输出", value: totals.output, reported: totals.outputAttempts,
-                           attempts: totals.attempts, unit: "Tokens")
-                metricTile(title: "缓存命中", value: totals.cachedInput, reported: totals.cachedInputAttempts,
-                           attempts: totals.attempts, unit: "Tokens")
-                metricTile(title: "请求数", value: totals.requests, reported: totals.requests,
-                           attempts: 0, unit: "次")
-            }
-
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Label(coverageText, systemImage: coverageIcon)
-                    .font(.caption)
-                    .foregroundStyle(coverageColor)
-                Spacer(minLength: 8)
-                Text("缓存命中是输入的子集；推理量是输出的子集。— = 未上报")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.trailing)
-            }
+        return HStack(spacing: 12) {
+            metricTile(title: "输入", value: totals.input, reported: totals.inputAttempts,
+                       attempts: totals.attempts, unit: "Tokens")
+            metricTile(title: "输出", value: totals.output, reported: totals.outputAttempts,
+                       attempts: totals.attempts, unit: "Tokens")
+            metricTile(title: "缓存命中", value: totals.cachedInput, reported: totals.cachedInputAttempts,
+                       attempts: totals.attempts, unit: "Tokens", helpNote: "输入的子集")
+            metricTile(title: "请求数", value: totals.requests, reported: totals.requests,
+                       attempts: 0, unit: "次", helpNote: coverageSummary)
         }
         .cardSurface()
     }
 
-    private func metricTile(title: String, value: Int, reported: Int, attempts: Int, unit: String) -> some View {
+    private func metricTile(title: String, value: Int, reported: Int, attempts: Int, unit: String,
+                            helpNote: String? = nil) -> some View {
         let missing = attempts > 0 && reported == 0
+        let base = missing ? "\(title)：本区间未上报（—）"
+                           : "\(title)：\(UsageFormat.exact(value)) \(unit)"
         return VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.caption).foregroundStyle(.secondary)
             Text(missing ? "—" : UsageFormat.compact(value))
@@ -209,35 +214,20 @@ struct UsageView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
-        .help(missing ? "\(title)：本区间未上报" : "\(title)：\(UsageFormat.exact(value)) \(unit)")
+        .help([base, helpNote].compactMap { $0 }.joined(separator: "\n"))
         .accessibilityElement(children: .combine)
     }
 
-    private var coverageText: String {
+    /// 上游尝试用量的覆盖情况；仅在存在尝试时有意义，作为「请求数」指标卡的 tooltip 补充。
+    private var coverageSummary: String? {
         let totals = model.snapshot.totals
-        guard totals.attempts > 0 else { return "暂无上游尝试记录" }
+        guard totals.attempts > 0 else { return nil }
         let unknown = max(0, totals.attempts - totals.knownAttempts)
         var text = "已获取 \(totals.knownAttempts)/\(totals.attempts) 次上游尝试用量"
         if unknown > 0 {
             text += "（\(unknown) 次未知或部分）"
         }
         return text
-    }
-
-    private var coverageIcon: String {
-        let totals = model.snapshot.totals
-        if totals.attempts > 0, totals.knownAttempts < totals.attempts {
-            return "exclamationmark.circle"
-        }
-        return "checkmark.circle"
-    }
-
-    private var coverageColor: Color {
-        let totals = model.snapshot.totals
-        if totals.attempts > 0, totals.knownAttempts < totals.attempts {
-            return .orange
-        }
-        return .secondary
     }
 
     // MARK: - 图表
@@ -255,13 +245,7 @@ struct UsageView: View {
 
     private var chartCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("每日 Token").font(.headline)
-                Spacer(minLength: 8)
-                Text("输入 / 输出堆叠，单位 Token")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text("每日 Token").font(.headline)
 
             Chart(model.snapshot.days) { day in
                 BarMark(
