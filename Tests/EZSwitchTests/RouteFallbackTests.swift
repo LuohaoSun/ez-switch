@@ -152,4 +152,133 @@ struct RouteFallbackTests {
         #expect(try ProviderModelCatalog.request(for: model).url?.absoluteString ==
                 "https://api.anthropic.com/v1/models")
     }
+
+    // MARK: 自动回退成功后的粘性首选（运行期状态）
+
+    /// 一次“已完成的成功”才把回退目标提升为首选；首选失败即回到持久起始。
+    @Test
+    func completedFallbackSuccessBecomesPreferredAndReversesOnFailure() throws {
+        let a = remote("A", "one"), b = remote("B", "two")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b], fakes: [fake]))
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [a.id, b.id])
+
+        // a 失败（冷却已过期，仅用于观察顺序）；b 在同一请求内完成成功 → 成为首选。
+        let epoch = router.requestEpoch(fakeModelID: "main")
+        router.recordFailure(remoteID: a.id, retryAfter: Date().addingTimeInterval(-1))
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: epoch)
+        #expect(router.activeRemoteID(fakeID: fake.id) == b.id)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [b.id, a.id])
+
+        // 首选失败 → 回到持久起始。
+        router.recordFailure(remoteID: b.id, retryAfter: Date().addingTimeInterval(-1))
+        #expect(router.activeRemoteID(fakeID: fake.id) == a.id)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [a.id, b.id])
+    }
+
+    /// 手动选择发生在在途请求拿到响应头之前：迟到的完成不得覆盖它。
+    @Test
+    func manualSelectionIsNotOverriddenByStaleCompletion() throws {
+        let a = remote("A", "one"), b = remote("B", "two")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b], fakes: [fake]))
+
+        let staleEpoch = router.requestEpoch(fakeModelID: "main")   // 旧计划 a → b 的开始代次
+        router.selectRemote(fakeID: fake.id, remoteID: a.id)        // 用户手动选回 a
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: staleEpoch)
+
+        #expect(router.activeRemoteID(fakeID: fake.id) == a.id)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [a.id, b.id])
+    }
+
+    /// 同一代次的更早完成迟到时，不得撤销更晚的一次成功提升。
+    @Test
+    func delayedSameGenerationOlderSuccessDoesNotUndoNewerFallback() throws {
+        let a = remote("A", "one"), b = remote("B", "two"), c = remote("C", "three")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id, c.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b, c], fakes: [fake]))
+
+        let epoch = router.requestEpoch(fakeModelID: "main")        // 两个请求同代次开始
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: epoch)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [b.id, c.id, a.id])
+
+        // 请求2（同代次的旧计划）迟到完成：c 成功 → 忽略。
+        router.recordSuccess(fakeID: fake.id, remoteID: c.id, epoch: epoch)
+        #expect(router.activeRemoteID(fakeID: fake.id) == b.id)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [b.id, c.id, a.id])
+    }
+
+    /// 同目标重复成功保留代次；新代次请求前进到下一目标仍可提升。
+    @Test
+    func repeatedSuccessSameTargetRetainsEpochAndAllowsForwardPromotion() throws {
+        let a = remote("A", "one"), b = remote("B", "two"), c = remote("C", "three")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id, c.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b, c], fakes: [fake]))
+
+        let epoch0 = router.requestEpoch(fakeModelID: "main")
+        // 对持久起始的成功：有效首选未变，不提升代次（避免作废并发的其它计划）。
+        router.recordSuccess(fakeID: fake.id, remoteID: a.id, epoch: epoch0)
+        #expect(router.requestEpoch(fakeModelID: "main") == epoch0)
+        #expect(router.activeRemoteID(fakeID: fake.id) == a.id)
+
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: epoch0)   // 有效首选 a → b
+        let epoch1 = router.requestEpoch(fakeModelID: "main")
+        #expect(epoch1 == epoch0 + 1)
+
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: epoch1)   // 同目标，重复成功
+        #expect(router.requestEpoch(fakeModelID: "main") == epoch1)            // 代次保持
+        #expect(router.activeRemoteID(fakeID: fake.id) == b.id)
+
+        router.recordSuccess(fakeID: fake.id, remoteID: c.id, epoch: epoch1)   // 新代次前进
+        #expect(router.activeRemoteID(fakeID: fake.id) == c.id)
+    }
+
+    /// 关闭自动回退时忽略运行期首选，保留手动/持久起始目标。
+    @Test
+    func disabledAutoFallbackKeepsManualTargetIgnoringRuntimePreference() throws {
+        let a = remote("A", "one"), b = remote("B", "two")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b], fakes: [fake]))
+
+        let epoch = router.requestEpoch(fakeModelID: "main")
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: epoch)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [b.id, a.id])
+
+        var off = fake
+        off.autoFallback = false
+        router.update(AppConfig(port: 8788, remotes: [a, b], fakes: [off]))
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [a.id])
+        #expect(router.activeRemoteID(fakeID: fake.id) == a.id)
+    }
+
+    /// 首选失败后，同一在途请求按已生成的顺序继续前进到下一个候选并提升它。
+    @Test
+    func preferredRemoteProgressesForwardWhenItFails() throws {
+        let a = remote("A", "one"), b = remote("B", "two"), c = remote("C", "three")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id, c.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b, c], fakes: [fake]))
+
+        let epoch0 = router.requestEpoch(fakeModelID: "main")
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: epoch0)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [b.id, c.id, a.id])
+
+        // 下一次请求从 b 开始；b 失败后候选已按 b → c → a 生成，继续到 c 成功。
+        let epoch = router.requestEpoch(fakeModelID: "main")
+        router.recordFailure(remoteID: b.id)
+        router.recordSuccess(fakeID: fake.id, remoteID: c.id, epoch: epoch)
+        #expect(router.activeRemoteID(fakeID: fake.id) == c.id)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [c.id, a.id])
+    }
 }

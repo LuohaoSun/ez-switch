@@ -383,14 +383,23 @@ final class Router {
     private var fakesByID: [String: FakeModel] = [:]
     private var allFakes: [FakeModel] = []
     private var retryAfter: [UUID: Date] = [:]
+    /// 运行期“首选远端”：仅由手动选择或已完成的自动回退成功写入，candidates 与 UI 都从它读起。
     private var activeRemoteIDs: [UUID: UUID] = [:]
+    /// 权威代次：请求开始时取快照，完成时仅当代次未变才允许提升首选，防止迟到完成覆盖手动选择。
+    private var selectionEpochs: [UUID: UInt64] = [:]
+
+    private struct BindingSnapshot: Equatable {
+        let manualStart: UUID?
+        let ordered: [UUID]
+        let autoFallback: Bool
+    }
 
     func candidates(fakeModelID: String?, endpoint: EndpointKind? = nil) -> (fake: FakeModel, remotes: [RemoteModel])? {
         lock.lock()
         defer { lock.unlock() }
         guard let want = fakeModelID, let fake = fakesByID[want] else { return nil }
         var ordered = fake.orderedRemoteIDs.compactMap { remotes[$0] }
-        if let index = ordered.firstIndex(where: { $0.id == fake.startingRemoteID }) {
+        if let index = ordered.firstIndex(where: { $0.id == effectivePreferredRemoteID(for: fake) }) {
             ordered = Array(ordered[index...]) + Array(ordered[..<index])
         }
         if !fake.autoFallback { ordered = Array(ordered.prefix(1)) }
@@ -399,36 +408,63 @@ final class Router {
         return (fake, fake.autoFallback ? (available.isEmpty ? ordered : available) : ordered)
     }
 
+    /// 自动回退开启且首选仍有效时用它；否则用持久起始（禁用自动回退时始终如此）。
+    private func effectivePreferredRemoteID(for fake: FakeModel) -> UUID? {
+        if fake.autoFallback,
+           let preferred = activeRemoteIDs[fake.id],
+           fake.orderedRemoteIDs.contains(preferred) {
+            return preferred
+        }
+        return fake.startingRemoteID
+    }
+
     func recordFailure(remoteID: UUID, retryAfter date: Date = Date().addingTimeInterval(60)) {
         lock.lock()
         retryAfter[remoteID] = date
+        // 首选失败即失去资格；在途请求仍按已生成的候选顺序前进。
         activeRemoteIDs = activeRemoteIDs.filter { $0.value != remoteID }
         lock.unlock()
     }
 
+    /// 手动选择：立即成为首选并提升代次，使在途请求的迟到完成不能覆盖。
     func selectRemote(fakeID: UUID, remoteID: UUID) {
         lock.lock()
         activeRemoteIDs[fakeID] = remoteID
+        selectionEpochs[fakeID, default: 0] += 1
         retryAfter.removeValue(forKey: remoteID)
         lock.unlock()
     }
 
-    func recordAttempt(fakeID: UUID, remoteID: UUID) {
+    /// 完成成功时调用：远端须仍存在且仍绑定；代次未变（nil = 直接调用不校验）才提升首选，
+    /// 首选改变时提升代次。取消/流错误不会走到这里。
+    func recordSuccess(fakeID: UUID, remoteID: UUID, epoch: UInt64? = nil) {
         lock.lock()
+        defer { lock.unlock() }
+        guard let fake = allFakes.first(where: { $0.id == fakeID }),
+              remotes[remoteID] != nil,
+              fake.orderedRemoteIDs.contains(remoteID) else { return }
+        retryAfter.removeValue(forKey: remoteID)
+        if let epoch, epoch != (selectionEpochs[fakeID] ?? 0) { return }
+        // 仅当“有效首选”确实改变时才提升代次；对持久起始的成功不提升，避免作废并发计划。
+        if effectivePreferredRemoteID(for: fake) != remoteID {
+            selectionEpochs[fakeID, default: 0] += 1
+        }
         activeRemoteIDs[fakeID] = remoteID
-        lock.unlock()
     }
 
-    func recordSuccess(fakeID: UUID, remoteID: UUID) {
+    /// 请求开始时取的权威代次快照，用于完成时的过期校验。
+    func requestEpoch(fakeModelID: String) -> UInt64 {
         lock.lock()
-        retryAfter.removeValue(forKey: remoteID)
-        lock.unlock()
+        defer { lock.unlock() }
+        guard let fake = fakesByID[fakeModelID] else { return 0 }
+        return selectionEpochs[fake.id] ?? 0
     }
 
     func activeRemoteID(fakeID: UUID) -> UUID? {
         lock.lock()
         defer { lock.unlock() }
-        return activeRemoteIDs[fakeID] ?? allFakes.first(where: { $0.id == fakeID })?.startingRemoteID
+        guard let fake = allFakes.first(where: { $0.id == fakeID }) else { return nil }
+        return effectivePreferredRemoteID(for: fake)
     }
 
     func update(_ config: AppConfig) {
@@ -441,18 +477,35 @@ final class Router {
             if f[fake.fakeModelID] == nil { f[fake.fakeModelID] = fake }
         }
         lock.lock()
-        let previous = Dictionary(uniqueKeysWithValues: allFakes.map { ($0.id, $0.startingRemoteID) })
+        let previous = Dictionary(uniqueKeysWithValues: allFakes.map {
+            ($0.id, BindingSnapshot(manualStart: $0.selectedRemoteID,
+                                    ordered: $0.orderedRemoteIDs,
+                                    autoFallback: $0.autoFallback))
+        })
         remotes = r
         fakesByID = f
         allFakes = config.fakes
         let valid = Set(r.keys)
         retryAfter = retryAfter.filter { valid.contains($0.key) }
-        activeRemoteIDs = activeRemoteIDs.filter { fakeID, remoteID in
-            config.fakes.contains {
-                $0.id == fakeID && $0.orderedRemoteIDs.contains(remoteID) &&
-                    (previous[$0.id] ?? nil) == $0.startingRemoteID &&
-                    ($0.autoFallback || $0.startingRemoteID == remoteID)
+        // 手动起始/自动回退变化清首选；候选顺序或成员变化只提升代次作废旧计划，保留仍有效的首选。
+        for fake in config.fakes {
+            guard let prior = previous[fake.id] else { continue }
+            let manualChanged = prior.manualStart != fake.selectedRemoteID
+                || prior.autoFallback != fake.autoFallback
+            if manualChanged || prior.ordered != fake.orderedRemoteIDs {
+                selectionEpochs[fake.id, default: 0] += 1
             }
+            if manualChanged {
+                activeRemoteIDs.removeValue(forKey: fake.id)
+            }
+        }
+        let validFakeIDs = Set(config.fakes.map(\.id))
+        selectionEpochs = selectionEpochs.filter { validFakeIDs.contains($0.key) }
+        activeRemoteIDs = activeRemoteIDs.filter { fakeID, remoteID in
+            guard valid.contains(remoteID),
+                  let fake = config.fakes.first(where: { $0.id == fakeID }) else { return false }
+            return fake.orderedRemoteIDs.contains(remoteID)
+                && (fake.autoFallback || fake.startingRemoteID == remoteID)
         }
         lock.unlock()
     }
