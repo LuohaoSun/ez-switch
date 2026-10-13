@@ -12,7 +12,9 @@ import SQLite3
 final class UsageStore: @unchecked Sendable {
 
     /// 当前 schema 版本；升级时必须写迁移，且不得清空已有数据。
-    static let schemaVersion: Int32 = 1
+    /// v2：追加流式性能列（streaming/ttft_ms/request_ttft_ms/generation_ms/output_delta_count），
+    /// 全部为 nullable，旧记录保持 NULL，一律不重建表。
+    static let schemaVersion: Int32 = 2
 
     /// 成功写入或清除后发布，作为"今日用量"等派生视图的失效信号。
     /// 只发信号，不携带任何记录、token 数值、路径或凭证。
@@ -81,6 +83,17 @@ final class UsageStore: @unchecked Sendable {
             let db = try requireDB(force: true)
             try throwPendingWriteError()
             return try snapshot(db, from: from, to: to, grouping: grouping)
+        }
+    }
+
+    /// 统计 `[from, to)` 内的流式性能（TTFT / TPS），按 `grouping` 分组。
+    /// 独立于 `snapshot`：菜单/用量视图不触发性能查询，性能视图也不连带聚合 token。
+    /// 采样与分位数在 store 的 utility 队列上完成，不阻塞主线程。
+    func performanceSnapshot(from: Date, to: Date, grouping: UsageGrouping) async throws -> PerformanceSnapshot {
+        try await onQueue { [self] in
+            let db = try requireDB(force: true)
+            try throwPendingWriteError()
+            return try performanceSnapshot(db, from: from, to: to, grouping: grouping)
         }
     }
 
@@ -211,10 +224,17 @@ final class UsageStore: @unchecked Sendable {
     }
 
     /// schema 与 user_version 在同一事务内提交；失败回滚，已存在的库保持原样。
+    /// 各版本迁移步骤按序追加：只对“旧于该版本”的库执行，已是最新的库不再触碰。
     private func migrate(_ handle: OpaquePointer, from version: Int32) throws {
         try execute(handle, "BEGIN IMMEDIATE;")
         do {
+            // 全新库直接建出完整 v2 表；已存在的表此句为 no-op（不会补列，故下面按需 ALTER）。
             try execute(handle, Self.schemaSQL)
+            // v2：仅补齐缺失的 nullable 性能列。用 table_info 探测而非盲目 ALTER，
+            // 兼容 v0/v1 或被外部手工建过的旧表（可能已含部分新列），避免 duplicate column。
+            if version < 2 {
+                try ensurePerformanceColumns(handle)
+            }
             if version < Self.schemaVersion {
                 try execute(handle, "PRAGMA user_version = \(Self.schemaVersion);")
             }
@@ -223,6 +243,31 @@ final class UsageStore: @unchecked Sendable {
             try? execute(handle, "ROLLBACK;")
             throw error
         }
+    }
+
+    /// 逐列探测 `usage_records`，只为缺失的性能列执行 `ALTER TABLE ... ADD COLUMN`（nullable）。
+    /// 旧行在这些列上保持 NULL，不重写、不重建表。
+    private func ensurePerformanceColumns(_ handle: OpaquePointer) throws {
+        let existing = try Set(tableColumns(handle, table: "usage_records"))
+        for column in Self.performanceColumns where !existing.contains(column.name) {
+            try execute(handle, "ALTER TABLE usage_records ADD COLUMN \(column.name) \(column.definition);")
+        }
+    }
+
+    private func tableColumns(_ handle: OpaquePointer, table: String) throws -> [String] {
+        // table 为静态字面量，非用户输入。
+        let statement = try prepare(handle, "PRAGMA table_info(\(table));")
+        defer { sqlite3_finalize(statement) }
+        var columns: [String] = []
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else {
+                throw UsageStoreError.sqlite(message: lastErrorMessage(handle), code: sqlite3_errcode(handle))
+            }
+            if let name = text(statement, 1) { columns.append(name) }
+        }
+        return columns
     }
 
     private func userVersion(_ handle: OpaquePointer) throws -> Int32 {
@@ -249,8 +294,9 @@ final class UsageStore: @unchecked Sendable {
         INSERT OR IGNORE INTO usage_records
           (id, request_id, ts, route_id, route_name, remote_id, provider, model, endpoint,
            attempt, status, outcome, duration_ms, input_tokens, output_tokens,
-           cached_input_tokens, cache_write_tokens, reasoning_tokens)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+           cached_input_tokens, cache_write_tokens, reasoning_tokens,
+           streaming, ttft_ms, request_ttft_ms, generation_ms, output_delta_count)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
         """
         let statement = try prepare(db, sql)
         defer { sqlite3_finalize(statement) }
@@ -272,7 +318,29 @@ final class UsageStore: @unchecked Sendable {
         bindOptionalInt(statement, 16, record.tokens.cachedInput)
         bindOptionalInt(statement, 17, record.tokens.cacheWrite)
         bindOptionalInt(statement, 18, record.tokens.reasoning)
+        bindPerformance(statement, startingAt: 19, record.performance)
         try stepToDone(db, statement)
+    }
+
+    /// 性能列整体落盘：`performance == nil` 时全写 NULL（旧/非流式记录无性能数据）。
+    /// 时长先做合法性归一：非有限或负数一律归 NULL，避免污染后续分位数。
+    private func bindPerformance(_ statement: OpaquePointer, startingAt index: Int32,
+                                 _ performance: UsagePerformance?) {
+        guard let performance else {
+            for offset in 0..<5 { sqlite3_bind_null(statement, index + Int32(offset)) }
+            return
+        }
+        sqlite3_bind_int(statement, index, performance.streaming ? 1 : 0)
+        bindOptionalDouble(statement, index + 1, Self.sanitizedDuration(performance.ttftMS))
+        bindOptionalDouble(statement, index + 2, Self.sanitizedDuration(performance.requestTTFTMS))
+        bindOptionalDouble(statement, index + 3, Self.sanitizedDuration(performance.generationMS))
+        sqlite3_bind_int64(statement, index + 4, Int64(max(0, performance.outputDeltaCount)))
+    }
+
+    /// 非有限或负数时长视为无效 → NULL；`nil` 保持 `nil`。
+    private static func sanitizedDuration(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        return value
     }
 
     // MARK: - 查询实现
@@ -426,6 +494,145 @@ final class UsageStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - 性能聚合
+
+    /// 单趟扫描区间内所有记录，同时聚合成总览与分组。
+    ///
+    /// - `attempts` 统计全部记录（含失败 / 取消 / 非流式）。
+    /// - `successfulStreamingAttempts` = `outcome=success` 且 HTTP 2xx 且流式的尝试数，
+    ///   是 TTFT 的资格分母（无论是否带 usage）。
+    /// - TTFT 样本：成功流式且有合法 ttft；缺 usage 不影响 TTFT。
+    /// - TPS 样本：成功流式且 `UsagePerformance.tps(outputTokens:)` 非空
+    ///   （内含有效 ttft、outputTokens≥2、deltaCount≥2、generation>0 的要求）。
+    /// - 失败 / 取消保留在 `attempts` 中，但不进入任何分位数样本。
+    /// - 分位数用实际样本的最近秩（见 `nearestRankPercentile`），全量参与，不截尾。
+    private func performanceSnapshot(_ db: OpaquePointer, from: Date, to: Date,
+                                     grouping: UsageGrouping) throws -> PerformanceSnapshot {
+        var snapshot = PerformanceSnapshot()
+        guard from < to else { return snapshot }
+        let sql = """
+        SELECT route_id, route_name, provider, model, outcome, status, output_tokens,
+               streaming, ttft_ms, request_ttft_ms, generation_ms, output_delta_count
+        FROM usage_records
+        WHERE ts >= ? AND ts < ?
+        ORDER BY ts ASC, id ASC;
+        """
+        let statement = try prepare(db, sql)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, from.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 2, to.timeIntervalSince1970)
+
+        let overall = PerformanceAggregator()
+        var grouped: [String: PerformanceAggregator] = [:]
+
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else {
+                throw UsageStoreError.sqlite(message: lastErrorMessage(db), code: sqlite3_errcode(db))
+            }
+            let routeID = text(statement, 0) ?? ""
+            let routeName = text(statement, 1) ?? routeID
+            let provider = text(statement, 2) ?? ""
+            let model = text(statement, 3) ?? ""
+            let outcome = text(statement, 4) ?? ""
+            let status = optionalInt(statement, 5)
+            let outputTokens = optionalInt(statement, 6)
+            let performance = readPerformance(statement, streamingIndex: 7)
+
+            overall.add(outcome: outcome, status: status, outputTokens: outputTokens, performance: performance)
+
+            let key: String
+            let title: String
+            let subtitle: String
+            switch grouping {
+            case .route:
+                // 记录按 ts 升序，末次写入即最近一次的名字。
+                key = routeID
+                title = routeName
+                subtitle = ""
+            case .provider:
+                key = provider
+                title = provider
+                subtitle = ""
+            case .model:
+                // 供应商 + 模型共同构成身份，避免不同供应商的同名模型被合并。
+                // 用长度前缀编码（`<utf8字节数>:<provider><model>`），即便 provider/model 含分隔符也无碰撞。
+                key = "\(provider.utf8.count):\(provider)\(model)"
+                title = model
+                subtitle = provider
+            }
+            let aggregator: PerformanceAggregator
+            if let existing = grouped[key] {
+                aggregator = existing
+                aggregator.title = title
+                aggregator.subtitle = subtitle
+            } else {
+                aggregator = PerformanceAggregator(title: title, subtitle: subtitle)
+                grouped[key] = aggregator
+            }
+            aggregator.add(outcome: outcome, status: status, outputTokens: outputTokens,
+                           performance: performance)
+        }
+
+        snapshot.summary = overall.summary()
+        snapshot.groups = grouped
+            .map { PerformanceGroupRow(id: $0.key, title: $0.value.title,
+                                       subtitle: $0.value.subtitle, summary: $0.value.summary()) }
+            .sorted { lhs, rhs in
+                if lhs.summary.attempts != rhs.summary.attempts {
+                    return lhs.summary.attempts > rhs.summary.attempts
+                }
+                return lhs.id < rhs.id
+            }
+        return snapshot
+    }
+
+    /// 单组/总览的性能累加器（引用类型：字典内原地追加样本，避免逐行复制样本数组）。
+    private final class PerformanceAggregator {
+        var title: String
+        var subtitle: String
+        private var attempts = 0
+        private var successfulStreamingAttempts = 0
+        private var ttft: [Double] = []
+        private var requestTTFT: [Double] = []
+        private var tps: [Double] = []
+
+        init(title: String = "", subtitle: String = "") {
+            self.title = title
+            self.subtitle = subtitle
+        }
+
+        func add(outcome: String, status: Int?, outputTokens: Int?, performance: UsagePerformance?) {
+            attempts += 1
+            guard let performance, performance.streaming,
+                  outcome.lowercased() == "success",
+                  let status, (200...299).contains(status) else { return }
+            successfulStreamingAttempts += 1
+            if let ttftMS = performance.ttftMS { ttft.append(ttftMS) }
+            if let requestTTFTMS = performance.requestTTFTMS { requestTTFT.append(requestTTFTMS) }
+            // TPS 需合法生成时长与足量输出样本；有效 TTFT 由 `tps` 内部把关。缺 usage 的记录不产生 TPS 样本。
+            if let value = performance.tps(outputTokens: outputTokens) {
+                tps.append(value)
+            }
+        }
+
+        func summary() -> PerformanceSummary {
+            var summary = PerformanceSummary()
+            summary.attempts = attempts
+            summary.successfulStreamingAttempts = successfulStreamingAttempts
+            summary.ttftSamples = ttft.count
+            summary.requestTTFTSamples = requestTTFT.count
+            summary.tpsSamples = tps.count
+            summary.ttftP50MS = nearestRankPercentile(ttft, 0.5)
+            summary.ttftP95MS = nearestRankPercentile(ttft, 0.95)
+            summary.requestTTFTP50MS = nearestRankPercentile(requestTTFT, 0.5)
+            summary.requestTTFTP95MS = nearestRankPercentile(requestTTFT, 0.95)
+            summary.tpsP50 = nearestRankPercentile(tps, 0.5)
+            return summary
+        }
+    }
+
     // MARK: - CSV
 
     private func exportCSV(_ db: OpaquePointer, from: Date, to: Date) throws -> String {
@@ -439,7 +646,8 @@ final class UsageStore: @unchecked Sendable {
         let sql = """
         SELECT ts, request_id, route_id, route_name, provider, model, endpoint, attempt, status,
                outcome, duration_ms, input_tokens, output_tokens, cached_input_tokens,
-               cache_write_tokens, reasoning_tokens
+               cache_write_tokens, reasoning_tokens,
+               streaming, ttft_ms, request_ttft_ms, generation_ms, output_delta_count
         FROM usage_records
         WHERE ts >= ? AND ts < ?
         ORDER BY ts ASC, id ASC;
@@ -455,6 +663,8 @@ final class UsageStore: @unchecked Sendable {
             guard step == SQLITE_ROW else {
                 throw UsageStoreError.sqlite(message: lastErrorMessage(db), code: sqlite3_errcode(db))
             }
+            let outputTokens = optionalInt(statement, 12)
+            let performance = readPerformance(statement, streamingIndex: 16)
             let timestamp = iso.string(from: Date(timeIntervalSince1970: sqlite3_column_double(statement, 0)))
             let fields: [String] = [
                 timestamp,
@@ -469,14 +679,29 @@ final class UsageStore: @unchecked Sendable {
                 text(statement, 9) ?? "",
                 String(sqlite3_column_int64(statement, 10)),
                 optionalInt(statement, 11).map(String.init) ?? "",
-                optionalInt(statement, 12).map(String.init) ?? "",
+                outputTokens.map(String.init) ?? "",
                 optionalInt(statement, 13).map(String.init) ?? "",
                 optionalInt(statement, 14).map(String.init) ?? "",
                 optionalInt(statement, 15).map(String.init) ?? "",
+                // 性能列：无性能数据（旧记录 / 非流式）留空；无效值也留空，不写成 0。
+                // CSV 是原始观测导出：失败/取消行若确有采样也会保留其 tps，但这些行不进入分位数。
+                performance.map { $0.streaming ? "true" : "false" } ?? "",
+                Self.csvNumber(performance?.ttftMS),
+                Self.csvNumber(performance?.requestTTFTMS),
+                Self.csvNumber(performance?.generationMS),
+                performance.map { String($0.outputDeltaCount) } ?? "",
+                Self.csvNumber(performance?.tps(outputTokens: outputTokens)),
             ]
             lines.append(fields.map(Self.csvField).joined(separator: ","))
         }
         return lines.joined(separator: "\r\n") + "\r\n"
+    }
+
+    /// 数值单元格格式化：`nil` 或非有限值输出空串（不写成 0，避免把“无数据”误当“零”）。
+    /// 固定 en_US_POSIX + 3 位小数，避免受系统区域设置影响（如逗号小数点）。
+    private static func csvNumber(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "" }
+        return String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), arguments: [value])
     }
 
     /// 中和公式注入：字符串单元格若以 `=` `+` `-` `@` / TAB / CR 开头则加前导单引号。
@@ -530,6 +755,11 @@ final class UsageStore: @unchecked Sendable {
         else { sqlite3_bind_null(statement, index) }
     }
 
+    private func bindOptionalDouble(_ statement: OpaquePointer, _ index: Int32, _ value: Double?) {
+        if let value { sqlite3_bind_double(statement, index, value) }
+        else { sqlite3_bind_null(statement, index) }
+    }
+
     private func text(_ statement: OpaquePointer, _ index: Int32) -> String? {
         guard sqlite3_column_type(statement, index) != SQLITE_NULL,
               let pointer = sqlite3_column_text(statement, index) else { return nil }
@@ -539,6 +769,23 @@ final class UsageStore: @unchecked Sendable {
     private func optionalInt(_ statement: OpaquePointer, _ index: Int32) -> Int? {
         guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
         return Int(sqlite3_column_int64(statement, index))
+    }
+
+    /// 读取时长列并对磁盘上的历史值再做一次防御性归一：非有限或负数归 `nil`。
+    private func sanitizedDouble(_ statement: OpaquePointer, _ index: Int32) -> Double? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        return Self.sanitizedDuration(sqlite3_column_double(statement, index))
+    }
+
+    /// 从 `streaming` 起始列读取一条性能采样；`streaming IS NULL` 表示该记录无性能数据。
+    /// 其后四列依序为 ttft_ms、request_ttft_ms、generation_ms、output_delta_count。
+    private func readPerformance(_ statement: OpaquePointer, streamingIndex: Int32) -> UsagePerformance? {
+        guard sqlite3_column_type(statement, streamingIndex) != SQLITE_NULL else { return nil }
+        return UsagePerformance(streaming: sqlite3_column_int(statement, streamingIndex) != 0,
+                                ttftMS: sanitizedDouble(statement, streamingIndex + 1),
+                                requestTTFTMS: sanitizedDouble(statement, streamingIndex + 2),
+                                generationMS: sanitizedDouble(statement, streamingIndex + 3),
+                                outputDeltaCount: Int(sqlite3_column_int64(statement, streamingIndex + 4)))
     }
 
     private func readTotals(_ statement: OpaquePointer, offset: Int32) -> UsageTotals {
@@ -605,7 +852,12 @@ final class UsageStore: @unchecked Sendable {
         output_tokens INTEGER,
         cached_input_tokens INTEGER,
         cache_write_tokens INTEGER,
-        reasoning_tokens INTEGER
+        reasoning_tokens INTEGER,
+        streaming INTEGER,
+        ttft_ms REAL,
+        request_ttft_ms REAL,
+        generation_ms REAL,
+        output_delta_count INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_records(ts);
     CREATE INDEX IF NOT EXISTS idx_usage_request ON usage_records(request_id);
@@ -614,7 +866,17 @@ final class UsageStore: @unchecked Sendable {
     CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records(provider, model);
     """
 
-    private static let csvHeader = "timestamp,requestID,routeID,routeName,provider,model,endpoint,attempt,status,outcome,durationMS,inputTokens,outputTokens,cachedInputTokens,cacheWriteTokens,reasoningTokens"
+    /// v2 追加的 nullable 性能列（列名 + 定义）。迁移时按 table_info 只补缺失项。
+    /// 列顺序：streaming、ttft_ms、request_ttft_ms、generation_ms、output_delta_count。
+    private static let performanceColumns: [(name: String, definition: String)] = [
+        ("streaming", "INTEGER"),
+        ("ttft_ms", "REAL"),
+        ("request_ttft_ms", "REAL"),
+        ("generation_ms", "REAL"),
+        ("output_delta_count", "INTEGER"),
+    ]
+
+    private static let csvHeader = "timestamp,requestID,routeID,routeName,provider,model,endpoint,attempt,status,outcome,durationMS,inputTokens,outputTokens,cachedInputTokens,cacheWriteTokens,reasoningTokens,streaming,ttftMS,requestTTFTMS,generationMS,outputDeltaCount,tps"
 }
 
 // MARK: - 错误

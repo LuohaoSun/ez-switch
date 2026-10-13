@@ -133,4 +133,116 @@ struct UsageFormatTests {
         #expect(UsageTextFormatter.count(1_234_567) == "1,234,567")
         #expect(UsageTextFormatter.sanitize("a\tb") == "a\\tb")
     }
+
+    // MARK: - Performance
+
+    private func performance(_ object: [String: Any]) throws -> PerformanceReport {
+        let parsed = try UsageResponseParser.parse(
+            UsageFixture.envelope(usage: UsageFixture.usageObject(), performance: object),
+            expectPerformance: true)
+        return try #require(parsed.performance)
+    }
+
+    @Test func routeGroupingReportsRequestTTFTWithFallback() throws {
+        let report = try performance(UsageFixture.performanceObject(grouping: "route"))
+        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
+        #expect(text.hasPrefix("Performance (route)\nTTFT basis: request (includes fallback)\n"))
+        // Request-level values (1500/2400 ms) are shown, not the attempt-level 1200/2100 ms.
+        #expect(text.contains("TTFT P50: 1.50 s  TTFT P95: 2.40 s"))
+        #expect(!text.contains("TTFT P50: 1.20 s"))
+        #expect(text.contains("Successful streaming: 5/10 attempts"))
+        #expect(text.contains("TTFT samples: 4  TPS samples: 3"))
+        #expect(text.contains("TPS P50: 42.3 tok/s"))
+    }
+
+    @Test func nonRouteGroupingReportsUpstreamAttemptTTFT() throws {
+        let report = try performance(UsageFixture.performanceObject(grouping: "model"))
+        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
+        #expect(text.hasPrefix("Performance (model)\nTTFT basis: upstream attempt\n"))
+        #expect(text.contains("TTFT P50: 1.20 s  TTFT P95: 2.10 s"))
+        #expect(!text.contains("TTFT P50: 1.50 s"))
+    }
+
+    @Test func durationAndRateHelpersUseExplicitUnits() {
+        #expect(UsageTextFormatter.duration(850) == "850 ms")
+        #expect(UsageTextFormatter.duration(999) == "999 ms")
+        #expect(UsageTextFormatter.duration(1200) == "1.20 s")
+        #expect(UsageTextFormatter.duration(nil) == "—")
+        #expect(UsageTextFormatter.duration(Double.nan) == "—")
+        #expect(UsageTextFormatter.duration(Double.infinity) == "—")
+        #expect(UsageTextFormatter.duration(-1) == "—")
+        #expect(UsageTextFormatter.rate(42.34) == "42.3 tok/s")
+        #expect(UsageTextFormatter.rate(nil) == "—")
+        #expect(UsageTextFormatter.rate(Double.nan) == "—")
+        #expect(UsageTextFormatter.rate(-2) == "—")
+    }
+
+    @Test func noSamplesShowDashesAndANote() throws {
+        let summary = UsageFixture.performanceSummary(attempts: 0, successfulStreamingAttempts: 0,
+                                                      ttftSamples: 0, requestTTFTSamples: 0, tpsSamples: 0,
+                                                      ttftP50MS: nil, ttftP95MS: nil,
+                                                      requestTTFTP50MS: nil, requestTTFTP95MS: nil,
+                                                      tpsP50: nil)
+        let report = try performance(UsageFixture.performanceObject(groupCount: 0, summary: summary, groups: []))
+        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
+        #expect(text.contains("No performance data recorded."))
+        #expect(text.contains("TTFT P50: —  TTFT P95: —"))
+        #expect(text.contains("TPS P50: —"))
+    }
+
+    @Test func routeGroupingUsesRequestTTFSampleCount() throws {
+        let summary = UsageFixture.performanceSummary(ttftSamples: 9, requestTTFTSamples: 4, tpsSamples: 3)
+        let report = try performance(UsageFixture.performanceObject(grouping: "route", summary: summary))
+        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
+        // Route grouping shows requestTTFTSamples (4), not ttftSamples (9).
+        #expect(text.contains("TTFT samples: 4  TPS samples: 3"))
+        #expect(!text.contains("TTFT samples: 9"))
+    }
+
+    @Test func routeGroupingWithoutRequestTTFTWarnsAndDoesNotSubstituteUpstream() throws {
+        let summary = UsageFixture.performanceSummary(ttftSamples: 5, requestTTFTSamples: nil,
+                                                      requestTTFTP50MS: nil, requestTTFTP95MS: nil)
+        let route = try performance(UsageFixture.performanceObject(grouping: "route", summary: summary))
+        let routeText = UsageTextFormatter.renderPerformance(route, options: UsageOptions())
+        #expect(routeText.contains("TTFT samples: 0  TPS samples: 3"))
+        #expect(routeText.contains("Warning: no request-level TTFT samples"))
+        #expect(routeText.contains("TTFT P50: —"))
+
+        // The same summary under model grouping uses the upstream attempt count.
+        let model = try performance(UsageFixture.performanceObject(grouping: "model", summary: summary))
+        let modelText = UsageTextFormatter.renderPerformance(model, options: UsageOptions())
+        #expect(modelText.contains("TTFT samples: 5"))
+        #expect(!modelText.contains("Warning:"))
+        #expect(modelText.contains("TTFT P50: 1.20 s"))
+    }
+
+    @Test func truncatedPerformanceGroupsAreAnnounced() throws {
+        let report = try performance(UsageFixture.performanceObject(groupCount: 5, truncated: true))
+        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
+        #expect(text.contains("Groups — showing 1 of 5 groups; raise --limit to see more"))
+    }
+
+    @Test func performanceGroupTitlesAreSanitized() throws {
+        let groups: [[String: Any]] = [[
+            "id": "x", "title": "evil\u{1B}[31m", "subtitle": "sub\nline",
+            "summary": UsageFixture.performanceSummary(),
+        ]]
+        let report = try performance(UsageFixture.performanceObject(groups: groups))
+        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
+        #expect(text.contains("evil\\u{1B}[31m"))
+        #expect(text.contains("(sub\\nline)"))
+        #expect(!text.contains("\u{1B}"))
+    }
+
+    @Test func combinedJSONKeepsUsageAndPerformanceObjectsSeparate() throws {
+        let usage = UsageFixture.usageObject()
+        let performance = UsageFixture.performanceObject()
+        let text = try UsageTextFormatter.renderCombinedJSON(usage: usage, performance: performance)
+        let object = try #require(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        #expect(object["usage"] != nil)
+        let perf = try #require(object["performance"] as? [String: Any])
+        #expect(perf["grouping"] as? String == "model")
+        #expect((perf["summary"] as? [String: Any])?["attempts"] as? Int == 10)
+        #expect(Set(object.keys) == ["usage", "performance"])
+    }
 }

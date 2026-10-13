@@ -1,4 +1,5 @@
 import Darwin
+import Dispatch
 import Foundation
 import NIOHTTP1
 import Testing
@@ -126,6 +127,11 @@ private final class StringListSpy: @unchecked Sendable {
     }
 }
 
+/// Use uptime so system sleep and wall-clock changes do not consume the wait budget.
+private func uptimeDeadline(_ timeout: TimeInterval) -> DispatchTime {
+    DispatchTime.now() + .milliseconds(Int((timeout * 1000).rounded()))
+}
+
 /// Minimal raw TCP HTTP client. Closing the socket is a real FIN, so the proxy's
 /// `channelInactive` fires deterministically (URLSession cancellation can be
 /// deferred by connection pooling).
@@ -163,8 +169,8 @@ private final class RawSocketClient {
         let needle = Data(marker.utf8)
         var received = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let deadline = uptimeDeadline(timeout)
+        while DispatchTime.now() < deadline {
             let count = read(fd, &chunk, chunk.count)
             if count > 0 {
                 received.append(contentsOf: chunk[0..<count])
@@ -191,8 +197,8 @@ private final class RawSocketClient {
         let secondData = Data(second.utf8)
         var received = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let deadline = uptimeDeadline(timeout)
+        while DispatchTime.now() < deadline {
             let count = read(fd, &chunk, chunk.count)
             if count > 0 {
                 received.append(contentsOf: chunk[0..<count])
@@ -213,8 +219,8 @@ private final class RawSocketClient {
     func readToEnd(timeout: TimeInterval) -> Bool {
         guard fd >= 0 else { return true }
         var chunk = [UInt8](repeating: 0, count: 4096)
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let deadline = uptimeDeadline(timeout)
+        while DispatchTime.now() < deadline {
             let count = read(fd, &chunk, chunk.count)
             if count > 0 { continue }
             if count == 0 { return true }
@@ -249,8 +255,8 @@ struct UsageIntegrationTests {
     }
 
     private func waitFor(_ spy: UsageRecordSpy, count: Int, timeout: TimeInterval = 5) async -> [UsageRecord] {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let deadline = uptimeDeadline(timeout)
+        while DispatchTime.now() < deadline {
             let records = spy.records
             if records.count >= count { return records }
             try? await Task.sleep(nanoseconds: 25_000_000)
@@ -259,8 +265,8 @@ struct UsageIntegrationTests {
     }
 
     private func waitForEvents(_ spy: AutoFallbackSpy, count: Int, timeout: TimeInterval = 5) async -> [AutoFallbackEvent] {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let deadline = uptimeDeadline(timeout)
+        while DispatchTime.now() < deadline {
             let events = spy.events
             if events.count >= count { return events }
             try? await Task.sleep(nanoseconds: 25_000_000)

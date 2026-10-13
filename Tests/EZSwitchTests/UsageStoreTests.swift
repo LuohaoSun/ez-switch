@@ -37,14 +37,16 @@ struct UsageStoreTests {
         output: Int? = 5,
         cachedInput: Int? = nil,
         cacheWrite: Int? = nil,
-        reasoning: Int? = nil
+        reasoning: Int? = nil,
+        performance: UsagePerformance? = nil
     ) -> UsageRecord {
         UsageRecord(id: id, requestID: requestID, timestamp: timestamp, routeID: routeID,
                     routeName: routeName, remoteID: remoteID, provider: provider, model: model,
                     endpoint: endpoint, attempt: attempt, status: status, outcome: outcome,
                     durationMS: durationMS,
                     tokens: UsageTokens(input: input, output: output, cachedInput: cachedInput,
-                                        cacheWrite: cacheWrite, reasoning: reasoning))
+                                        cacheWrite: cacheWrite, reasoning: reasoning),
+                    performance: performance)
     }
 
     private func day(_ year: Int, _ month: Int, _ day: Int, hour: Int = 12, minute: Int = 0) -> Date {
@@ -391,6 +393,36 @@ struct UsageStoreTests {
         #expect(lines[0].hasPrefix("timestamp,requestID"))
     }
 
+    @Test
+    func csvAppendsPerformanceColumnsWithBlanksForLegacyRows() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let start = day(2026, 5, 10)
+        let store = UsageStore(url: url)
+        // 旧记录：无性能数据 → 新列留空（不写成 0）。
+        store.record(record(timestamp: start))
+        // 流式记录：带性能数据，tps = 20 * 1000 / 2000 = 10。
+        store.record(record(timestamp: start.addingTimeInterval(1), output: 20,
+                            performance: UsagePerformance(streaming: true, ttftMS: 120.5,
+                                                          requestTTFTMS: 40.25, generationMS: 2000,
+                                                          outputDeltaCount: 8)))
+        try await store.flush()
+
+        let csv = try await store.exportCSV(from: start.addingTimeInterval(-1),
+                                            to: start.addingTimeInterval(3600))
+        let lines = csv.components(separatedBy: "\r\n").filter { !$0.isEmpty }
+        #expect(lines.count == 3) // header + 2 rows
+        #expect(lines[0].hasSuffix("reasoningTokens,streaming,ttftMS,requestTTFTMS,generationMS,outputDeltaCount,tps"))
+
+        let legacy = lines[1].components(separatedBy: ",")
+        #expect(legacy.count == 22)
+        #expect(legacy.suffix(6).allSatisfy { $0.isEmpty })
+
+        let streaming = lines[2].components(separatedBy: ",")
+        #expect(streaming.count == 22)
+        #expect(Array(streaming.suffix(6)) == ["true", "120.500", "40.250", "2000.000", "8", "10.000"])
+    }
+
     // MARK: - 清理
 
     @Test
@@ -422,17 +454,57 @@ struct UsageStoreTests {
         store.record(record(timestamp: start))
         try await store.flush()
 
-        try rawExec(url, "PRAGMA user_version = 2;")
-        #expect(try rawUserVersion(url) == 2)
+        try rawExec(url, "PRAGMA user_version = 3;")
+        #expect(try rawUserVersion(url) == 3)
 
         let reopened = UsageStore(url: url)
-        await #expect(throws: UsageStoreError.futureSchema(found: 2, supported: 1)) {
+        await #expect(throws: UsageStoreError.futureSchema(found: 3, supported: 2)) {
             _ = try await reopened.snapshot(from: start.addingTimeInterval(-1),
                                             to: start.addingTimeInterval(3600), grouping: .route)
         }
         // 数据与版本均未被破坏性重置。
+        #expect(try rawUserVersion(url) == 3)
+        #expect(try rawCount(url) == 1)
+    }
+
+    @Test
+    func migratesV1DatabasePreservingRowsAndAddingNullPerformanceColumns() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let start = day(2026, 5, 10)
+
+        // 构造一个货真价实的 v1 库：v1 表结构 + user_version=1 + 一条旧记录。
+        try rawExec(url, Self.v1SchemaSQL)
+        try rawExec(url, """
+        INSERT INTO usage_records
+          (id, request_id, ts, route_id, route_name, remote_id, provider, model, endpoint,
+           attempt, status, outcome, duration_ms, input_tokens, output_tokens)
+        VALUES ('legacy', 'req', \(start.timeIntervalSince1970), 'r1', 'R1', 'm1', 'OpenAI',
+                'gpt-4o', 'chat', 1, 200, 'success', 100, 10, 5);
+        """)
+        try rawExec(url, "PRAGMA user_version = 1;")
+        #expect(try rawUserVersion(url) == 1)
+        #expect(try rawHasColumn(url, "streaming") == false)
+
+        // 打开即迁移到 v2（事务内 ALTER ADD），旧行保留、性能列为 NULL。
+        let store = UsageStore(url: url)
+        let snapshot = try await store.snapshot(from: start.addingTimeInterval(-1),
+                                                to: start.addingTimeInterval(3600), grouping: .route)
+        #expect(snapshot.totals.attempts == 1)
+        #expect(snapshot.totals.input == 10)
+        #expect(snapshot.totals.output == 5)
+
+        // 迁移后可见新的 nullable 列，且未重建（旧行仍在）。
+        try await store.flush()
         #expect(try rawUserVersion(url) == 2)
         #expect(try rawCount(url) == 1)
+        #expect(try rawHasColumn(url, "streaming"))
+        #expect(try rawHasColumn(url, "ttft_ms"))
+        #expect(try rawHasColumn(url, "request_ttft_ms"))
+        #expect(try rawHasColumn(url, "generation_ms"))
+        #expect(try rawHasColumn(url, "output_delta_count"))
+        #expect(try rawIsNull(url, "legacy", "streaming"))
+        #expect(try rawIsNull(url, "legacy", "ttft_ms"))
     }
 
     @Test
@@ -487,6 +559,30 @@ struct UsageStoreTests {
 
     // MARK: - 原始 sqlite 辅助（仅测试）
 
+    /// v1 表结构（无性能列），用于构造真实的旧库以验证迁移。
+    private static let v1SchemaSQL = """
+    CREATE TABLE IF NOT EXISTS usage_records (
+        id TEXT PRIMARY KEY NOT NULL,
+        request_id TEXT NOT NULL,
+        ts REAL NOT NULL,
+        route_id TEXT NOT NULL,
+        route_name TEXT NOT NULL,
+        remote_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        status INTEGER,
+        outcome TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cached_input_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        reasoning_tokens INTEGER
+    );
+    """
+
     private func rawExec(_ url: URL, _ sql: String) throws {
         var handle: OpaquePointer?
         guard sqlite3_open(url.path, &handle) == SQLITE_OK, let handle else {
@@ -535,5 +631,48 @@ struct UsageStoreTests {
             throw NSError(domain: "test", code: 2, userInfo: [NSLocalizedDescriptionKey: "step failed"])
         }
         return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func rawHasColumn(_ url: URL, _ column: String) throws -> Bool {
+        for columnName in try rawColumns(url) where columnName == column { return true }
+        return false
+    }
+
+    private func rawColumns(_ url: URL) throws -> [String] {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK, let handle else {
+            throw NSError(domain: "test", code: 0, userInfo: [NSLocalizedDescriptionKey: "open failed"])
+        }
+        defer { sqlite3_close_v2(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "PRAGMA table_info(usage_records);", -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "prepare failed"])
+        }
+        defer { sqlite3_finalize(statement) }
+        var columns: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let pointer = sqlite3_column_text(statement, 1) { columns.append(String(cString: pointer)) }
+        }
+        return columns
+    }
+
+    private func rawIsNull(_ url: URL, _ id: String, _ column: String) throws -> Bool {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK, let handle else {
+            throw NSError(domain: "test", code: 0, userInfo: [NSLocalizedDescriptionKey: "open failed"])
+        }
+        defer { sqlite3_close_v2(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT \(column) FROM usage_records WHERE id = ?;", -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "prepare failed"])
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw NSError(domain: "test", code: 2, userInfo: [NSLocalizedDescriptionKey: "step failed"])
+        }
+        return sqlite3_column_type(statement, 0) == SQLITE_NULL
     }
 }

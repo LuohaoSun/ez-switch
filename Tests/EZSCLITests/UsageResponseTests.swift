@@ -84,4 +84,100 @@ struct UsageResponseTests {
         #expect(parsed.report.days.isEmpty)
         #expect(parsed.report.groups.isEmpty)
     }
+
+    // MARK: - Performance
+
+    @Test func decodesPerformanceWhenExpected() throws {
+        let performance = UsageFixture.performanceObject(grouping: "model", groupCount: 2, truncated: true)
+        let parsed = try UsageResponseParser.parse(
+            UsageFixture.envelope(usage: UsageFixture.usageObject(), performance: performance),
+            expectPerformance: true)
+
+        // The existing usage contract is untouched.
+        #expect(parsed.report.totals.total == 1_500)
+        let report = try #require(parsed.performance)
+        #expect(report.grouping == "model")
+        #expect(report.limit == 100)
+        #expect(report.groupCount == 2)
+        #expect(report.truncated)
+        #expect(report.summary.attempts == 10)
+        #expect(report.summary.successfulStreamingAttempts == 5)
+        #expect(report.summary.ttftSamples == 4)
+        #expect(report.summary.requestTTFTSamples == 4)
+        #expect(report.summary.tpsSamples == 3)
+        #expect(report.summary.ttftP50MS == 1200)
+        #expect(report.summary.ttftP95MS == 2100)
+        #expect(report.summary.requestTTFTP50MS == 1500)
+        #expect(report.summary.requestTTFTP95MS == 2400)
+        #expect(report.summary.tpsP50 == 42.3)
+        #expect(report.groups.first?.title == "gpt-4o")
+        #expect(report.groups.first?.subtitle == "OpenAI")
+        #expect(report.groups.first?.summary.tpsP50 == 42.3)
+        #expect(parsed.performanceJSONObject != nil)
+    }
+
+    @Test func nullPerformanceStatsDecodeAsNil() throws {
+        let summary = UsageFixture.performanceSummary(ttftSamples: 0, requestTTFTSamples: 0, tpsSamples: 0,
+                                                      ttftP50MS: nil, ttftP95MS: nil,
+                                                      requestTTFTP50MS: nil, requestTTFTP95MS: nil,
+                                                      tpsP50: nil)
+        let performance = UsageFixture.performanceObject(summary: summary)
+        // Serialised as JSON null, not omitted.
+        let data = UsageFixture.envelope(usage: UsageFixture.usageObject(), performance: performance)
+        let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let rawSummary = try #require((object["performance"] as? [String: Any])?["summary"] as? [String: Any])
+        #expect(rawSummary["ttftP50MS"] is NSNull)
+
+        let parsed = try UsageResponseParser.parse(data, expectPerformance: true)
+        let report = try #require(parsed.performance)
+        #expect(report.summary.ttftSamples == 0)
+        #expect(report.summary.requestTTFTSamples == 0)
+        #expect(report.summary.ttftP50MS == nil)
+        #expect(report.summary.ttftP95MS == nil)
+        #expect(report.summary.requestTTFTP50MS == nil)
+        #expect(report.summary.requestTTFTP95MS == nil)
+        #expect(report.summary.tpsP50 == nil)
+    }
+
+    @Test func missingRequestTTFSamplesDecodesAsNilNotUpstreamCount() throws {
+        // Payload predating the requestTTFTSamples field.
+        var summary = UsageFixture.performanceSummary(ttftSamples: 7)
+        summary.removeValue(forKey: "requestTTFTSamples")
+        let parsed = try UsageResponseParser.parse(
+            UsageFixture.envelope(usage: UsageFixture.usageObject(),
+                                  performance: UsageFixture.performanceObject(summary: summary)),
+            expectPerformance: true)
+        let report = try #require(parsed.performance)
+        #expect(report.summary.requestTTFTSamples == nil)
+        #expect(report.summary.ttftSamples == 7)
+    }
+
+    @Test func requestingPerformanceFromOldServerIsUnsupported() {
+        let data = UsageFixture.envelope(usage: UsageFixture.usageObject())
+        #expect(throws: UsageResponseError.performanceUnsupported) {
+            _ = try UsageResponseParser.parse(data, expectPerformance: true)
+        }
+        #expect(UsageResponseError.performanceUnsupported.localizedDescription.contains("update and restart"))
+    }
+
+    @Test func unrequestedPerformanceObjectIsIgnored() throws {
+        let data = UsageFixture.envelope(usage: UsageFixture.usageObject(),
+                                         performance: UsageFixture.performanceObject())
+        let parsed = try UsageResponseParser.parse(data)
+        #expect(parsed.performance == nil)
+        #expect(parsed.performanceJSONObject == nil)
+        #expect(parsed.report.totals.total == 1_500)
+    }
+
+    @Test func malformedPerformanceShapeIsRejected() {
+        let bad: [String: Any] = [
+            "grouping": "model", "limit": 100, "groupCount": 0, "truncated": false,
+            "summary": ["attempts": 1], "groups": [],
+        ]
+        #expect(throws: (any Error).self) {
+            _ = try UsageResponseParser.parse(
+                UsageFixture.envelope(usage: UsageFixture.usageObject(), performance: bad),
+                expectPerformance: true)
+        }
+    }
 }

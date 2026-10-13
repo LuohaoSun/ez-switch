@@ -692,7 +692,7 @@ struct NativeSupplierModelTableTests {
         let alpha = [aOne, aTwo, aThree]
         let items = alpha.map { SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: false) }
         let list = NativeSupplierModelList(items: items, provider: "Alpha", sortEnabled: sortEnabled,
-                                           store: store, onEdit: { _ in })
+                                           store: store, onRename: { _, _ in nil })
         let coordinator = list.makeCoordinator()
         let table = SupplierModelTableView()
         list.wire(table, coordinator: coordinator)
@@ -708,8 +708,8 @@ struct NativeSupplierModelTableTests {
         #expect(s.table.registeredDraggedTypes.contains(ModelDragPayload.nativePasteboardType))
         #expect(s.coordinator.numberOfRows(in: s.table) == 3)
         #expect(s.coordinator.displayedIDs == s.alpha.map(\.id))
-        // 右键菜单只对真实行提供（编辑模型能力保留）。
-        #expect(s.coordinator.contextMenu(row: 0)?.items.first?.title == "编辑模型…")
+        // 右键菜单只对真实行提供：重命名 / 删除两项（重命名能力保留）。
+        #expect(s.coordinator.contextMenu(row: 0)?.items.map(\.title) == ["重命名", "删除"])
         #expect(s.coordinator.contextMenu(row: 3) == nil)
     }
 
@@ -768,5 +768,601 @@ struct NativeSupplierModelTableTests {
         #expect(s.coordinator.displayedIDs == s.alpha.map(\.id))
         s.coordinator.dragStateChanged(false)
         #expect(s.coordinator.displayedIDs == rotated.map(\.id))
+    }
+}
+
+/// 供应商原生表格的可见单行选中、原生就地重命名与右键菜单回调。
+@MainActor
+@Suite("Native supplier model interactions")
+struct NativeSupplierInteractionTests {
+    /// 记录内联重命名提交（稳定 ID + 提交文本）与删除回调。
+    private final class Recorder {
+        var renamed: [(id: UUID, text: String)] = []
+        var deleted: [UUID] = []
+    }
+
+    private struct Setup {
+        let directory: TempConfigDirectory
+        let store: ConfigStore
+        let coordinator: NativeSupplierModelList.Coordinator
+        let table: SupplierModelTableView
+        let container: SupplierModelTableContainer
+        let window: NSWindow
+        let alpha: [RemoteModel]
+        let recorder: Recorder
+    }
+
+    private func remote(_ model: String) -> RemoteModel {
+        RemoteModel(id: UUID(), name: "Alpha · \(model)", apiKey: "k", model: model,
+                    extraHeaders: [:], apiEndpoints: .all(baseURL: "https://example.test"))
+    }
+
+    private func items(_ models: [RemoteModel]) -> [SupplierModelItem] {
+        models.map { SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: false) }
+    }
+
+    private func makeSetup() throws -> Setup {
+        let models = [remote("one"), remote("two"), remote("three")]
+        let directory = try TempConfigDirectory(name: "supplier-interaction")
+        try JSONEncoder().encode(AppConfig(port: 8788, remotes: models, fakes: [])).write(to: directory.url)
+        let store = ConfigStore(configURL: directory.url)
+        let recorder = Recorder()
+        let list = NativeSupplierModelList(items: items(models), provider: "Alpha", sortEnabled: true,
+                                           store: store,
+                                           onRename: { id, text in
+                                               recorder.renamed.append((id, text))
+                                               return store.updateModel(id: id, model: text)
+                                           },
+                                           onDelete: { recorder.deleted.append($0) })
+        let coordinator = list.makeCoordinator()
+        let container = SupplierModelTableContainer(rowHeight: 24)
+        // 挂到一个离屏窗口：menu(for:) 的命中换算依赖窗口坐标，无窗口时 convert(from: nil) 会把翻转视图坐标算错。
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: 90),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = container
+        list.wire(container.tableView, coordinator: coordinator)
+        coordinator.apply(items: items(models))
+        container.layoutSubtreeIfNeeded()
+        return Setup(directory: directory, store: store, coordinator: coordinator,
+                     table: container.tableView, container: container, window: window,
+                     alpha: models, recorder: recorder)
+    }
+
+    private func keyEvent(_ keyCode: UInt16) throws -> NSEvent {
+        try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                      timestamp: 0, windowNumber: 0, context: nil,
+                                      characters: "\r", charactersIgnoringModifiers: "\r",
+                                      isARepeat: false, keyCode: keyCode))
+    }
+
+    /// 容器启用可见的单行选中：单选、可空选、有高亮。
+    @Test func containerEnablesSingleVisibleSelection() throws {
+        let s = try makeSetup()
+        #expect(s.container.tableView.allowsMultipleSelection == false)
+        #expect(s.container.tableView.allowsEmptySelection == true)
+        #expect(s.container.tableView.selectionHighlightStyle != .none)
+        #expect(s.coordinator.selectedID == nil)
+    }
+
+    /// 采用原生 `.inset` 圆角内缩选中（AppKit 绘制，无手绘蓝色形状），行高保持紧凑 24、行间距归零。
+    @Test func containerUsesNativeInsetRoundedSelection() throws {
+        let s = try makeSetup()
+        #expect(s.container.tableView.style == .inset)
+        #expect(s.container.tableView.selectionHighlightStyle == .regular)
+        #expect(s.container.tableView.rowHeight == 24)
+        #expect(s.container.tableView.intercellSpacing == NSSize(width: 0, height: 0))
+    }
+
+    /// 选中记录稳定 ID，且始终是单行；越界行不改变选中。
+    @Test func selectionRecordsStableIDAndStaysSingle() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.selectRow(1))
+        #expect(s.coordinator.selectedID == s.alpha[1].id)
+        #expect(s.table.selectedRow == 1)
+        #expect(s.table.selectedRowIndexes == IndexSet(integer: 1))
+        #expect(s.coordinator.selectRow(2))
+        #expect(s.table.selectedRowIndexes == IndexSet(integer: 2))
+        #expect(s.coordinator.selectedID == s.alpha[2].id)
+        // 越界行拒绝，选中不变。
+        #expect(s.coordinator.selectRow(3) == false)
+        #expect(s.coordinator.selectedID == s.alpha[2].id)
+    }
+
+    /// AppKit 触发的选中变化（用户点击）由委托回写到稳定 ID；空选中清空。
+    @Test func userSelectionChangeSyncsStableID() throws {
+        let s = try makeSetup()
+        let notification = Notification(name: NSTableView.selectionDidChangeNotification, object: s.table)
+        s.table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        s.coordinator.tableViewSelectionDidChange(notification)
+        #expect(s.coordinator.selectedID == s.alpha[2].id)
+        s.table.deselectAll(nil)
+        s.coordinator.tableViewSelectionDidChange(notification)
+        #expect(s.coordinator.selectedID == nil)
+    }
+
+    /// reload / 重排后选中跟随稳定 UUID，而不是旧行号。
+    @Test func selectionFollowsStableIDAcrossReorder() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.selectRow(1))
+        let rotated = items([s.alpha[1], s.alpha[0], s.alpha[2]])
+        s.coordinator.apply(items: rotated)
+        #expect(s.coordinator.displayedIDs == rotated.map(\.id))
+        #expect(s.coordinator.selectedID == s.alpha[1].id)
+        #expect(s.table.selectedRow == 0)
+    }
+
+    /// 选中行被移除时清空选中。
+    @Test func selectionClearsWhenSelectedRowIsRemoved() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.selectRow(1))
+        s.coordinator.apply(items: items([s.alpha[0], s.alpha[2]]))
+        #expect(s.coordinator.selectedID == nil)
+        #expect(s.table.selectedRow == -1)
+    }
+
+    /// 拖动冻结期间显示快照与选中都不变，解冻后积压数据与选中一起应用。
+    @Test func selectionSurvivesDragFreezeAndDeferredReload() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.selectRow(2))
+        s.coordinator.dragStateChanged(true)
+        let rotated = items([s.alpha[2], s.alpha[0], s.alpha[1]])
+        s.coordinator.apply(items: rotated)
+        #expect(s.coordinator.displayedIDs == s.alpha.map(\.id))
+        #expect(s.coordinator.selectedID == s.alpha[2].id)
+        s.coordinator.dragStateChanged(false)
+        #expect(s.coordinator.displayedIDs == rotated.map(\.id))
+        #expect(s.coordinator.selectedID == s.alpha[2].id)
+        #expect(s.table.selectedRow == 0)
+    }
+
+    /// Return / 小键盘 Enter 只对有有效选中的行开始就地编辑；无选中或选中行已移除都不触发。
+    @Test func returnAndKeypadEnterStartEditingOnlyWithSelection() throws {
+        let s = try makeSetup()
+        // 无有效选中：键盘闸门直接拒绝（不进入编辑）。
+        #expect(s.table.onReturnKey?() == false)
+        #expect(s.coordinator.activateSelectedRow() == false)
+        #expect(s.coordinator.editingID == nil)
+        // 选中第 2 行：Return 进入就地编辑。
+        #expect(s.coordinator.selectRow(1))
+        s.table.keyDown(with: try keyEvent(36))
+        #expect(s.coordinator.editingID == s.alpha[1].id)
+        s.coordinator.cancelEditing()
+        // 小键盘 Enter 同样进入就地编辑。
+        s.table.keyDown(with: try keyEvent(76))
+        #expect(s.coordinator.editingID == s.alpha[1].id)
+        // 只是开始编辑，未提交：没有任何写入。
+        #expect(s.recorder.renamed.isEmpty)
+        s.coordinator.cancelEditing()
+        // 选中行被移除后：闸门再次拒绝。
+        s.coordinator.apply(items: items([s.alpha[0], s.alpha[2]]))
+        #expect(s.coordinator.selectedID == nil)
+        #expect(s.table.onReturnKey?() == false)
+    }
+
+    /// 右键菜单恰好是“重命名 / 删除”：“重命名”开始就地编辑，“删除”按稳定 UUID 回调。
+    @Test func contextMenuOffersRenameAndDeleteWiredToCallbacks() throws {
+        let s = try makeSetup()
+        let menu = try #require(s.coordinator.contextMenu(row: 1))
+        #expect(menu.items.map(\.title) == ["重命名", "删除"])
+        // “重命名”改为就地编辑（不再直接写配置、也不弹面板）。
+        s.coordinator.renameMenuItemClicked(menu.items[0])
+        #expect(s.coordinator.editingID == s.alpha[1].id)
+        #expect(s.recorder.renamed.isEmpty)
+        s.coordinator.cancelEditing()
+        // “删除”仍按稳定 UUID 回调（removeRemote 语义由视图层接线）。
+        s.coordinator.deleteMenuItemClicked(menu.items[1])
+        #expect(s.recorder.deleted == [s.alpha[1].id])
+        // 越界行没有菜单。
+        #expect(s.coordinator.contextMenu(row: 3) == nil)
+        // 缺失 representedObject 的菜单项不触发任何回调。
+        let bare = NSMenuItem(title: "重命名", action: nil, keyEquivalent: "")
+        s.coordinator.renameMenuItemClicked(bare)
+        s.coordinator.deleteMenuItemClicked(bare)
+        #expect(s.coordinator.editingID == nil)
+        #expect(s.recorder.deleted == [s.alpha[1].id])
+    }
+
+    // MARK: 原生就地重命名（字段编辑器）
+
+    /// Return 对选中行开始原生就地编辑：cell 文本域可编辑，无校验提示，不触碰 store。
+    @Test func returnBeginsInPlaceEditingOnSelectedRow() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.selectRow(1))
+        #expect(s.coordinator.activateSelectedRow())
+        #expect(s.coordinator.editingID == s.alpha[1].id)
+        #expect(s.coordinator.editingRow == 1)
+        let cell = s.table.view(atColumn: 0, row: 1, makeIfNecessary: false) as? SupplierModelCell
+        #expect(cell?.isTitleEditable == true)
+        #expect(cell?.isShowingValidation == false)
+        #expect(s.recorder.renamed.isEmpty)
+        #expect(s.store.config.remotes[1].model == "two")
+    }
+
+    /// 拖动会话进行中拒绝进入编辑。
+    @Test func beginEditingRefusedWhileDragging() throws {
+        let s = try makeSetup()
+        s.coordinator.dragStateChanged(true)
+        #expect(s.coordinator.beginEditing(row: 1) == false)
+        #expect(s.coordinator.editingID == nil)
+        s.coordinator.dragStateChanged(false)
+    }
+
+    /// Return 提交：按稳定 UUID 写入 ConfigStore，结束编辑并保留选中。
+    @Test func returnCommitsInlineRenameToStore() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.beginEditing(row: 1))
+        #expect(s.coordinator.handleReturn(withText: "two-renamed"))
+        #expect(s.coordinator.editingID == nil)
+        #expect(s.recorder.renamed.map { $0.id } == [s.alpha[1].id])
+        #expect(s.recorder.renamed.map { $0.text } == ["two-renamed"])
+        #expect(s.store.config.remotes.first { $0.id == s.alpha[1].id }?.model == "two-renamed")
+        #expect(s.coordinator.selectedID == s.alpha[1].id)
+    }
+
+    /// 原文未变：Return 只结束编辑，不调用提交闭包、不写入。
+    @Test func returnWithUnchangedNameEndsWithoutCommit() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.beginEditing(row: 0))
+        #expect(s.coordinator.handleReturn(withText: "one"))
+        #expect(s.coordinator.editingID == nil)
+        #expect(s.recorder.renamed.isEmpty)
+        #expect(s.store.config.remotes[0].model == "one")
+    }
+
+    /// Escape（取消）不写入任何内容并结束编辑。
+    @Test func escapeCancelsWithoutWriting() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.beginEditing(row: 1))
+        s.coordinator.cancelEditing()
+        #expect(s.coordinator.editingID == nil)
+        #expect(s.recorder.renamed.isEmpty)
+        #expect(s.store.config.remotes[1].model == "two")
+    }
+
+    /// 空模型 ID：就地展示原生校验文案并保持编辑，不写入。
+    @Test func emptyNameKeepsEditingWithInlineValidation() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.beginEditing(row: 1))
+        #expect(s.coordinator.handleReturn(withText: "   ") == false)
+        #expect(s.coordinator.editingID == s.alpha[1].id)
+        #expect(s.coordinator.editingError == "模型 ID 不能为空")
+        let cell = s.table.view(atColumn: 0, row: 1, makeIfNecessary: false) as? SupplierModelCell
+        #expect(cell?.validationMessage == "模型 ID 不能为空")
+        #expect(cell?.isShowingValidation == true)
+        #expect(s.store.config.remotes[1].model == "two")
+        #expect(s.coordinator.selectedID == s.alpha[1].id)
+    }
+
+    /// 重复模型 ID：就地展示校验并保持编辑；修正为合法名称后即可提交。
+    @Test func duplicateNameKeepsEditingWithInlineValidation() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.beginEditing(row: 1))
+        #expect(s.coordinator.handleReturn(withText: "three") == false)
+        #expect(s.coordinator.editingID == s.alpha[1].id)
+        #expect(s.coordinator.editingError == "该供应商下模型 ID 已存在")
+        #expect(s.store.config.remotes[1].model == "two")
+        #expect(s.coordinator.handleReturn(withText: "two-fixed"))
+        #expect(s.coordinator.editingID == nil)
+        #expect(s.store.config.remotes[1].model == "two-fixed")
+    }
+
+    /// 编辑期间冻结 reload：新行数据积压，编辑结束后再落回，选中仍按稳定 UUID。
+    @Test func editingFreezesReloadUntilSessionEnds() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.beginEditing(row: 1))
+        let rotated = items([s.alpha[2], s.alpha[1], s.alpha[0]])
+        s.coordinator.apply(items: rotated)
+        #expect(s.coordinator.displayedIDs == s.alpha.map(\.id))
+        s.coordinator.cancelEditing()
+        #expect(s.coordinator.displayedIDs == rotated.map(\.id))
+        #expect(s.coordinator.selectedID == s.alpha[1].id)
+    }
+
+    /// 编辑期间不发起拖动；会话结束后恢复可拖动。
+    @Test func editingBlocksDragSource() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.beginEditing(row: 1))
+        #expect(s.coordinator.tableView(s.table, pasteboardWriterForRow: 1) == nil)
+        s.coordinator.cancelEditing()
+        #expect(s.coordinator.tableView(s.table, pasteboardWriterForRow: 1) != nil)
+    }
+
+    /// 字段编辑器委托：Escape 取消、Return 校验失败保持编辑、合法后 Return 提交。
+    @Test func fieldEditorDelegateDrivesCommitCancelAndValidation() throws {
+        let s = try makeSetup()
+        let cell = try #require(s.table.view(atColumn: 0, row: 2, makeIfNecessary: false) as? SupplierModelCell)
+        let field = try #require(cell.textField)
+        let editor = NSTextView()
+        // Escape → 取消，零写入。
+        #expect(s.coordinator.beginEditing(row: 2))
+        editor.string = "ignored"
+        #expect(s.coordinator.control(field, textView: editor,
+                                      doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        #expect(s.coordinator.editingID == nil)
+        #expect(s.recorder.renamed.isEmpty)
+        // 空文本 Return → 保持编辑并展示校验。
+        #expect(s.coordinator.beginEditing(row: 2))
+        editor.string = ""
+        #expect(s.coordinator.control(field, textView: editor,
+                                      doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        #expect(s.coordinator.editingID == s.alpha[2].id)
+        #expect(s.recorder.renamed.map { $0.text } == [""])
+        // 合法文本 Return → 提交并结束。
+        editor.string = "three-fixed"
+        #expect(s.coordinator.control(field, textView: editor,
+                                      doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        #expect(s.coordinator.editingID == nil)
+        #expect(s.store.config.remotes[2].model == "three-fixed")
+    }
+
+    /// 右键命中行的选择副作用：菜单作用在用户点中的确切行（选中跟随该行稳定 ID）。
+    @Test func contextMenuSelectionTargetsExactRow() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.selectRow(0))
+        s.table.selectRowForContextMenu(1)
+        #expect(s.table.selectedRow == 1)
+        #expect(s.coordinator.selectedID == s.alpha[1].id)
+        // 越界命中不改变选中。
+        s.table.selectRowForContextMenu(9)
+        #expect(s.table.selectedRow == 1)
+    }
+
+    /// 右键命中行触发 menu(for:)：先选中该行，再返回“重命名 / 删除”菜单；命中空白不弹菜单。
+    @Test func rightClickSelectsExactTargetRowAndBuildsMenu() throws {
+        let s = try makeSetup()
+        #expect(s.coordinator.selectRow(0))
+        // 命中行用表格坐标定位，再换算成窗口坐标构造事件，与真实右键一致。
+        let rowPoint = NSPoint(x: 20, y: s.table.rect(ofRow: 1).midY)
+        let windowPoint = s.table.convert(rowPoint, to: nil)
+        let event = try #require(NSEvent.mouseEvent(with: .rightMouseDown, location: windowPoint,
+                                                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                                                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        let menu = try #require(s.table.menu(for: event))
+        #expect(menu.items.map(\.title) == ["重命名", "删除"])
+        #expect(s.table.selectedRow == 1)
+        #expect(s.coordinator.selectedID == s.alpha[1].id)
+        // 命中表格下方空白（无行）不弹菜单，选中不变。
+        let blankPoint = s.table.convert(NSPoint(x: 20, y: -10), to: nil)
+        let blank = try #require(NSEvent.mouseEvent(with: .rightMouseDown, location: blankPoint,
+                                                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                                                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        #expect(s.table.menu(for: blank) == nil)
+        #expect(s.table.selectedRow == 1)
+    }
+}
+
+/// 原生 `.inset` 表格的真实几何：外层布局高度 = 行区净高（顶部样式内缩被容器滚出可视区），
+/// 首行贴顶、末行连同圆角完整可见；命中测试在偏移后仍正确。
+@MainActor
+@Suite("Native supplier model list geometry")
+struct NativeSupplierModelGeometryTests {
+    private struct Setup {
+        let directory: TempConfigDirectory
+        let container: SupplierModelTableContainer
+        let coordinator: NativeSupplierModelList.Coordinator
+        let rows: Int
+    }
+
+    private func remote(_ model: String) -> RemoteModel {
+        RemoteModel(id: UUID(), name: "Alpha · \(model)", apiKey: "k", model: model,
+                    extraHeaders: [:], apiEndpoints: .all(baseURL: "https://example.test"))
+    }
+
+    /// 容器可视高度取行区净高（与 `sizeThatFits` 返回值一致），因此窗口内容高度设为 行数 × 行高。
+    private func makeSetup(rows: Int) throws -> Setup {
+        let models = (0..<rows).map { remote("m\($0)") }
+        let directory = try TempConfigDirectory(name: "supplier-geometry")
+        try JSONEncoder().encode(AppConfig(port: 8788, remotes: models, fakes: [])).write(to: directory.url)
+        let store = ConfigStore(configURL: directory.url)
+        let items = models.map { SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: false) }
+        let list = NativeSupplierModelList(items: items, provider: "Alpha", sortEnabled: true,
+                                           store: store, onRename: { _, _ in nil })
+        let coordinator = list.makeCoordinator()
+        let container = SupplierModelTableContainer(rowHeight: list.rowHeight)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: max(CGFloat(rows) * list.rowHeight, 1)),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = container
+        list.wire(container.tableView, coordinator: coordinator)
+        coordinator.apply(items: items)
+        container.tableView.reloadData()
+        container.layoutSubtreeIfNeeded()
+        container.layout()
+        return Setup(directory: directory, container: container, coordinator: coordinator, rows: rows)
+    }
+
+    @Test func tightHeightEqualsMeasuredRowArea() throws {
+        for rows in [1, 2, 3] {
+            let s = try makeSetup(rows: rows)
+            let table = s.container.tableView
+            let height = CGFloat(rows) * table.rowHeight
+            #expect(s.container.tightContentHeight == height)
+            #expect(table.rect(ofRow: rows - 1).maxY - table.rect(ofRow: 0).minY == height)
+        }
+    }
+
+    /// 首行紧贴可视顶部、末行连同圆角完整可见：顶部样式内缩被滚出可视区，底行不再被裁。
+    @Test func firstRowAtVisibleTopAndLastRowFullyVisible() throws {
+        for rows in [1, 2, 3] {
+            let s = try makeSetup(rows: rows)
+            let table = s.container.tableView
+            let visible = s.container.contentView.bounds
+            let inset = table.rect(ofRow: 0).minY
+            #expect(inset > 0)                                          // `.inset` 确实加入固定顶部内缩
+            #expect(visible.minY == inset)                              // 该内缩被容器滚出可视区
+            #expect(table.rect(ofRow: 0).minY == visible.minY)          // 首行贴近分隔线
+            #expect(table.rect(ofRow: rows - 1).maxY == visible.maxY)   // 末行完整可见（圆角不被裁）
+            #expect(table.frame.height == inset + s.container.tightContentHeight)
+        }
+    }
+
+    /// 容器可视高度 == `sizeThatFits` 返回值（行区净高）：不再少算顶部内缩。
+    @Test func containerVisibleHeightMatchesSizeThatFits() throws {
+        for rows in [1, 2, 3] {
+            let s = try makeSetup(rows: rows)
+            #expect(s.container.contentSize.height == s.container.tightContentHeight)
+        }
+    }
+
+    /// 偏移后的命中测试仍正确：可视顶 / 底分别命中首行 / 末行。
+    @Test func hitTestingSurvivesTopInsetOffset() throws {
+        for rows in [2, 3] {
+            let s = try makeSetup(rows: rows)
+            let visible = s.container.contentView.bounds
+            #expect(s.container.tableView.row(at: NSPoint(x: 5, y: visible.minY + 1)) == 0)
+            #expect(s.container.tableView.row(at: NSPoint(x: 5, y: visible.maxY - 1)) == rows - 1)
+        }
+    }
+
+    /// 选中末行 / AppKit 在 layout 之外重置 clip bounds / 再次 layout 后，顶部内缩偏移仍被钉住；
+    /// 文档 frame 原点不被 tile 改动。（回归：初次 layout 有效、交互后偏移丢失。）
+    @Test func selectionAndResetKeepTopInsetOffset() throws {
+        for rows in [1, 2, 3] {
+            let s = try makeSetup(rows: rows)
+            let table = s.container.tableView
+            let clip = s.container.contentView
+            let inset = table.rect(ofRow: 0).minY
+            #expect(clip.bounds.minY == inset)
+            // 选中末行：原生会尝试 scrollRowToVisible。
+            s.coordinator.selectRow(rows - 1)
+            table.scrollRowToVisible(rows - 1)
+            #expect(clip.bounds.minY == inset)
+            #expect(table.rect(ofRow: rows - 1).maxY == clip.bounds.maxY)
+            #expect(table.frame.origin == .zero)
+            // 在 layout 之外直接重置：钉住逻辑立即恢复偏移。
+            clip.bounds.origin = .zero
+            #expect(clip.bounds.minY == inset)
+            clip.scroll(to: .zero)
+            #expect(clip.bounds.minY == inset)
+            // SwiftUI 更新再 layout 后仍保持。
+            s.container.layout()
+            #expect(clip.bounds.minY == inset)
+            #expect(table.rect(ofRow: 0).minY == clip.bounds.minY)
+            #expect(table.rect(ofRow: rows - 1).maxY == clip.bounds.maxY)
+        }
+    }
+
+    @Test func emptyListHasNoHeightOrOffset() throws {
+        let s = try makeSetup(rows: 0)
+        #expect(s.container.tightContentHeight == 0)
+        #expect(s.container.topInset == 0)
+        #expect(s.container.contentView.bounds.minY == 0)
+    }
+}
+
+/// 工作区共享选中：跨所有供应商卡片只有一个选中模型；任意卡片显示另一张卡片的选中即清除。
+@MainActor
+@Suite("Workspace shared model selection")
+struct WorkspaceSharedModelSelectionTests {
+    private final class Recorder {
+        var changes: [UUID?] = []
+    }
+
+    private struct Card {
+        let directory: TempConfigDirectory
+        let coordinator: NativeSupplierModelList.Coordinator
+        let table: SupplierModelTableView
+        let models: [RemoteModel]
+    }
+
+    private func remote(_ provider: String, _ model: String) -> RemoteModel {
+        RemoteModel(id: UUID(), name: "\(provider) · \(model)", apiKey: "k", model: model,
+                    extraHeaders: [:], apiEndpoints: .all(baseURL: "https://example.test"))
+    }
+
+    private func items(_ models: [RemoteModel]) -> [SupplierModelItem] {
+        models.map { SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: false) }
+    }
+
+    private func makeCard(provider: String, models: [RemoteModel], recorder: Recorder) throws -> Card {
+        let directory = try TempConfigDirectory(name: "shared-\(provider)")
+        try JSONEncoder().encode(AppConfig(port: 8788, remotes: models, fakes: [])).write(to: directory.url)
+        let store = ConfigStore(configURL: directory.url)
+        let list = NativeSupplierModelList(items: items(models), provider: provider, sortEnabled: true,
+                                           store: store, onRename: { _, _ in nil },
+                                           onSelectionChange: { recorder.changes.append($0) })
+        let coordinator = list.makeCoordinator()
+        let table = SupplierModelTableView()
+        list.wire(table, coordinator: coordinator)
+        coordinator.apply(items: items(models))
+        return Card(directory: directory, coordinator: coordinator, table: table, models: models)
+    }
+
+    /// 选中缓冲卡片后，把共享选中同步到另一张卡片：另一张卡片不显示任何选中 → 全局唯一。
+    @Test func onlyOneCardShowsSelectionAcrossWorkspace() throws {
+        let recorder = Recorder()
+        let alpha = try makeCard(provider: "Alpha",
+                                 models: [remote("Alpha", "a1"), remote("Alpha", "a2"), remote("Alpha", "a3")],
+                                 recorder: recorder)
+        let beta = try makeCard(provider: "Beta",
+                                models: [remote("Beta", "b1"), remote("Beta", "b2")],
+                                recorder: recorder)
+        // 选中 Alpha.a2，同步到 Beta：Beta 无行匹配 → 无选中。
+        #expect(alpha.coordinator.selectRow(1))
+        beta.coordinator.applySelectedModelID(alpha.coordinator.selectedID)
+        #expect(alpha.coordinator.selectedID == alpha.models[1].id)
+        #expect(beta.coordinator.selectedID == nil)
+        #expect(beta.table.selectedRow == -1)
+        // 选中 Beta.b1，同步到 Alpha：Alpha 清除选中 → 全局仍有且仅有一行被选中。
+        #expect(beta.coordinator.selectRow(0))
+        alpha.coordinator.applySelectedModelID(beta.coordinator.selectedID)
+        #expect(alpha.coordinator.selectedID == nil)
+        #expect(alpha.table.selectedRow == -1)
+        #expect(beta.coordinator.selectedID == beta.models[0].id)
+        #expect(beta.table.selectedRow == 0)
+        // 两次用户选中都上报工作区（共享真源）。
+        #expect(recorder.changes.map { $0 } == [alpha.models[1].id, beta.models[0].id])
+    }
+
+    /// 程序化同步共享选中不触发回写回调（避免工作区 ↔ 卡片回环）。
+    @Test func applyingSharedSelectionDoesNotFeedback() throws {
+        let recorder = Recorder()
+        let alpha = try makeCard(provider: "Alpha",
+                                 models: [remote("Alpha", "a1"), remote("Alpha", "a2")],
+                                 recorder: recorder)
+        #expect(alpha.coordinator.selectRow(1))
+        let after = recorder.changes.count
+        alpha.coordinator.applySelectedModelID(alpha.models[1].id)   // 同值 → 无操作
+        alpha.coordinator.applySelectedModelID(alpha.models[0].id)   // 外部改选 → 移动选中
+        #expect(recorder.changes.count == after)
+        #expect(alpha.coordinator.selectedID == alpha.models[0].id)
+        #expect(alpha.table.selectedRow == 0)
+    }
+
+    /// 用户原生选中变化（点击 / 右键选中）经委托回写工作区共享选中。
+    @Test func userSelectionChangeReportsToWorkspace() throws {
+        let recorder = Recorder()
+        let alpha = try makeCard(provider: "Alpha",
+                                 models: [remote("Alpha", "a1"), remote("Alpha", "a2"), remote("Alpha", "a3")],
+                                 recorder: recorder)
+        alpha.table.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        recorder.changes.removeAll()
+        alpha.coordinator.tableViewSelectionDidChange(
+            Notification(name: NSTableView.selectionDidChangeNotification, object: alpha.table))
+        #expect(alpha.coordinator.selectedID == alpha.models[2].id)
+        #expect(recorder.changes == [alpha.models[2].id])
+    }
+
+    /// 共享选中为 nil（工作区已清空 / 模型被移除）时卡片清除选中。
+    @Test func externalNilSelectionClearsCard() throws {
+        let recorder = Recorder()
+        let alpha = try makeCard(provider: "Alpha",
+                                 models: [remote("Alpha", "a1"), remote("Alpha", "a2")],
+                                 recorder: recorder)
+        #expect(alpha.coordinator.selectRow(0))
+        alpha.coordinator.applySelectedModelID(nil)
+        #expect(alpha.coordinator.selectedID == nil)
+        #expect(alpha.table.selectedRow == -1)
+    }
+
+    /// 选中行被移除后选中清空（稳定 UUID 失效即清除）。
+    @Test func removedSelectedModelClearsSelection() throws {
+        let recorder = Recorder()
+        let alpha = try makeCard(provider: "Alpha",
+                                 models: [remote("Alpha", "a1"), remote("Alpha", "a2"), remote("Alpha", "a3")],
+                                 recorder: recorder)
+        #expect(alpha.coordinator.selectRow(1))
+        alpha.coordinator.apply(items: items([alpha.models[0], alpha.models[2]]))
+        #expect(alpha.coordinator.selectedID == nil)
+        #expect(alpha.table.selectedRow == -1)
     }
 }

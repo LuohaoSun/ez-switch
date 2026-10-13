@@ -32,6 +32,10 @@ struct UsageRecord: Codable, Identifiable, Sendable {
     var outcome: String
     var durationMS: Int
     var tokens: UsageTokens
+
+    /// 可选的流式性能采样（TTFT、生成时长、输出增量计数）。
+    /// 旧的构造点与历史解码记录没有该字段；保持 `nil`，旧记录全部视为无性能数据。
+    var performance: UsagePerformance? = nil
 }
 
 enum UsageGrouping: String, CaseIterable, Identifiable, Sendable {

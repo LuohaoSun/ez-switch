@@ -26,6 +26,9 @@ struct UpstreamResponse {
     /// 原始上游 usage 采集器（在 Responses→Chat 翻译之前喂入原始字节）。
     /// nil = 未采集。
     var usage: UsageAccumulator? = nil
+    /// 原始上游性能采集器（TTFT / generation / 语义 delta 计数），同样在翻译
+    /// 之前的原始字节上喂入。nil = 未采集。
+    var performance: PerformanceAccumulator? = nil
 }
 
 /// URLSession 数据回调 → AsyncThrowingStream<ByteBuffer> 的桥。
@@ -239,9 +242,13 @@ enum Forwarder {
 
     /// 建请求 → 发出去 → 等第一版响应头 → 返回 (响应, 流, cancel)。
     /// `session` 可注入（测试用 mock），默认走生产单例。
+    /// `requestStart`/`attemptStart` 为路由器侧的单调起点（记录在最终 record
+    /// 时换算成 ttft/requestTTFT）；nil = 不测 TTFT。
     static func makeRequest(clientHead: HTTPRequestHead, body: Data,
                             endpoint: EndpointKind, remote: RemoteModel,
-                            query: String, session: URLSession = Forwarder.session) async throws -> UpstreamResponse {
+                            query: String, session: URLSession = Forwarder.session,
+                            requestStart: DispatchTime? = nil,
+                            attemptStart: DispatchTime? = nil) async throws -> UpstreamResponse {
         let upstreamEndpoint: EndpointKind = endpoint == .responses
             && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
         var req = try buildRequest(clientHead: clientHead, body: body,
@@ -254,33 +261,52 @@ enum Forwarder {
                 let upstream = try await perform(req, session: session)
                 guard (200..<300).contains(upstream.response.statusCode) else {
                     translator.stop()
-                    return accumulating(upstream, endpoint: upstreamEndpoint)
+                    return accumulating(upstream, endpoint: upstreamEndpoint,
+                                        requestStart: requestStart, attemptStart: attemptStart)
                 }
-                return translatedResponse(accumulating(upstream, endpoint: upstreamEndpoint), translator: translator)
+                return translatedResponse(accumulating(upstream, endpoint: upstreamEndpoint,
+                                                       requestStart: requestStart, attemptStart: attemptStart),
+                                          translator: translator)
             } catch {
                 translator.stop()
                 throw error
             }
         }
-        return accumulating(try await perform(req, session: session), endpoint: upstreamEndpoint)
+        return accumulating(try await perform(req, session: session), endpoint: upstreamEndpoint,
+                            requestStart: requestStart, attemptStart: attemptStart)
     }
 
-    /// 在原始上游字节流上做 usage 采集（先于 Responses→Chat 翻译），每个 chunk
-    /// 原样透传，不改变时序、不重复消费。
-    private static func accumulating(_ upstream: UpstreamResponse, endpoint: EndpointKind) -> UpstreamResponse {
+    /// 在原始上游字节流上做 usage + 性能采集（先于 Responses→Chat 翻译），每个
+    /// chunk 原样透传，不改变时序、不重复消费。
+    private static func accumulating(_ upstream: UpstreamResponse, endpoint: EndpointKind,
+                                     requestStart: DispatchTime? = nil,
+                                     attemptStart: DispatchTime? = nil) -> UpstreamResponse {
         let parser = UsageAccumulator(endpoint: endpoint,
                                       contentType: upstream.response.value(forHTTPHeaderField: "content-type"))
+        let performance = PerformanceAccumulator(endpoint: endpoint,
+                                                 contentType: upstream.response.value(forHTTPHeaderField: "content-type"),
+                                                 requestStart: requestStart,
+                                                 attemptStart: attemptStart)
         let (stream, continuation) = AsyncThrowingStream<ByteBuffer, Error>.makeStream()
         let producer = Task {
             do {
                 for try await chunk in upstream.body {
+                    // 一到就取单调时间，避免把 usage 的 JSON 解析耗时算进 TTFT。
+                    let arrived = DispatchTime.now()
                     parser.ingest(chunk)
+                    performance.ingest(chunk, at: arrived)
                     continuation.yield(chunk)
                 }
+                let ended = DispatchTime.now()
                 parser.finish()
+                // 正常 for 结束也要排除「因取消而自然结束」：那不是正常 body 结束，
+                // 不能生成 generation 窗口。
+                if !Task.isCancelled { performance.finish(at: ended) }
                 continuation.finish()
             } catch {
                 parser.finish()
+                // streamError / cancelled：保留已观测到的 TTFT，但绝不补一个正常结束
+                // 时间（generation 保持 nil）。
                 continuation.finish(throwing: error)
             }
         }
@@ -290,7 +316,7 @@ enum Forwarder {
         }
         return UpstreamResponse(response: upstream.response, body: stream,
                                 cancel: { producer.cancel(); upstream.cancel() },
-                                usage: parser)
+                                usage: parser, performance: performance)
     }
 
     /// 流式 Chat 请求附带 usage：仅在 body 为 `"stream":true` 且 `stream_options`
@@ -396,7 +422,7 @@ enum Forwarder {
             producer.cancel()
             translator.stop()
             upstream.cancel()
-        }, usage: upstream.usage)
+        }, usage: upstream.usage, performance: upstream.performance)
     }
 
     static let droppedResponseHeaders: Set<String> = [

@@ -27,10 +27,20 @@ struct UsageOptions: Equatable {
     var from: String? = nil
     var to: String? = nil
     var json: Bool = false
+    /// `--performance` adds TTFT/TPS statistics to the request.
+    var performance: Bool = false
+    /// Whether `--group` was given explicitly; drives the performance default.
+    var groupExplicitlySet: Bool = false
 
     var usesCustomRange: Bool { from != nil && to != nil }
     /// Human label for the header; the concrete dates always come from the server.
     var rangeLabel: String { usesCustomRange ? "custom" : period.label }
+
+    /// Performance stats default to per-model grouping; the plain usage report keeps
+    /// its route default. An explicit `--group` always wins.
+    var effectiveGroup: UsageGrouping {
+        groupExplicitlySet ? group : (performance ? .model : group)
+    }
 }
 
 // MARK: - Argument parsing
@@ -83,6 +93,7 @@ enum UsageArgumentParser {
         var sawLimit = false
         var sawFrom = false
         var sawTo = false
+        var sawPerformance = false
 
         var index = 0
         while index < arguments.count {
@@ -91,6 +102,12 @@ enum UsageArgumentParser {
             case "--json":
                 guard !options.json else { throw UsageArgumentError.duplicateOption(token) }
                 options.json = true
+                index += 1
+
+            case "--performance":
+                guard !sawPerformance else { throw UsageArgumentError.duplicateOption(token) }
+                sawPerformance = true
+                options.performance = true
                 index += 1
 
             case "--period", "--group", "--limit", "--from", "--to":
@@ -116,6 +133,7 @@ enum UsageArgumentParser {
                                                               expected: "route, provider or model")
                     }
                     options.group = group
+                    options.groupExplicitlySet = true
 
                 case "--limit":
                     guard !sawLimit else { throw UsageArgumentError.duplicateOption(token) }
@@ -169,10 +187,12 @@ enum UsageArgumentParser {
 
     /// Request payload for the `usage` command. `json` is a local-only flag and is
     /// deliberately never sent; values are strings per the control protocol.
+    /// `performance` is sent only when requested, so older apps keep replying with
+    /// the unchanged usage payload.
     static func requestPayload(_ options: UsageOptions) -> [String: String] {
         var payload: [String: String] = [
             "command": "usage",
-            "group": options.group.rawValue,
+            "group": options.effectiveGroup.rawValue,
             "limit": String(options.limit),
         ]
         if let from = options.from, let to = options.to {
@@ -180,6 +200,9 @@ enum UsageArgumentParser {
             payload["to"] = to
         } else {
             payload["period"] = options.period.rawValue
+        }
+        if options.performance {
+            payload["performance"] = "true"
         }
         return payload
     }
@@ -236,11 +259,48 @@ struct UsageReport: Decodable, Equatable {
     var groups: [UsageReportGroup]
 }
 
+// MARK: - Performance report models
+
+/// The optional `performance` object returned alongside `usage` when it is requested.
+struct PerformanceReportSummary: Decodable, Equatable {
+    var attempts: Int
+    var successfulStreamingAttempts: Int
+    var ttftSamples: Int
+    /// Optional so payloads predating this field still decode; a missing value is not
+    /// the same as the upstream attempt sample count and is never substituted for it.
+    var requestTTFTSamples: Int?
+    var tpsSamples: Int
+    var ttftP50MS: Double?
+    var ttftP95MS: Double?
+    var requestTTFTP50MS: Double?
+    var requestTTFTP95MS: Double?
+    var tpsP50: Double?
+}
+
+struct PerformanceReportGroup: Decodable, Equatable {
+    var id: String
+    var title: String
+    var subtitle: String
+    var summary: PerformanceReportSummary
+}
+
+struct PerformanceReport: Decodable, Equatable {
+    var grouping: String
+    var limit: Int
+    var groupCount: Int
+    var truncated: Bool
+    var summary: PerformanceReportSummary
+    var groups: [PerformanceReportGroup]
+}
+
 // MARK: - Response parsing
 
 enum UsageResponseError: Error, LocalizedError, Equatable {
     /// The running app predates the `usage` command (old handler replies "unknown command").
     case unsupportedServer
+    /// The running app answered `usage` but ignores `performance`, so it predates
+    /// performance stats. We say so rather than reporting zeros.
+    case performanceUnsupported
     case server(String)
     case invalidResponse(String)
 
@@ -248,6 +308,8 @@ enum UsageResponseError: Error, LocalizedError, Equatable {
         switch self {
         case .unsupportedServer:
             return "the running EZ Switch does not support usage; update and restart the app, then try again"
+        case .performanceUnsupported:
+            return "the running EZ Switch does not support performance stats; update and restart the app, then try again"
         case .server(let message):
             return message
         case .invalidResponse(let detail):
@@ -261,10 +323,18 @@ struct ParsedUsage {
     var report: UsageReport
     /// Raw `usage` object, re-encoded verbatim for `--json`.
     var jsonObject: Any
+    /// Typed performance view; only present when `--performance` was requested and the
+    /// server returned it.
+    var performance: PerformanceReport?
+    /// Raw `performance` object, re-encoded verbatim for `--json`.
+    var performanceJSONObject: Any?
 }
 
 enum UsageResponseParser {
-    static func parse(_ data: Data) throws -> ParsedUsage {
+    /// - Parameter expectPerformance: when true (the CLI sent `--performance`), a
+    ///   response without a `performance` object means the app is too old to know it,
+    ///   which is surfaced as `performanceUnsupported` rather than silent zeros.
+    static func parse(_ data: Data, expectPerformance: Bool = false) throws -> ParsedUsage {
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw UsageResponseError.invalidResponse("response is not a JSON object")
         }
@@ -285,12 +355,29 @@ enum UsageResponseParser {
         } catch {
             throw UsageResponseError.invalidResponse("usage object is not serializable")
         }
+        let report: UsageReport
         do {
-            let report = try JSONDecoder().decode(UsageReport.self, from: usageData)
-            return ParsedUsage(report: report, jsonObject: usage)
+            report = try JSONDecoder().decode(UsageReport.self, from: usageData)
         } catch {
             throw UsageResponseError.invalidResponse("unexpected usage shape")
         }
+
+        var performance: PerformanceReport?
+        var performanceObject: Any?
+        if expectPerformance {
+            guard let raw = object["performance"] as? [String: Any] else {
+                throw UsageResponseError.performanceUnsupported
+            }
+            do {
+                let performanceData = try JSONSerialization.data(withJSONObject: raw)
+                performance = try JSONDecoder().decode(PerformanceReport.self, from: performanceData)
+            } catch {
+                throw UsageResponseError.invalidResponse("unexpected performance shape")
+            }
+            performanceObject = raw
+        }
+        return ParsedUsage(report: report, jsonObject: usage,
+                           performance: performance, performanceJSONObject: performanceObject)
     }
 }
 
@@ -385,6 +472,135 @@ enum UsageTextFormatter {
         return text
     }
 
+    /// `--json --performance` prints both objects so the existing usage contract is
+    /// preserved and the optional `performance` object is added alongside it.
+    static func renderCombinedJSON(usage: Any, performance: Any) throws -> String {
+        let combined: [String: Any] = ["usage": usage, "performance": performance]
+        let data = try JSONSerialization.data(withJSONObject: combined, options: [.prettyPrinted, .sortedKeys])
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw UsageResponseError.invalidResponse("usage object is not valid UTF-8")
+        }
+        return text
+    }
+
+    // MARK: Performance rendering
+
+    /// Explicit unit for a millisecond value: sub-second reads in ms, otherwise seconds.
+    static func duration(_ milliseconds: Double?) -> String {
+        guard let milliseconds, milliseconds.isFinite, milliseconds >= 0 else { return "—" }
+        return milliseconds < 1000 ? String(format: "%.0f ms", milliseconds)
+                                   : String(format: "%.2f s", milliseconds / 1000)
+    }
+
+    static func rate(_ tokensPerSecond: Double?) -> String {
+        guard let tokensPerSecond, tokensPerSecond.isFinite, tokensPerSecond >= 0 else { return "—" }
+        return String(format: "%.1f tok/s", tokensPerSecond)
+    }
+
+    /// Route grouping reports request-level TTFT (which includes fallback); every other
+    /// grouping reports the upstream attempt TTFT.
+    private static func ttftP50(_ summary: PerformanceReportSummary, grouping: String) -> Double? {
+        grouping == "route" ? summary.requestTTFTP50MS : summary.ttftP50MS
+    }
+
+    private static func ttftP95(_ summary: PerformanceReportSummary, grouping: String) -> Double? {
+        grouping == "route" ? summary.requestTTFTP95MS : summary.ttftP95MS
+    }
+
+    /// The sample count that backs the TTFT columns for the active grouping. A missing
+    /// `requestTTFTSamples` (old payload) reads as 0, never as the upstream attempt count.
+    private static func ttftSampleCount(_ summary: PerformanceReportSummary, grouping: String) -> Int {
+        grouping == "route" ? (summary.requestTTFTSamples ?? 0) : summary.ttftSamples
+    }
+
+    private static func ttftBasisLine(grouping: String) -> String {
+        grouping == "route" ? "TTFT basis: request (includes fallback)"
+                            : "TTFT basis: upstream attempt"
+    }
+
+    /// Route grouping can have request-level TTFT missing while upstream attempt TTFT
+    /// exists; warn instead of silently presenting the wrong basis.
+    private static func ttftWarning(_ summary: PerformanceReportSummary, grouping: String) -> String? {
+        guard grouping == "route", (summary.requestTTFTSamples ?? 0) == 0, summary.ttftSamples > 0 else {
+            return nil
+        }
+        return "Warning: no request-level TTFT samples; upstream attempt TTFT is not shown for route grouping"
+    }
+
+    static func renderPerformance(_ report: PerformanceReport, options: UsageOptions) -> String {
+        let grouping = report.grouping
+        var lines = ["Performance (\(sanitize(grouping)))", ttftBasisLine(grouping: grouping)]
+
+        // Always show the summary (with dashes for missing values) so "no samples" reads
+        // as — rather than being hidden.
+        lines.append("")
+        lines.append("Summary")
+        lines.append(contentsOf: performanceSummaryLines(report.summary, grouping: grouping, indent: "  "))
+
+        if report.summary.attempts == 0 && report.groups.isEmpty {
+            lines.append("")
+            lines.append("No performance data recorded.")
+            return lines.joined(separator: "\n")
+        }
+
+        lines.append("")
+        lines.append(performanceGroupsHeading(report))
+        if report.groups.isEmpty {
+            lines.append("  (none)")
+        } else {
+            for group in report.groups {
+                lines.append(contentsOf: performanceGroupLines(group, grouping: grouping))
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func performanceSummaryLines(_ summary: PerformanceReportSummary,
+                                                grouping: String, indent: String) -> [String] {
+        var lines = [
+            "\(indent)Attempts: \(count(summary.attempts))",
+            "\(indent)Successful streaming: \(count(summary.successfulStreamingAttempts))/\(count(summary.attempts)) attempts",
+            "\(indent)TTFT samples: \(count(ttftSampleCount(summary, grouping: grouping)))  "
+                + "TPS samples: \(count(summary.tpsSamples))",
+            "\(indent)TTFT P50: \(duration(ttftP50(summary, grouping: grouping)))  "
+                + "TTFT P95: \(duration(ttftP95(summary, grouping: grouping)))",
+            "\(indent)TPS P50: \(rate(summary.tpsP50))",
+        ]
+        if let warning = ttftWarning(summary, grouping: grouping) {
+            lines.append("\(indent)\(warning)")
+        }
+        return lines
+    }
+
+    private static func performanceGroupsHeading(_ report: PerformanceReport) -> String {
+        var heading = "Groups"
+        if report.truncated {
+            heading += " — showing \(report.groups.count) of \(report.groupCount) groups; raise --limit to see more"
+        }
+        return heading
+    }
+
+    private static func performanceGroupLines(_ group: PerformanceReportGroup, grouping: String) -> [String] {
+        var header = "  " + sanitize(group.title)
+        if !group.subtitle.isEmpty {
+            header += " (\(sanitize(group.subtitle)))"
+        }
+        let summary = group.summary
+        var lines = [
+            header,
+            "    Attempts \(count(summary.attempts))  "
+                + "Successful streaming \(count(summary.successfulStreamingAttempts))/\(count(summary.attempts)) attempts",
+            "    TTFT samples \(count(ttftSampleCount(summary, grouping: grouping)))  "
+                + "TPS samples \(count(summary.tpsSamples))",
+            "    TTFT P50 \(duration(ttftP50(summary, grouping: grouping)))  "
+                + "P95 \(duration(ttftP95(summary, grouping: grouping)))  TPS P50 \(rate(summary.tpsP50))",
+        ]
+        if let warning = ttftWarning(summary, grouping: grouping) {
+            lines.append("    \(warning)")
+        }
+        return lines
+    }
+
     // MARK: Section builders
 
     private static func totalsLines(_ totals: UsageReportTotals) -> [String] {
@@ -443,7 +659,7 @@ enum EZSCLIHelp {
       ezs set <model-id> --provider <name> --model <upstream-model>
       ezs set <model-id> --remote-id <UUID>
       ezs usage [--period today|7d|month] [--from YYYY-MM-DD --to YYYY-MM-DD]
-                [--group route|provider|model] [--limit N] [--json]
+                [--group route|provider|model] [--limit N] [--performance] [--json]
       ezs help | -h | --help
 
     Commands:
@@ -460,6 +676,7 @@ enum EZSCLIHelp {
       --to <YYYY-MM-DD>                Custom end date (inclusive); requires --from.
       --group <route|provider|model>   How to group results. Default: route.
       --limit <1-1000>                 Maximum groups to show. Default: 100.
+      --performance                    Add TTFT/TPS streaming performance stats.
       --json                           Print the raw usage object as JSON.
 
     Dates use the local calendar; --to is inclusive. 7d covers today and the six
@@ -470,7 +687,7 @@ enum EZSCLIHelp {
     static let usage = """
     Usage:
       ezs usage [--period today|7d|month] [--from YYYY-MM-DD --to YYYY-MM-DD]
-                [--group route|provider|model] [--limit N] [--json]
+                [--group route|provider|model] [--limit N] [--performance] [--json]
 
     Show token usage recorded by EZ Switch for a time range.
 
@@ -480,6 +697,8 @@ enum EZSCLIHelp {
       --to <YYYY-MM-DD>                Custom end date (inclusive).
       --group <route|provider|model>   How to group results. Default: route.
       --limit <1-1000>                 Maximum groups to show. Default: 100.
+      --performance                    Add TTFT/TPS streaming performance stats,
+                                       grouped by model unless --group is given.
       --json                           Print the raw usage object as JSON.
       -h, --help                       Show this help.
 

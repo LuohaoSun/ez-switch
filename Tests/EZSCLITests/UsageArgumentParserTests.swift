@@ -163,4 +163,53 @@ struct UsageArgumentParserTests {
         #expect(payload["group"] == "route")
         #expect(payload["limit"] == "100")
     }
+
+    // MARK: - Performance flag
+
+    @Test func performanceDefaultsToModelGroupingWithoutChangingPlainDefault() throws {
+        let plain = try UsageArgumentParser.parse([])
+        #expect(plain.performance == false)
+        #expect(plain.effectiveGroup == .route)
+
+        let performance = try UsageArgumentParser.parse(["--performance"])
+        #expect(performance.performance)
+        // The stored default is untouched; only the effective grouping switches.
+        #expect(performance.group == .route)
+        #expect(performance.groupExplicitlySet == false)
+        #expect(performance.effectiveGroup == .model)
+    }
+
+    @Test func explicitGroupWinsOverPerformanceDefault() throws {
+        let options = try UsageArgumentParser.parse(["--performance", "--group", "provider"])
+        #expect(options.groupExplicitlySet)
+        #expect(options.effectiveGroup == .provider)
+    }
+
+    @Test func performanceIsAFlagThatRejectsRepeatsAndValues() {
+        #expect(throws: UsageArgumentError.duplicateOption("--performance")) {
+            _ = try UsageArgumentParser.parse(["--performance", "--performance"])
+        }
+        #expect(throws: UsageArgumentError.unexpectedArgument("true")) {
+            _ = try UsageArgumentParser.parse(["--performance", "true"])
+        }
+    }
+
+    @Test func payloadAddsPerformanceOnlyWhenRequested() throws {
+        let plain = UsageArgumentParser.requestPayload(try UsageArgumentParser.parse([]))
+        #expect(plain["performance"] == nil)
+        #expect(plain["group"] == "route")
+
+        let performance = UsageArgumentParser.requestPayload(
+            try UsageArgumentParser.parse(["--performance"]))
+        #expect(performance["performance"] == "true")
+        #expect(performance["group"] == "model")
+
+        // --json is still local-only and never sent alongside the performance flag.
+        let grouped = UsageArgumentParser.requestPayload(
+            try UsageArgumentParser.parse(["--performance", "--group", "provider", "--limit", "5", "--json"]))
+        #expect(grouped["group"] == "provider")
+        #expect(grouped["performance"] == "true")
+        #expect(grouped["limit"] == "5")
+        #expect(grouped["json"] == nil)
+    }
 }

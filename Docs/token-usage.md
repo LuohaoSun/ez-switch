@@ -19,6 +19,8 @@
 
 侧栏「用量」提供今日、近 7 天、本月和自定义日期范围。日期按本机时区计算，结束日期包含当天。输入与输出按日绘制堆叠趋势图，明细可按路由、供应商或实际模型分组。菜单中的今日用量可直接打开此页。
 
+侧栏「性能」是独立入口，按日期区间展示同一数据源下流式请求的首输出延迟（TTFT）与吞吐（TPS），口径见下文「性能统计」。
+
 CSV 导出保留所选时间范围内的逐次上游尝试记录。缓存和推理字段在导出中单独保留。导出不包含 API Key、请求头、提示词或回答正文。清空记录需要在界面确认，不修改路由配置。
 
 ## 命令行
@@ -30,14 +32,55 @@ ezs usage                                   # 今天，按路由分组，最多 
 ezs usage --period 7d --group provider      # 近 7 天，按供应商分组
 ezs usage --from 2026-01-01 --to 2026-01-31 --limit 1000
 ezs usage --json                            # 只输出 usage 对象
+ezs usage --performance                     # 追加流式性能（TTFT/TPS），默认按模型分组
+ezs usage --performance --group route --json
 ```
 
 - `--period today|7d|month`：预设区间，默认 `today`。`7d` 含今天及前 6 个自然日。
 - `--from`／`--to`：自定义区间，必须成对且不能与 `--period` 同时出现；日期按 `YYYY-MM-DD`，`--to` 含当天，实际日历有效性由应用校验。
 - `--group route|provider|model` 与 `--limit 1..1000`：分组维度与最大分组数，默认 `route`、`100`；被截断时提示 `showing N of M groups`。
-- `--json`：输出日期范围、总量、每日趋势、分组明细和报告覆盖率，Token 数值保留精确整数。分组限制只影响明细行，不改变总量或每日趋势。
+- `--performance`：在用量报告之外追加流式性能统计（TTFT/TPS）；未显式给出 `--group` 时性能默认按 `model` 分组，普通用量默认仍是 `route`。见下文「性能统计」。
+- `--json`：输出日期范围、总量、每日趋势、分组明细和报告覆盖率，Token 数值保留精确整数。分组限制只影响明细行，不改变总量或每日趋势；加 `--performance` 时输出 `{"usage": …, "performance": …}` 两个对象。
 
 文本输出给出精确的输入／输出／合计、缓存与推理细分、请求数、上游尝试、失败尝试与覆盖率，并列出每日趋势与分组摘要。覆盖率不足时明确标注合计为已上报部分、不是估算。空区间显示 `No usage recorded`，表示该范围内确实没有记录，而不是数据缺失。分组名称中的控制字符会被转义，避免终端转义序列注入；输出不含 API Key 或本机路径。旧版本应用不支持 `usage` 时会提示更新并重启。
+
+`--performance` 与既有参数完全复用：区间、分组、`--limit` 语义一致，`--limit` 同样只截取性能分组明细、保留全量 summary。应用端仅在请求明确带 `performance` 时才查询并返回性能对象；不带该字段的旧调用保持一致。旧版应用忽略该字段、不会返回 `performance`，此时 CLI 会明确提示 `does not support performance stats; update and restart`，而不是把缺失当成 0。
+
+## 性能统计（TTFT 与 TPS）
+
+`--performance` 报告流式请求的**首输出延迟（TTFT）**与**输出速率（TPS）**，用于比较实际使用表现，不是供应商计费或模型内部解码速率的度量。
+
+- **测量范围**：原生 Responses、Chat Completions、Anthropic Messages，以及经桥接转换的路由，均按**原始上游响应**测量；协议转换补出的事件不参与统计。
+- **TTFT**：从开始准备该次上游请求到收到**首个非空正文、推理或工具参数片段**的毫秒数。心跳、仅含角色或生命周期信息的事件不计入。流式片段可能包含多个 token，无法据此还原模型内部的首 token 生成时刻。
+- **TPS**：`上游报告的输出 token 数 ÷（首个有效输出片段到上游响应体正常结束）`，单位为 tok/s。计数可能包含未对外流出的推理 token，时间窗口包含尾部与网络收尾，因此只表示代理观测到的平均速率，不代表内部解码速度或屏幕上的文字出现速度。
+- **有效样本**：TPS 需要有效 TTFT、输出 tokens ≥ 2、有效输出事件 ≥ 2 且完整生成窗口大于零。默认分位数只纳入成功完成的流式尝试；失败或取消时仍保留已观测到的原始计时，但不纳入分位数。缺少输出 token 计数时只贡献 TTFT。超限或解析丢失导致无法可靠测量时，对应指标留空。
+- **requestTTFT 与 attemptTTFT**：按 `route` 分组时展示 **requestTTFT**，从路由器收到完整请求并进入候选尝试阶段开始计时，包含自动回退等待；按 `provider`／`model` 分组时展示 **attemptTTFT**，仅包含该次上游尝试自身的首输出等待。两者都在原始上游流上测量，后续输出翻译、事件重排及客户端渲染延迟不属于该口径。
+- **样本数**：TTFT samples 与展示口径一致——`route` 分组为 request 级样本数（JSON `requestTTFTSamples`），`provider`／`model` 分组为上游 attempt 样本数（`ttftSamples`）。两者可能不同；request 级样本缺失时按 0 显示并给出 warning，绝不用上游样本数冒充路由样本。TPS samples 独立统计。
+- **分位数**：P50／P95 使用 nearest-rank，样本不足时按已有样本计算。时间清楚标注单位（`ms` 或 `s`），TPS 单位为 `tok/s`。
+- **无样本**：没有对应样本时显示 `—`，JSON 中对应字段为 `null`，绝不显示为 0。
+- **历史**：早于本功能开始记录的历史尝试没有性能数据，与「无样本」一致；统计不持久化任何提示词或回答正文，只保留时延与 token 计数。
+
+命令行文本会先打印完整用量报告，再追加一段性能报告，例如：
+
+```text
+Performance (model)
+TTFT basis: upstream attempt
+
+Summary
+  Attempts: 12
+  Successful streaming: 9/12 attempts
+  TTFT samples: 9  TPS samples: 8
+  TTFT P50: 480 ms  TTFT P95: 2.40 s
+  TPS P50: 42.3 tok/s
+
+Groups
+  deepseek-v4.1-flash (command-wsz)
+    Attempts 12  Successful streaming 9/12 attempts
+    TTFT samples 9  TPS samples 8
+    TTFT P50 480 ms  P95 2.40 s  TPS P50 42.3 tok/s
+```
+
+按 `route` 分组时，标题下方提示 `TTFT basis: request (includes fallback)`，展示 requestTTFT。
 
 ## 存储与安装
 

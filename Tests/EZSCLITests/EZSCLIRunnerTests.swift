@@ -89,6 +89,59 @@ struct EZSCLIRunnerTests {
                                         "to": "2026-01-31", "group": "route", "limit": "100"]])
     }
 
+    // MARK: - Performance compatibility
+
+    @Test func usageWithoutPerformanceFlagIsUnchanged() throws {
+        let (runner, client) = self.runner(["ok": true, "usage": UsageFixture.usageObject()])
+        let output = try runner.run(["usage"])
+        #expect(client.sentPayloads == [["command": "usage", "period": "today",
+                                        "group": "route", "limit": "100"]])
+        #expect(client.sentPayloads[0]["performance"] == nil)
+        #expect(!output.contains("Performance ("))
+    }
+
+    @Test func usagePerformanceSendsFlagAndDefaultsGroupToModel() throws {
+        let usage = UsageFixture.usageObject()
+        let response: [String: Any] = ["ok": true, "usage": usage,
+                                       "performance": UsageFixture.performanceObject(grouping: "model")]
+        let (runner, client) = self.runner(response)
+        let output = try runner.run(["usage", "--performance"])
+
+        #expect(client.sentPayloads == [["command": "usage", "period": "today",
+                                        "group": "model", "limit": "100", "performance": "true"]])
+        // The usage report is still printed, followed by the performance section.
+        #expect(output.contains("Totals"))
+        #expect(output.contains("Performance (model)"))
+        #expect(output.contains("TTFT basis: upstream attempt"))
+    }
+
+    @Test func usagePerformanceJSONPrintsCombinedObjects() throws {
+        let usage = UsageFixture.usageObject()
+        let response: [String: Any] = ["ok": true, "usage": usage,
+                                       "performance": UsageFixture.performanceObject()]
+        let (runner, client) = self.runner(response)
+        let output = try runner.run(["usage", "--performance", "--json", "--group", "provider"])
+
+        #expect(client.sentPayloads == [["command": "usage", "period": "today",
+                                        "group": "provider", "limit": "100", "performance": "true"]])
+        let decoded = try #require(try JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+        #expect(decoded["usage"] != nil)
+        #expect((decoded["performance"] as? [String: Any])?["grouping"] as? String == "model")
+        #expect(!output.contains("\"ok\""))
+    }
+
+    @Test func usagePerformanceAgainstOldServerGivesUpgradeHint() {
+        // Old app answers usage but never returns a performance object.
+        let (runner, _) = self.runner(["ok": true, "usage": UsageFixture.usageObject()])
+        do {
+            _ = try runner.run(["usage", "--performance"])
+            Issue.record("expected an error")
+        } catch {
+            #expect(error.localizedDescription.contains("performance"))
+            #expect(error.localizedDescription.contains("update and restart"))
+        }
+    }
+
     @Test func oldServerUnknownCommandGivesUpgradeHint() {
         let (runner, _) = self.runner(["ok": false, "message": "unknown command"])
         do {

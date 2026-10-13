@@ -541,60 +541,88 @@ struct GeneralPane: View {
 
     @ViewBuilder
     private var updateContent: some View {
-        switch updater.state {
-        case .idle:
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            updateStatus
+            Spacer(minLength: 8)
             Button {
                 Task { await updater.check() }
             } label: {
                 Label("检查更新", systemImage: "arrow.clockwise")
             }
+            .disabled(updateBusy)
+            .help("检查是否有新版本")
+        }
+
+        if case .available(let release) = updater.state {
+            availableReleaseView(release)
+        }
+    }
+
+    private var updateBusy: Bool {
+        switch updater.state {
+        case .checking, .downloading, .verifying: return true
+        default: return false
+        }
+    }
+
+    @ViewBuilder
+    private var updateStatus: some View {
+        switch updater.state {
+        case .idle:
+            Text("尚未检查更新").foregroundStyle(.secondary)
         case .checking:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("正在检查更新…")
-            }
+            busyStatus("正在检查更新…")
         case .upToDate:
             Label("当前已是最新版本", systemImage: "checkmark.circle")
                 .foregroundStyle(.secondary)
-            Button("再次检查") { Task { await updater.check() } }
         case .available(let release):
-            VStack(alignment: .leading, spacing: 10) {
-                Label("发现新版本 \(release.version)", systemImage: "arrow.down.circle")
-                    .font(.headline)
-                if let body = release.body, !body.isEmpty {
-                    ScrollView {
-                        Text(body)
-                            .font(.caption)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(maxHeight: 140)
-                }
-                HStack {
-                    Link("查看 Release", destination: release.htmlURL)
-                    Button {
-                        Task { await updater.downloadAndOpen(release) }
-                    } label: {
-                        Label("下载并打开 DMG", systemImage: "arrow.down.doc")
-                    }
-                }
-            }
+            Label("发现新版本 \(release.version)", systemImage: "arrow.down.circle")
+                .font(.headline)
         case .downloading:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("正在下载 DMG…")
-            }
+            busyStatus("正在下载 DMG…")
         case .verifying:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("正在校验 SHA-256…")
-            }
+            busyStatus("正在校验 SHA-256…")
         case .ready(let fileName):
             Label("已打开 \(fileName)，请拖入 Applications 完成更新。", systemImage: "checkmark.circle")
                 .foregroundStyle(.secondary)
         case .failed(let message):
-            Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
-            Button("重新检查") { Task { await updater.check() } }
+            Label {
+                Text(message)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+            }
+            .foregroundStyle(.red)
+            .textSelection(.enabled)
+        }
+    }
+
+    private func busyStatus(_ text: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(text)
+        }
+    }
+
+    private func availableReleaseView(_ release: UpdateRelease) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let body = release.body, !body.isEmpty {
+                ScrollView {
+                    Text(body)
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 140)
+            }
+            HStack {
+                Link("查看 Release", destination: release.htmlURL)
+                Button {
+                    Task { await updater.downloadAndOpen(release) }
+                } label: {
+                    Label("下载并打开 DMG", systemImage: "arrow.down.doc")
+                }
+                .disabled(updateBusy)
+            }
         }
     }
 }
