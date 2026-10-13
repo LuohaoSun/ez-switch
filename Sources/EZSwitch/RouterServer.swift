@@ -223,6 +223,10 @@ enum RequestProcessor {
         let parsed: Any? = try? JSONSerialization.jsonObject(with: bodyData)
         let requested: String? = (parsed as? [String: Any])?["model"] as? String
 
+        // 请求开始时的权威代次快照：完成成功时若代次已变（手动选择或更晚的一次成功），
+        // 迟到的完成不得覆盖新的首选。
+        let selectionEpoch = requested.map { router.requestEpoch(fakeModelID: $0) }
+
         guard let route = router.candidates(fakeModelID: requested), !route.remotes.isEmpty else {
             // 无兜底：id 不存在 → 404（附 known_models）；存在但未绑可用远端 → 502
             if let req = requested, router.hasFake(fakeModelID: req) {
@@ -312,9 +316,6 @@ enum RequestProcessor {
                 selected = (remote, upstream)
                 selectedAttempt = attempt
                 selectedStarted = attemptStarted
-                if (200..<300).contains(status) {
-                    router.recordAttempt(fakeID: fake.id, remoteID: remote.id)
-                }
                 break
             } catch {
                 lastError = error
@@ -420,7 +421,9 @@ enum RequestProcessor {
                     upstream.cancel()
                 } else {
                     try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
-                    if isSuccess { router.recordSuccess(fakeID: fake.id, remoteID: remote.id) }
+                    if isSuccess {
+                        router.recordSuccess(fakeID: fake.id, remoteID: remote.id, epoch: selectionEpoch)
+                    }
                     outcome = isSuccess ? "success" : "httpError"
                 }
                 if retryableFailure {

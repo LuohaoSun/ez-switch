@@ -928,4 +928,129 @@ struct UsageIntegrationTests {
         #expect(events.events.isEmpty)
         #expect(hosts.values == ["fail.test"]) // 未启动下一个候选
     }
+
+    /// 一次自动回退成功后，下一次请求直接从成功的上游开始（运行期首选），不再触碰失败上游。
+    @Test func successfulFallbackIsPreferredOnNextRequest() async throws {
+        let hosts = StringListSpy()
+        let upstream = mockSession { request in
+            hosts.append(request.url?.host ?? "")
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 503,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let server = RouterServer(router: router, session: upstream)
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let firstResponse = try await post(session, port: port, path: "/v1/chat/completions",
+                                           body: #"{"model":"main","stream":false}"#)
+        #expect(firstResponse.statusCode == 200)
+
+        // 等到首个请求“完成成功”把首选提升为 good.test（recordSuccess 在响应 end 之后调用）。
+        let deadline = uptimeDeadline(5)
+        while router.activeRemoteID(fakeID: fake.id) != second.id, DispatchTime.now() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(router.activeRemoteID(fakeID: fake.id) == second.id)
+
+        let secondResponse = try await post(session, port: port, path: "/v1/chat/completions",
+                                            body: #"{"model":"main","stream":false}"#)
+        #expect(secondResponse.statusCode == 200)
+
+        // 第二次请求直接命中 good.test，未再触碰 fail.test。
+        #expect(hosts.values.filter { $0 == "good.test" }.count == 2)
+        #expect(hosts.values.filter { $0 == "fail.test" }.count == 1)
+    }
+
+    /// 回退目标已返回 2xx 并送来首块后客户端取消：未完成成功，不得提升首选。
+    @Test func cancellationAfterFallbackHeadDoesNotPromote() async throws {
+        let firstChunk = Data("data: {\"usage\":{\"prompt_tokens\":5}}\n\n".utf8)
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 503,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "text/event-stream"],
+                chunks: [firstChunk], chunkDelay: 1.0, finishDelay: 10)
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let server = RouterServer(router: router, session: upstream)
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let client = try #require(RawSocketClient(port: port))
+        client.send(Data(rawRequest(path: "/v1/chat/completions",
+                                    body: #"{"model":"main","stream":true}"#).utf8))
+        // 等到回退目标 good.test 已返回 2xx 并送来首块，再断开（取消）。
+        #expect(client.readUntil("prompt_tokens", timeout: 5))
+        client.closeSocket()
+
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        #expect(router.activeRemoteID(fakeID: fake.id) == first.id) // 未提升首选
+    }
+
+    /// 在途请求等待回退目标响应头期间用户手动选择：迟到的完成成功不得覆盖。
+    @Test func staleManualSelectionDuringFallbackIsNotOverridden() async throws {
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 503,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"busy"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[],"usage":{"prompt_tokens":1}}"#.utf8)],
+                headDelay: 0.4)
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let server = RouterServer(router: router, session: upstream)
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        async let response = post(session, port: port, path: "/v1/chat/completions",
+                                  body: #"{"model":"main","stream":false}"#)
+        // 在途请求正等待 good.test 响应头时（headDelay 0.4s）手动选回第一个。
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        router.selectRemote(fakeID: fake.id, remoteID: first.id)
+
+        _ = try await response
+        #expect(router.activeRemoteID(fakeID: fake.id) == first.id) // 迟到完成被代次拦截
+    }
 }
