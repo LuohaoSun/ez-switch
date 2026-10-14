@@ -262,19 +262,28 @@ struct UsageReport: Decodable, Equatable {
 // MARK: - Performance report models
 
 /// The optional `performance` object returned alongside `usage` when it is requested.
+///
+/// Metrics are averages (not percentiles). Older payloads predate the mean fields
+/// entirely and are rejected up-front by key presence, so a present-but-null value
+/// here always means "measured, no valid sample" rather than "old server".
 struct PerformanceReportSummary: Decodable, Equatable {
     var attempts: Int
     var successfulStreamingAttempts: Int
     var ttftSamples: Int
-    /// Optional so payloads predating this field still decode; a missing value is not
-    /// the same as the upstream attempt sample count and is never substituted for it.
+    /// Optional so a payload that omits it still decodes; a missing value is never
+    /// substituted with the upstream attempt sample count.
     var requestTTFTSamples: Int?
     var tpsSamples: Int
-    var ttftP50MS: Double?
-    var ttftP95MS: Double?
-    var requestTTFTP50MS: Double?
-    var requestTTFTP95MS: Double?
-    var tpsP50: Double?
+    /// Average first-output latency (ms) of upstream attempts.
+    var ttftMeanMS: Double?
+    /// Average request-level first-output latency (ms), including fallback waiting.
+    var requestTTFTMeanMS: Double?
+    /// Average output throughput (tok/s) counting TTFT in the window.
+    var tpsIncludingTTFT: Double?
+    /// Request-scope variant of `tpsIncludingTTFT`, including fallback waiting.
+    var requestTpsIncludingTTFT: Double?
+    /// Average output throughput (tok/s) over generation time only, excluding TTFT.
+    var tpsExcludingTTFT: Double?
 }
 
 struct PerformanceReportGroup: Decodable, Equatable {
@@ -301,6 +310,10 @@ enum UsageResponseError: Error, LocalizedError, Equatable {
     /// The running app answered `usage` but ignores `performance`, so it predates
     /// performance stats. We say so rather than reporting zeros.
     case performanceUnsupported
+    /// The running app returns a `performance` object but only the old percentile
+    /// fields, so it predates the average metrics. Reported as an update hint instead
+    /// of decoding every new field as silently nil.
+    case performanceStatsUnsupported
     case server(String)
     case invalidResponse(String)
 
@@ -310,6 +323,8 @@ enum UsageResponseError: Error, LocalizedError, Equatable {
             return "the running EZ Switch does not support usage; update and restart the app, then try again"
         case .performanceUnsupported:
             return "the running EZ Switch does not support performance stats; update and restart the app, then try again"
+        case .performanceStatsUnsupported:
+            return "the running EZ Switch does not report average performance metrics; update and restart the app, then try again"
         case .server(let message):
             return message
         case .invalidResponse(let detail):
@@ -368,6 +383,14 @@ enum UsageResponseParser {
             guard let raw = object["performance"] as? [String: Any] else {
                 throw UsageResponseError.performanceUnsupported
             }
+            // A server that predates the average metrics still returns a `performance`
+            // object, but only the old percentile fields; decoding would leave every
+            // new field nil. Detect the absent keys on the raw JSON so the old server
+            // reads as an update hint, while a new server's all-nil payload (no valid
+            // samples) stays valid because its keys are present as null.
+            guard hasAverageMetrics(raw) else {
+                throw UsageResponseError.performanceStatsUnsupported
+            }
             do {
                 let performanceData = try JSONSerialization.data(withJSONObject: raw)
                 performance = try JSONDecoder().decode(PerformanceReport.self, from: performanceData)
@@ -378,6 +401,28 @@ enum UsageResponseParser {
         }
         return ParsedUsage(report: report, jsonObject: usage,
                            performance: performance, performanceJSONObject: performanceObject)
+    }
+
+    /// Keys introduced with the average metrics. New payloads always include them
+    /// (serialised as null when unmeasured), so their presence marks a mean-capable
+    /// server; a payload carrying only the old percentile fields does not.
+    static let averageMetricKeys = [
+        "ttftMeanMS", "requestTTFTMeanMS", "tpsIncludingTTFT",
+        "requestTpsIncludingTTFT", "tpsExcludingTTFT",
+    ]
+
+    /// True when the summary or any group summary carries at least one average-metric
+    /// key. Presence is checked on the raw JSON, not the decoded value.
+    static func hasAverageMetrics(_ performance: [String: Any]) -> Bool {
+        var summaries: [[String: Any]] = []
+        if let summary = performance["summary"] as? [String: Any] { summaries.append(summary) }
+        for group in (performance["groups"] as? [[String: Any]]) ?? [] {
+            if let summary = group["summary"] as? [String: Any] { summaries.append(summary) }
+        }
+        for summary in summaries where averageMetricKeys.contains(where: { summary[$0] != nil }) {
+            return true
+        }
+        return false
     }
 }
 
@@ -497,45 +542,52 @@ enum UsageTextFormatter {
         return String(format: "%.1f tok/s", tokensPerSecond)
     }
 
-    /// Route grouping reports request-level TTFT (which includes fallback); every other
-    /// grouping reports the upstream attempt TTFT.
-    private static func ttftP50(_ summary: PerformanceReportSummary, grouping: String) -> Double? {
-        grouping == "route" ? summary.requestTTFTP50MS : summary.ttftP50MS
+    // Average metrics. The overall summary is always request scope
+    // (requestTTFTMeanMS / requestTpsIncludingTTFT), matching the old overall
+    // requestTTFT. Group rows follow the grouping: route -> request scope,
+    // provider/model -> upstream attempt. TPS excluding TTFT is a single shared
+    // field with no request/attempt distinction.
+
+    private static func requestTTFTMean(_ summary: PerformanceReportSummary) -> Double? {
+        summary.requestTTFTMeanMS
     }
 
-    private static func ttftP95(_ summary: PerformanceReportSummary, grouping: String) -> Double? {
-        grouping == "route" ? summary.requestTTFTP95MS : summary.ttftP95MS
+    private static func requestTpsIncludingTTFT(_ summary: PerformanceReportSummary) -> Double? {
+        summary.requestTpsIncludingTTFT
     }
 
-    /// The sample count that backs the TTFT columns for the active grouping. A missing
-    /// `requestTTFTSamples` (old payload) reads as 0, never as the upstream attempt count.
+    private static func groupTTFTMean(_ summary: PerformanceReportSummary, grouping: String) -> Double? {
+        grouping == "route" ? summary.requestTTFTMeanMS : summary.ttftMeanMS
+    }
+
+    private static func groupTpsIncludingTTFT(_ summary: PerformanceReportSummary, grouping: String) -> Double? {
+        grouping == "route" ? summary.requestTpsIncludingTTFT : summary.tpsIncludingTTFT
+    }
+
+    private static func tpsExcludingTTFT(_ summary: PerformanceReportSummary) -> Double? {
+        summary.tpsExcludingTTFT
+    }
+
+    /// The sample count backing the TTFT metric for the active grouping. A missing
+    /// `requestTTFTSamples` reads as 0, never as the upstream attempt count.
     private static func ttftSampleCount(_ summary: PerformanceReportSummary, grouping: String) -> Int {
         grouping == "route" ? (summary.requestTTFTSamples ?? 0) : summary.ttftSamples
     }
 
-    private static func ttftBasisLine(grouping: String) -> String {
-        grouping == "route" ? "TTFT basis: request (includes fallback)"
-                            : "TTFT basis: upstream attempt"
-    }
-
-    /// Route grouping can have request-level TTFT missing while upstream attempt TTFT
-    /// exists; warn instead of silently presenting the wrong basis.
-    private static func ttftWarning(_ summary: PerformanceReportSummary, grouping: String) -> String? {
-        guard grouping == "route", (summary.requestTTFTSamples ?? 0) == 0, summary.ttftSamples > 0 else {
-            return nil
-        }
-        return "Warning: no request-level TTFT samples; upstream attempt TTFT is not shown for route grouping"
+    private static func groupsBasisLine(grouping: String) -> String {
+        grouping == "route" ? "request (includes fallback)" : "upstream attempt"
     }
 
     static func renderPerformance(_ report: PerformanceReport, options: UsageOptions) -> String {
         let grouping = report.grouping
-        var lines = ["Performance (\(sanitize(grouping)))", ttftBasisLine(grouping: grouping)]
+        var lines = ["Performance (\(sanitize(grouping)))",
+                     "Overall basis: request scope (includes fallback)"]
 
         // Always show the summary (with dashes for missing values) so "no samples" reads
         // as — rather than being hidden.
         lines.append("")
         lines.append("Summary")
-        lines.append(contentsOf: performanceSummaryLines(report.summary, grouping: grouping, indent: "  "))
+        lines.append(contentsOf: performanceSummaryLines(report.summary, indent: "  "))
 
         if report.summary.attempts == 0 && report.groups.isEmpty {
             lines.append("")
@@ -544,7 +596,7 @@ enum UsageTextFormatter {
         }
 
         lines.append("")
-        lines.append(performanceGroupsHeading(report))
+        lines.append(performanceGroupsHeading(report, grouping: grouping))
         if report.groups.isEmpty {
             lines.append("  (none)")
         } else {
@@ -556,24 +608,20 @@ enum UsageTextFormatter {
     }
 
     private static func performanceSummaryLines(_ summary: PerformanceReportSummary,
-                                                grouping: String, indent: String) -> [String] {
-        var lines = [
+                                                indent: String) -> [String] {
+        [
             "\(indent)Attempts: \(count(summary.attempts))",
             "\(indent)Successful streaming: \(count(summary.successfulStreamingAttempts))/\(count(summary.attempts)) attempts",
-            "\(indent)TTFT samples: \(count(ttftSampleCount(summary, grouping: grouping)))  "
+            "\(indent)TTFT samples: \(count(summary.requestTTFTSamples ?? 0))  "
                 + "TPS samples: \(count(summary.tpsSamples))",
-            "\(indent)TTFT P50: \(duration(ttftP50(summary, grouping: grouping)))  "
-                + "TTFT P95: \(duration(ttftP95(summary, grouping: grouping)))",
-            "\(indent)TPS P50: \(rate(summary.tpsP50))",
+            "\(indent)Average TTFT: \(duration(requestTTFTMean(summary)))",
+            "\(indent)Average TPS (incl TTFT): \(rate(requestTpsIncludingTTFT(summary)))",
+            "\(indent)Average TPS (excl TTFT): \(rate(tpsExcludingTTFT(summary)))",
         ]
-        if let warning = ttftWarning(summary, grouping: grouping) {
-            lines.append("\(indent)\(warning)")
-        }
-        return lines
     }
 
-    private static func performanceGroupsHeading(_ report: PerformanceReport) -> String {
-        var heading = "Groups"
+    private static func performanceGroupsHeading(_ report: PerformanceReport, grouping: String) -> String {
+        var heading = "Groups — basis: \(groupsBasisLine(grouping: grouping))"
         if report.truncated {
             heading += " — showing \(report.groups.count) of \(report.groupCount) groups; raise --limit to see more"
         }
@@ -586,19 +634,16 @@ enum UsageTextFormatter {
             header += " (\(sanitize(group.subtitle)))"
         }
         let summary = group.summary
-        var lines = [
+        return [
             header,
             "    Attempts \(count(summary.attempts))  "
                 + "Successful streaming \(count(summary.successfulStreamingAttempts))/\(count(summary.attempts)) attempts",
             "    TTFT samples \(count(ttftSampleCount(summary, grouping: grouping)))  "
                 + "TPS samples \(count(summary.tpsSamples))",
-            "    TTFT P50 \(duration(ttftP50(summary, grouping: grouping)))  "
-                + "P95 \(duration(ttftP95(summary, grouping: grouping)))  TPS P50 \(rate(summary.tpsP50))",
+            "    Average TTFT \(duration(groupTTFTMean(summary, grouping: grouping)))  "
+                + "Average TPS (incl TTFT) \(rate(groupTpsIncludingTTFT(summary, grouping: grouping)))  "
+                + "Average TPS (excl TTFT) \(rate(tpsExcludingTTFT(summary)))",
         ]
-        if let warning = ttftWarning(summary, grouping: grouping) {
-            lines.append("    \(warning)")
-        }
-        return lines
     }
 
     // MARK: Section builders

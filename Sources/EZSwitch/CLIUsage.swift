@@ -255,11 +255,11 @@ enum CLIUsage {
             "ttftSamples": summary.ttftSamples,
             "requestTTFTSamples": summary.requestTTFTSamples,
             "tpsSamples": summary.tpsSamples,
-            "ttftP50MS": finiteNumber(summary.ttftP50MS),
-            "ttftP95MS": finiteNumber(summary.ttftP95MS),
-            "requestTTFTP50MS": finiteNumber(summary.requestTTFTP50MS),
-            "requestTTFTP95MS": finiteNumber(summary.requestTTFTP95MS),
-            "tpsP50": finiteNumber(summary.tpsP50),
+            "ttftMeanMS": finiteNumber(summary.ttftMeanMS),
+            "requestTTFTMeanMS": finiteNumber(summary.requestTTFTMeanMS),
+            "tpsIncludingTTFT": finiteNumber(summary.tpsIncludingTTFT),
+            "requestTpsIncludingTTFT": finiteNumber(summary.requestTpsIncludingTTFT),
+            "tpsExcludingTTFT": finiteNumber(summary.tpsExcludingTTFT),
         ]
     }
 

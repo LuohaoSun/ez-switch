@@ -80,26 +80,32 @@ struct UsageView: View {
                 }
             }
 
-            // 单行只放区间选择器；日期控件另起一行，避免在最小宽度下撑宽布局。
+            // 单行只放区间选择器；自定义天数输入另起一行，避免在最小宽度下撑宽布局。
             Picker("时间区间", selection: $model.preset) {
-                ForEach(UsageRangePreset.allCases) { preset in
+                ForEach(UsageRangePreset.pagePresets) { preset in
                     Text(preset.title).tag(preset)
                 }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 280)
+            .fixedSize()
+            .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityLabel("时间区间")
 
             if model.preset == .custom {
-                HStack(spacing: 12) {
-                    DatePicker("开始", selection: $model.customStart, displayedComponents: .date)
-                        .fixedSize()
-                        .help("起始日期（含当天）")
-                    DatePicker("结束", selection: $model.customEnd, displayedComponents: .date)
-                        .fixedSize()
-                        .help("结束日期（含当天）")
-                    Spacer(minLength: 0)
+                HStack(spacing: 6) {
+                    Text("近")
+                    TextField("", text: customDaysBinding, onEditingChanged: { editing in
+                        if !editing { model.commitCustomLastNDaysInput() }
+                    })
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .frame(width: 52)
+                    .multilineTextAlignment(.center)
+                    .onSubmit { model.commitCustomLastNDaysInput() }
+                    .accessibilityLabel("最近天数")
+                    .help("输入正整数天数，回车或失焦生效")
+                    Text("天")
                 }
             }
 
@@ -119,7 +125,21 @@ struct UsageView: View {
 
     private var rangeSummary: String {
         let range = model.range
-        return "\(UsageFormat.day(range.from)) – \(UsageFormat.day(range.inclusiveEnd))（含结束日）"
+        return "\(UsageFormat.day(range.from)) – \(UsageFormat.day(range.inclusiveEnd))"
+    }
+
+    /// 仅合法正整数即时生效；非法输入只改缓冲，提交时回退，避免瞬时错误范围。
+    private var customDaysBinding: Binding<String> {
+        Binding(
+            get: { model.customLastNDaysInput },
+            set: { newValue in
+                model.customLastNDaysInput = newValue
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let value = Int(trimmed), value >= 1 {
+                    model.customLastNDays = min(value, model.maxCustomLastNDays)
+                }
+            }
+        )
     }
 
     private var actionErrorBinding: Binding<Bool> {
@@ -232,32 +252,41 @@ struct UsageView: View {
 
     // MARK: - 图表
 
+    /// 「今天」按小时展示，其余区间按天展示。
+    private var isHourlyChart: Bool { model.preset == .today }
+
+    private var chartPoints: [UsageDay] {
+        isHourlyChart ? model.snapshot.hours : model.snapshot.days
+    }
+
+    /// X 轴单位：今天用小时，其余用天。
+    private var chartUnit: Calendar.Component { isHourlyChart ? .hour : .day }
+
     private var chartDates: [Date] {
-        let calendar = Calendar.current
         let range = model.range
-        let days = max(1, calendar.dateComponents([.day], from: range.from, to: range.to).day ?? 1)
-        let step = max(1, Int(ceil(Double(days) / 7)))
-        return stride(from: 0, to: days, by: step).compactMap { offset in
-            guard let day = calendar.date(byAdding: .day, value: offset, to: range.from) else { return nil }
-            return calendar.date(bySettingHour: 12, minute: 0, second: 0, of: day)
-        }
+        return UsageAxisTicks.days(from: range.from, to: range.to)
+    }
+
+    private var chartHours: [Date] {
+        let range = model.range
+        return UsageAxisTicks.hours(from: range.from, to: range.to)
     }
 
     private var chartCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("每日 Token").font(.headline)
+            Text(isHourlyChart ? "每小时 Token" : "每日 Token").font(.headline)
 
-            Chart(model.snapshot.days) { day in
+            Chart(chartPoints) { point in
                 BarMark(
-                    x: .value("日期", day.date, unit: .day),
-                    y: .value("输入", day.input)
+                    x: .value(isHourlyChart ? "时间" : "日期", point.date, unit: chartUnit),
+                    y: .value("输入", point.input)
                 )
                 .foregroundStyle(by: .value("类型", "输入"))
                 .cornerRadius(3)
 
                 BarMark(
-                    x: .value("日期", day.date, unit: .day),
-                    y: .value("输出", day.output)
+                    x: .value(isHourlyChart ? "时间" : "日期", point.date, unit: chartUnit),
+                    y: .value("输出", point.output)
                 )
                 .foregroundStyle(by: .value("类型", "输出"))
                 .cornerRadius(3)
@@ -277,16 +306,16 @@ struct UsageView: View {
                 }
             }
             .chartXAxis {
-                AxisMarks(values: chartDates) { value in
+                AxisMarks(values: isHourlyChart ? chartHours : chartDates) { value in
                     AxisGridLine()
                     AxisValueLabel {
                         if let date = value.as(Date.self) {
-                            Text(UsageFormat.axisDay(date))
+                            Text(isHourlyChart ? UsageFormat.axisHour(date) : UsageFormat.axisDay(date))
                         }
                     }
                 }
             }
-            // 固定 X 轴为当前区间，避免"近 7 天只有一天有数据"时被压成今日外观。
+            // 固定 X 轴为当前区间，避免「近 7 天只有一天有数据」时被压成今日外观。
             .chartXScale(domain: model.range.from...model.range.to)
             .frame(height: 180)
         }

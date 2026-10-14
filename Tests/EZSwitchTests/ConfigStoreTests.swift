@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import NIOHTTP1
 import Testing
@@ -633,6 +634,73 @@ struct ConfigStoreTests {
 
         #expect(error == nil)
         #expect(store.config.remotes.map(\.model) == ["one"])
+    }
+
+    @Test
+    func reloadFromDiskSkipsRedundantSelfWriteButLoadsExternalEdit() throws {
+        let alpha = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                               baseURL: "https://alpha.example")
+        let beta = makeRemote(name: "Beta · one", model: "one", apiKey: "b",
+                              baseURL: "https://beta.example")
+        let route = FakeModel(id: UUID(), fakeModelID: "chat", displayName: "chat", remoteID: alpha.id)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EZSwitchTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("config.json")
+        try JSONEncoder().encode(AppConfig(port: 8788, remotes: [alpha, beta], fakes: [route])).write(to: url)
+
+        let store = ConfigStore(configURL: url)
+        var publishes = 0
+        let token = store.objectWillChange.sink { _ in publishes += 1 }
+        defer { token.cancel() }
+
+        store.moveProviders(sources: ["Alpha"], before: nil)   // 排序并写盘（等价 drop 的 save）
+        let afterMove = publishes
+        #expect(afterMove >= 1)
+
+        store.reloadFromDisk()                                 // watcher 路径：内容与内存一致
+        #expect(publishes == afterMove)
+
+        var external = store.config
+        external.port = 9999
+        try JSONEncoder().encode(external).write(to: url, options: .atomic)
+        store.reloadFromDisk()                                 // 真实外部修改：必须加载
+        #expect(publishes == afterMove + 1)
+        #expect(store.config.port == 9999)
+    }
+
+    /// 真实 file watcher 端到端：自写盘不重发布；外部写入必须被加载（证明监控确实在跑）。
+    @Test
+    func fileWatcherIgnoresSelfWriteButLoadsExternalEdit() async throws {
+        let alpha = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                               baseURL: "https://alpha.example")
+        let beta = makeRemote(name: "Beta · one", model: "one", apiKey: "b",
+                              baseURL: "https://beta.example")
+        let route = FakeModel(id: UUID(), fakeModelID: "chat", displayName: "chat", remoteID: alpha.id)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EZSwitchTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("config.json")
+        try JSONEncoder().encode(AppConfig(port: 8788, remotes: [alpha, beta], fakes: [route])).write(to: url)
+
+        let store = ConfigStore(configURL: url, startsWatching: true)
+        var publishes = 0
+        let token = store.objectWillChange.sink { _ in publishes += 1 }
+        defer { token.cancel() }
+
+        store.moveProviders(sources: ["Alpha"], before: nil)   // 自写盘 → watcher 事件
+        let afterMove = publishes
+        try await Task.sleep(nanoseconds: 800_000_000)          // > 500ms reload debounce
+        #expect(publishes == afterMove)
+
+        var external = store.config
+        external.port = 9999
+        try JSONEncoder().encode(external).write(to: url, options: .atomic)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        #expect(publishes > afterMove)
+        #expect(store.config.port == 9999)
     }
 
     private func makeStore(remotes: [RemoteModel], fakes: [FakeModel]) throws -> ConfigStore {

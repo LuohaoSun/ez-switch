@@ -20,6 +20,11 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
             ],
             path: "Sources/EZSwitch",
+            resources: [
+                // 预设供应商品牌图标，随 target 生成 EZSwitch_EZSwitch.bundle；
+                // build-app.sh 再把该 bundle 复制进 .app/Contents/Resources。
+                .copy("Resources/ProviderIcons")
+            ],
             linkerSettings: [
                 // SwiftPM 在 macOS 13 部署目标下会把 LC_BUILD_VERSION.sdk 写成 13.0，
                 // 导致系统按老 SDK 应用渲染。保留 minOS 13.0，同时把链接 SDK 标为 27.0。

@@ -3,16 +3,18 @@ import CoreFoundation
 import NIOCore
 
 /// Which upstream protocol produced a usage payload.
-enum UsageSource: Sendable {
+enum UsageSource: Sendable, Equatable {
     case chat
     case responses
     case messages
+    case gemini
 
     init(endpoint: EndpointKind) {
         switch endpoint {
         case .chat: self = .chat
         case .responses: self = .responses
         case .messages: self = .messages
+        case .gemini: self = .gemini
         }
     }
 }
@@ -22,7 +24,8 @@ enum UsageSource: Sendable {
 typealias UsageRecorder = @Sendable (UsageRecord) -> Void
 
 /// Incremental token-usage extractor for OpenAI Chat Completions, OpenAI
-/// Responses and Anthropic Messages, in both plain JSON and SSE form.
+/// Responses, Anthropic Messages and native Gemini `generateContent` /
+/// `streamGenerateContent`, in both plain JSON and SSE form.
 ///
 /// Streaming values are cumulative: a later event overwrites an earlier one
 /// rather than accumulating. Missing fields stay `nil`; an explicitly reported
@@ -31,6 +34,12 @@ typealias UsageRecorder = @Sendable (UsageRecord) -> Void
 /// real count. Memory stays bounded: a single oversized SSE line is dropped
 /// (later events, including the final usage event, are still parsed), and a
 /// non-streaming body beyond `maxBodyBytes` is not parsed at all.
+///
+/// Gemini's `usageMetadata`: `input` = `promptTokenCount` +
+/// `toolUsePromptTokenCount` (cached is already inside prompt), `output` =
+/// `candidatesTokenCount` + `thoughtsTokenCount`, `cachedInput` =
+/// `cachedContentTokenCount`, `reasoning` = `thoughtsTokenCount`. `countTokens`
+/// responses are input estimates, not generation usage, and are ignored.
 struct UsageParser {
     /// Largest single SSE line kept in memory. Longer lines are discarded.
     static let maxEventBytes = 1 << 20
@@ -39,6 +48,9 @@ struct UsageParser {
 
     private static let dataPrefix = Data("data:".utf8)
     private static let usageMarker = Data(#""usage""#.utf8)
+    /// Gemini nests usage under `usageMetadata`; the `"usage"` marker above does
+    /// not match it, so the pre-filter must be selected per source.
+    private static let geminiUsageMarker = Data(#""usageMetadata""#.utf8)
 
     private let source: UsageSource
     private let streaming: Bool
@@ -59,6 +71,13 @@ struct UsageParser {
     private var cached: Int?
     private var cacheWrite: Int?
     private var reasoning: Int?
+
+    // Gemini components tracked independently so a partial cumulative snapshot
+    // that omits an already-reported field cannot drop it from the sums.
+    private var geminiPrompt: Int?
+    private var geminiToolUse: Int?
+    private var geminiCandidates: Int?
+    private var geminiThoughts: Int?
 
     init(source: UsageSource, streaming: Bool) {
         self.source = source
@@ -84,7 +103,10 @@ struct UsageParser {
     mutating func finish() {
         if streaming {
             defer { lineBuffer.removeAll(keepingCapacity: false) }
-            if lineBuffer.first == 0x7B { // '{' — plain JSON body despite SSE framing
+            // '{' = plain JSON object despite SSE framing; for Gemini also '[' =
+            // the whole native streamGenerateContent JSON-array body (SSE
+            // framing absent), whose last cumulative snapshot wins.
+            if lineBuffer.first == 0x7B || (source == .gemini && lineBuffer.first == 0x5B) {
                 parseUsage(from: lineBuffer)
                 lineBuffer.removeAll(keepingCapacity: false)
                 return
@@ -100,7 +122,7 @@ struct UsageParser {
     var snapshot: UsageTokens {
         var tokens = UsageTokens()
         switch source {
-        case .chat, .responses:
+        case .chat, .responses, .gemini:
             tokens.input = rawInput
             tokens.output = rawOutput
             tokens.cachedInput = cached
@@ -197,11 +219,22 @@ struct UsageParser {
     }
 
     private mutating func parseUsage(from data: Data) {
-        // Cheap pre-filter: usage only ever appears under a "usage" key, so most
-        // streaming delta events never pay for a full JSON decode.
-        guard data.range(of: UsageParser.usageMarker) != nil else { return }
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        apply(object)
+        // Cheap pre-filter: usage only ever appears under a "usage" key (or
+        // "usageMetadata" for Gemini), so most streaming delta events never pay
+        // for a full JSON decode.
+        let marker = source == .gemini ? UsageParser.geminiUsageMarker : UsageParser.usageMarker
+        guard data.range(of: marker) != nil else { return }
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return }
+        if let dictionary = object as? [String: Any] {
+            apply(dictionary)
+        } else if source == .gemini, let array = object as? [Any] {
+            // Native non-SSE `streamGenerateContent` returns a JSON array; each
+            // element carries a cumulative usageMetadata, so later elements
+            // overwrite earlier ones (never summed).
+            for element in array {
+                if let dictionary = element as? [String: Any] { apply(dictionary) }
+            }
+        }
     }
 
     private mutating func apply(_ object: [String: Any]) {
@@ -220,6 +253,8 @@ struct UsageParser {
                 usage = message["usage"] as? [String: Any]
             }
             if let usage { applyAnthropic(usage) }
+        case .gemini:
+            if let usage = object["usageMetadata"] as? [String: Any] { applyGemini(usage) }
         }
     }
 
@@ -254,6 +289,43 @@ struct UsageParser {
         if let value = UsageParser.integer(usage["cache_read_input_tokens"]) { cached = value }
         if let value = UsageParser.integer(usage["cache_creation_input_tokens"]) { cacheWrite = value }
         if let reasoningTokens { reasoning = reasoningTokens }
+    }
+
+    /// Native Gemini `usageMetadata`: input = prompt + tool-use prompt (cache is
+    /// already inside prompt), output = candidates + thoughts, reasoning = thoughts.
+    /// Optional components are independently last-valid: omitted after being
+    /// reported they keep their value (never drop out of the sum), explicit 0
+    /// resets, invalid never overwrites, and unknown sides stay unknown.
+    private mutating func applyGemini(_ usage: [String: Any]) {
+        if let value = UsageParser.integer(usage["promptTokenCount"]) { geminiPrompt = value }
+        if let value = UsageParser.integer(usage["toolUsePromptTokenCount"]) { geminiToolUse = value }
+        if let value = UsageParser.integer(usage["cachedContentTokenCount"]) { cached = value }
+        if let value = UsageParser.integer(usage["candidatesTokenCount"]) { geminiCandidates = value }
+        if let value = UsageParser.integer(usage["thoughtsTokenCount"]) { geminiThoughts = value }
+
+        if let prompt = geminiPrompt {
+            rawInput = geminiToolUse == nil ? prompt : UsageParser.add(prompt, geminiToolUse)
+        }
+        if let candidates = geminiCandidates {
+            rawOutput = geminiThoughts == nil ? candidates
+                : UsageParser.add(candidates, geminiThoughts)
+        }
+        reasoning = geminiThoughts
+
+        reconcileGeminiTotal(usage)
+    }
+
+    /// Fill only a single side missing from the authoritative `totalTokenCount`
+    /// (= input + output): never invent a negative, never overwrite a set side.
+    private mutating func reconcileGeminiTotal(_ usage: [String: Any]) {
+        guard let total = UsageParser.integer(usage["totalTokenCount"]) else { return }
+        if rawInput == nil, let output = rawOutput {
+            let (derived, overflow) = total.subtractingReportingOverflow(output)
+            if !overflow, derived >= 0 { rawInput = derived }
+        } else if rawOutput == nil, let input = rawInput {
+            let (derived, overflow) = total.subtractingReportingOverflow(input)
+            if !overflow, derived >= 0 { rawOutput = derived }
+        }
     }
 
     // MARK: - Number handling

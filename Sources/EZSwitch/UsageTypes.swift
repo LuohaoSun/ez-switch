@@ -84,5 +84,7 @@ struct UsageGroupRow: Identifiable, Sendable {
 struct UsageSnapshot: Sendable {
     var totals = UsageTotals()
     var days: [UsageDay] = []
+    /// 本地日历小时分桶；仅在 `snapshot(includeHourly: true)` 时填充。
+    var hours: [UsageDay] = []
     var groups: [UsageGroupRow] = []
 }

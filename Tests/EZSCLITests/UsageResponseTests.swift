@@ -105,42 +105,42 @@ struct UsageResponseTests {
         #expect(report.summary.ttftSamples == 4)
         #expect(report.summary.requestTTFTSamples == 4)
         #expect(report.summary.tpsSamples == 3)
-        #expect(report.summary.ttftP50MS == 1200)
-        #expect(report.summary.ttftP95MS == 2100)
-        #expect(report.summary.requestTTFTP50MS == 1500)
-        #expect(report.summary.requestTTFTP95MS == 2400)
-        #expect(report.summary.tpsP50 == 42.3)
+        #expect(report.summary.ttftMeanMS == 1200)
+        #expect(report.summary.requestTTFTMeanMS == 1500)
+        #expect(report.summary.tpsIncludingTTFT == 42.3)
+        #expect(report.summary.requestTpsIncludingTTFT == 38.0)
+        #expect(report.summary.tpsExcludingTTFT == 55.1)
         #expect(report.groups.first?.title == "gpt-4o")
         #expect(report.groups.first?.subtitle == "OpenAI")
-        #expect(report.groups.first?.summary.tpsP50 == 42.3)
+        #expect(report.groups.first?.summary.tpsIncludingTTFT == 42.3)
         #expect(parsed.performanceJSONObject != nil)
     }
 
-    @Test func nullPerformanceStatsDecodeAsNil() throws {
+    @Test func nullAverageMetricsDecodeAsNil() throws {
         let summary = UsageFixture.performanceSummary(ttftSamples: 0, requestTTFTSamples: 0, tpsSamples: 0,
-                                                      ttftP50MS: nil, ttftP95MS: nil,
-                                                      requestTTFTP50MS: nil, requestTTFTP95MS: nil,
-                                                      tpsP50: nil)
+                                                      ttftMeanMS: nil, requestTTFTMeanMS: nil,
+                                                      tpsIncludingTTFT: nil, requestTpsIncludingTTFT: nil,
+                                                      tpsExcludingTTFT: nil)
         let performance = UsageFixture.performanceObject(summary: summary)
         // Serialised as JSON null, not omitted.
         let data = UsageFixture.envelope(usage: UsageFixture.usageObject(), performance: performance)
         let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         let rawSummary = try #require((object["performance"] as? [String: Any])?["summary"] as? [String: Any])
-        #expect(rawSummary["ttftP50MS"] is NSNull)
+        #expect(rawSummary["ttftMeanMS"] is NSNull)
 
         let parsed = try UsageResponseParser.parse(data, expectPerformance: true)
         let report = try #require(parsed.performance)
         #expect(report.summary.ttftSamples == 0)
         #expect(report.summary.requestTTFTSamples == 0)
-        #expect(report.summary.ttftP50MS == nil)
-        #expect(report.summary.ttftP95MS == nil)
-        #expect(report.summary.requestTTFTP50MS == nil)
-        #expect(report.summary.requestTTFTP95MS == nil)
-        #expect(report.summary.tpsP50 == nil)
+        #expect(report.summary.ttftMeanMS == nil)
+        #expect(report.summary.requestTTFTMeanMS == nil)
+        #expect(report.summary.tpsIncludingTTFT == nil)
+        #expect(report.summary.requestTpsIncludingTTFT == nil)
+        #expect(report.summary.tpsExcludingTTFT == nil)
     }
 
     @Test func missingRequestTTFSamplesDecodesAsNilNotUpstreamCount() throws {
-        // Payload predating the requestTTFTSamples field.
+        // Payload that omits requestTTFTSamples while still carrying the mean keys.
         var summary = UsageFixture.performanceSummary(ttftSamples: 7)
         summary.removeValue(forKey: "requestTTFTSamples")
         let parsed = try UsageResponseParser.parse(
@@ -150,6 +150,18 @@ struct UsageResponseTests {
         let report = try #require(parsed.performance)
         #expect(report.summary.requestTTFTSamples == nil)
         #expect(report.summary.ttftSamples == 7)
+    }
+
+    /// A server that predates the average metrics returns a `performance` object with
+    /// only the old percentile fields. Decoding would make every new field silently
+    /// nil, so the parser must surface an update hint instead.
+    @Test func percentileOnlyPerformanceGivesUpdateHintNotAllNil() throws {
+        let performance = UsageFixture.performanceObject(summary: UsageFixture.legacyPerformanceSummary())
+        let data = UsageFixture.envelope(usage: UsageFixture.usageObject(), performance: performance)
+        #expect(throws: UsageResponseError.performanceStatsUnsupported) {
+            _ = try UsageResponseParser.parse(data, expectPerformance: true)
+        }
+        #expect(UsageResponseError.performanceStatsUnsupported.localizedDescription.contains("update and restart"))
     }
 
     @Test func requestingPerformanceFromOldServerIsUnsupported() {
@@ -170,9 +182,11 @@ struct UsageResponseTests {
     }
 
     @Test func malformedPerformanceShapeIsRejected() {
+        // Carries a mean key (so it passes the server-capability gate) but omits the
+        // required counts, so the typed decode must fail loudly.
         let bad: [String: Any] = [
             "grouping": "model", "limit": 100, "groupCount": 0, "truncated": false,
-            "summary": ["attempts": 1], "groups": [],
+            "summary": ["ttftMeanMS": NSNull()], "groups": [],
         ]
         #expect(throws: (any Error).self) {
             _ = try UsageResponseParser.parse(

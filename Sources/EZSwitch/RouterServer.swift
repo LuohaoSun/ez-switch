@@ -196,32 +196,67 @@ enum RequestProcessor {
         let query = split.count > 1 ? String(split[1]) : ""
         let lower = path.lowercased()
 
-        // 1. 伪造 /v1/models
-        if head.method == .GET && lower.hasSuffix("/models") {
-            await respondModelList(channel: channel, headers: head.headers, router: router)
-            return
+        // 0. 原生 Gemini 本地路由：严格按路径识别（/v1beta/models… 及显式
+        //    /v1/models/{id}:{op}）。绝不按 x-goog-api-key 请求头猜协议，
+        //    因为 OpenAI 兼容的 Google 端点也带该头。
+        var endpoint: EndpointKind
+        var requested: String?
+        var isCountTokens = false
+        if let gemini = GeminiEndpoint.parse(uri: rawURI, method: head.method) {
+            switch gemini {
+            case .malformed:
+                Log.shared.log("404 Gemini malformed path \(path)")
+                await writeGeminiError(channel: channel, status: 404,
+                                       message: "unsupported Gemini route \(path)")
+                return
+            case .list(let pageSize, let pageToken):
+                await respondGeminiModelList(channel: channel, router: router,
+                                             pageSize: pageSize, pageToken: pageToken)
+                return
+            case .get(let routeID):
+                await respondGeminiModelGet(channel: channel, routeID: routeID, router: router)
+                return
+            case .badRequest(let message):
+                Log.shared.log("400 Gemini bad request at \(path)")
+                await writeGeminiError(channel: channel, status: 400, message: message)
+                return
+            case .operation(let context):
+                endpoint = .gemini
+                requested = context.routeID
+                isCountTokens = context.isCountTokens
+            }
+        } else {
+            // 1. 伪造 /v1/models（OpenAI / Anthropic 按请求头区分）
+            if head.method == .GET && lower.hasSuffix("/models") {
+                await respondModelList(channel: channel, headers: head.headers, router: router)
+                return
+            }
+
+            // 2. 路径判定（纯反向代理：入站路径决定上游路径，不预检上游是否支持）
+            if lower.hasSuffix("/chat/completions") {
+                endpoint = .chat
+            } else if lower.hasSuffix("/responses") {
+                endpoint = .responses
+            } else if lower.hasSuffix("/messages") {
+                endpoint = .messages
+            } else {
+                Log.shared.log("404 \(head.method) \(path)")
+                await writeJSON(channel: channel, status: 404,
+                                object: ["error": ["message": "no route for path \(path)"]])
+                return
+            }
         }
 
-        // 2. 路径判定（纯反向代理：入站路径决定上游路径，不预检上游是否支持）
-        var matched: EndpointKind?
-        if lower.hasSuffix("/chat/completions") {
-            matched = .chat
-        } else if lower.hasSuffix("/responses") {
-            matched = .responses
-        } else if lower.hasSuffix("/messages") {
-            matched = .messages
-        }
-        guard let endpoint = matched else {
-            Log.shared.log("404 \(head.method) \(path)")
-            await writeJSON(channel: channel, status: 404,
-                            object: ["error": ["message": "no route for path \(path)"]])
-            return
-        }
+        let isGemini = endpoint == .gemini
+        // countTokens 不做用量/性能记账，也不改首选与冷却。
+        let account = !isCountTokens
 
-        // 3. 先解析 body 里的 model（= fake model id）；路由只按模型 ID，入站路径决定上游格式
+        // 3. body 里的 model（= fake model id）。Gemini 的 model 在路径里，不解析 body。
         let bodyData = body.getBytes(at: body.readerIndex, length: body.readableBytes).map { Data($0) } ?? Data()
-        let parsed: Any? = try? JSONSerialization.jsonObject(with: bodyData)
-        let requested: String? = (parsed as? [String: Any])?["model"] as? String
+        if !isGemini {
+            let parsed: Any? = try? JSONSerialization.jsonObject(with: bodyData)
+            requested = (parsed as? [String: Any])?["model"] as? String
+        }
 
         // 请求开始时的权威代次快照：完成成功时若代次已变（手动选择或更晚的一次成功），
         // 迟到的完成不得覆盖新的首选。
@@ -231,17 +266,27 @@ enum RequestProcessor {
             // 无兜底：id 不存在 → 404（附 known_models）；存在但未绑可用远端 → 502
             if let req = requested, router.hasFake(fakeModelID: req) {
                 Log.shared.log("502 [\(endpoint.rawValue)] model=\(req) 未绑定可用远端")
-                await writeJSON(channel: channel, status: 502,
-                                object: ["error": ["message": "model '\(req)' has no usable remote (bind one via menu bar)",
-                                                   "type": "router_error",
-                                                   "fake_model_id": req]])
+                let message = "model '\(req)' has no usable remote (bind one via menu bar)"
+                if isGemini {
+                    await writeGeminiError(channel: channel, status: 502, message: message)
+                } else {
+                    await writeJSON(channel: channel, status: 502,
+                                    object: ["error": ["message": message,
+                                                       "type": "router_error",
+                                                       "fake_model_id": req]])
+                }
             } else {
                 let known = router.fakeIDs()
                 Log.shared.log("404 [\(endpoint.rawValue)] unknown model=\(requested ?? "(nil)") known=\(known)")
-                await writeJSON(channel: channel, status: 404,
-                                object: ["error": ["message": "unknown model id '\(requested ?? "")'",
-                                                   "type": "router_error",
-                                                   "known_models": known]])
+                let message = "unknown model id '\(requested ?? "")'"
+                if isGemini {
+                    await writeGeminiError(channel: channel, status: 404, message: message)
+                } else {
+                    await writeJSON(channel: channel, status: 404,
+                                    object: ["error": ["message": message,
+                                                       "type": "router_error",
+                                                       "known_models": known]])
+                }
             }
             return
         }
@@ -251,11 +296,15 @@ enum RequestProcessor {
         guard !compatible.isEmpty else {
             let message = "model '\(fake.fakeModelID)' 的候选模型均未启用 \(endpoint.displayName)"
             Log.shared.log("502 [\(endpoint.rawValue)] model=\(fake.fakeModelID) 无兼容上游")
-            await writeJSON(channel: channel, status: 502,
-                            object: ["error": ["message": message,
-                                               "type": "router_error",
-                                               "fake_model_id": fake.fakeModelID,
-                                               "endpoint": endpoint.rawValue]])
+            if isGemini {
+                await writeGeminiError(channel: channel, status: 502, message: message)
+            } else {
+                await writeJSON(channel: channel, status: 502,
+                                object: ["error": ["message": message,
+                                                   "type": "router_error",
+                                                   "fake_model_id": fake.fakeModelID,
+                                                   "endpoint": endpoint.rawValue]])
+            }
             return
         }
 
@@ -301,16 +350,21 @@ enum RequestProcessor {
                     let body = await FallbackDiagnostics.readErrorBody(upstream)
                     let reason = FallbackDiagnostics.summary(response: upstream.response, body: body, remote: remote)
                     Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → next=\(compatible[index + 1].name)")
-                    router.recordFailure(remoteID: remote.id)
-                    recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
-                                  fake: fake, remote: remote, endpoint: endpoint,
-                                  attempt: attempt, status: status, outcome: "httpError",
-                                  started: attemptStarted, tokens: upstream.usage?.tokens,
-                                  performance: upstream.performance?.performance)
+                    // countTokens：复用回退但绝不记账 / 冷却，也不发通知。
+                    if account {
+                        router.recordFailure(remoteID: remote.id)
+                        recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                                      fake: fake, remote: remote, endpoint: endpoint,
+                                      attempt: attempt, status: status, outcome: "httpError",
+                                      started: attemptStarted, tokens: upstream.usage?.tokens,
+                                      performance: upstream.performance?.performance)
+                    }
                     upstream.cancel()
                     if Task.isCancelled { return }
-                    pendingFallback = (from: remote.routeLabel,
-                                       reason: .httpStatus(status))
+                    if account {
+                        pendingFallback = (from: remote.routeLabel,
+                                           reason: .httpStatus(status))
+                    }
                     continue
                 }
                 selected = (remote, upstream)
@@ -323,38 +377,48 @@ enum RequestProcessor {
                 if (error as? ResponseTranslationError)?.clientError == true { break }
                 if Task.isCancelled || error is CancellationError {
                     // 取消不再 fallback 到下一个供应商，只记录这一次尝试
-                    recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
-                                  fake: fake, remote: remote, endpoint: endpoint,
-                                  attempt: attempt, status: nil, outcome: "cancelled",
-                                  started: attemptStarted, tokens: nil, performance: nil)
+                    if account {
+                        recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                                      fake: fake, remote: remote, endpoint: endpoint,
+                                      attempt: attempt, status: nil, outcome: "cancelled",
+                                      started: attemptStarted, tokens: nil, performance: nil)
+                    }
                     return
                 }
                 let nsError = error as NSError
                 let reason = FallbackDiagnostics.clean("\(nsError.domain)(\(nsError.code)): \(error)", remote: remote)
                 let next = index + 1 < compatible.count ? "next=\(compatible[index + 1].name)" : "候选耗尽"
                 Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → \(next)")
-                router.recordFailure(remoteID: remote.id)
-                // 连接失败（没有响应头）也必须记录，且只记一次
-                recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
-                              fake: fake, remote: remote, endpoint: endpoint,
-                              attempt: attempt, status: nil, outcome: "networkError",
-                              started: attemptStarted, tokens: nil, performance: nil)
-                // 仅当确实还有下一个候选要开始时，才留下回退事件。
-                if index + 1 < compatible.count {
-                    pendingFallback = (from: remote.routeLabel,
-                                       reason: .connectionFailure)
+                // countTokens：继续尝试下一个候选，但不冷却 / 不记账 / 不通知。
+                if account {
+                    router.recordFailure(remoteID: remote.id)
+                    // 连接失败（没有响应头）也必须记录，且只记一次
+                    recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                                  fake: fake, remote: remote, endpoint: endpoint,
+                                  attempt: attempt, status: nil, outcome: "networkError",
+                                  started: attemptStarted, tokens: nil, performance: nil)
+                    // 仅当确实还有下一个候选要开始时，才留下回退事件。
+                    if index + 1 < compatible.count {
+                        pendingFallback = (from: remote.routeLabel,
+                                           reason: .connectionFailure)
+                    }
                 }
             }
         }
         guard let (remote, upstream) = selected else {
             let status = (lastError as? ResponseTranslationError)?.clientError == true ? 400 : 502
-            await writeJSON(channel: channel, status: status,
-                            object: ["error": ["message": "upstream: \(lastError.map(String.init(describing:)) ?? "no usable remote")"]])
+            let message = "upstream: \(lastError.map(String.init(describing:)) ?? "no usable remote")"
+            if isGemini {
+                await writeGeminiError(channel: channel, status: status, message: message)
+            } else {
+                await writeJSON(channel: channel, status: status,
+                                object: ["error": ["message": message]])
+            }
             return
         }
         var errorBody = Data()
         let retryableFailure = upstream.response.statusCode == 429 || [500, 502, 503, 504].contains(upstream.response.statusCode)
-        if retryableFailure {
+        if retryableFailure, account {
             router.recordFailure(remoteID: remote.id)
         }
 
@@ -421,7 +485,7 @@ enum RequestProcessor {
                     upstream.cancel()
                 } else {
                     try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
-                    if isSuccess {
+                    if isSuccess, account {
                         router.recordSuccess(fakeID: fake.id, remoteID: remote.id, epoch: selectionEpoch)
                     }
                     outcome = isSuccess ? "success" : "httpError"
@@ -444,16 +508,24 @@ enum RequestProcessor {
             } else {
                 Log.shared.log("[\(endpoint.rawValue)] upstream error: \(error)")
                 upstream.cancel()
-                await writeJSON(channel: channel, status: 502,
-                                object: ["error": ["message": "upstream: \(error)"]])
+                let message = "upstream: \(error)"
+                if isGemini {
+                    await writeGeminiError(channel: channel, status: 502, message: message)
+                } else {
+                    await writeJSON(channel: channel, status: 502,
+                                    object: ["error": ["message": message]])
+                }
             }
         }
-        // 选中的那次尝试在“结束时”恰好记一次（含取消 / 流中途错误 / body 错误）
-        recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
-                      fake: fake, remote: remote, endpoint: endpoint,
-                      attempt: selectedAttempt, status: upstream.response.statusCode, outcome: outcome,
-                      started: selectedStarted, tokens: upstream.usage?.tokens,
-                      performance: upstream.performance?.performance)
+        // 选中的那次尝试在“结束时”恰好记一次（含取消 / 流中途错误 / body 错误）。
+        // countTokens 不记账。
+        if account {
+            recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
+                          fake: fake, remote: remote, endpoint: endpoint,
+                          attempt: selectedAttempt, status: upstream.response.statusCode, outcome: outcome,
+                          started: selectedStarted, tokens: upstream.usage?.tokens,
+                          performance: upstream.performance?.performance)
+        }
     }
 
     /// 记录一次上游尝试。record 非阻塞、不抛错；null-ish 计数字段保持 nil（不猜）。
@@ -530,6 +602,53 @@ enum RequestProcessor {
         }
         Log.shared.log("models: \(anthropic ? "anthropic" : "openai") format, \(fakes.count) fakes")
         await writeJSON(channel: channel, status: 200, object: payload)
+    }
+
+    // MARK: Gemini 本地模型目录 / 错误
+
+    /// Gemini `models.list` 默认每页条数与上限（Google REST 语义）。
+    static let geminiDefaultPageSize = 50
+    static let geminiMaxPageSize = 1000
+
+    /// 只列出「Gemini 兼容」的本地路由（至少一个已绑定远端启用了 Gemini），
+    /// 返回原生 Gemini 结构，不编造 token 上限。pageToken 为不透明偏移量。
+    private static func respondGeminiModelList(channel: Channel, router: Router,
+                                               pageSize: Int?, pageToken: String?) async {
+        let ids = router.fakes(supporting: .gemini).map(\.fakeModelID)
+        let offset: Int
+        if let pageToken {
+            guard let value = Int(pageToken), value >= 0 else {
+                await writeGeminiError(channel: channel, status: 400, message: "invalid pageToken")
+                return
+            }
+            offset = value
+        } else {
+            offset = 0
+        }
+        let size = min(max(pageSize ?? geminiDefaultPageSize, 1), geminiMaxPageSize)
+        let start = min(offset, ids.count)
+        let slice = Array(ids[start..<min(start + size, ids.count)])
+        var payload = GeminiEndpoint.listPayload(ids: slice)
+        let next = start + slice.count
+        if next < ids.count { payload["nextPageToken"] = String(next) }
+        Log.shared.log("models: gemini format, \(slice.count)/\(ids.count) fakes")
+        await writeJSON(channel: channel, status: 200, object: payload)
+    }
+
+    private static func respondGeminiModelGet(channel: Channel, routeID: String, router: Router) async {
+        let ids = router.fakes(supporting: .gemini).map(\.fakeModelID)
+        guard ids.contains(routeID) else {
+            await writeGeminiError(channel: channel, status: 404,
+                                   message: "model '\(routeID)' not found")
+            return
+        }
+        Log.shared.log("models: gemini get \(routeID)")
+        await writeJSON(channel: channel, status: 200, object: GeminiEndpoint.modelPayload(id: routeID))
+    }
+
+    private static func writeGeminiError(channel: Channel, status: Int, message: String) async {
+        await writeJSON(channel: channel, status: status,
+                        object: GeminiEndpoint.errorPayload(status: status, message: message))
     }
 
     /// 透传上游头：丢 hop-by-hop / content-length / content-encoding，改 chunked

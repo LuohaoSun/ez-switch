@@ -78,20 +78,40 @@ enum UsageFixture {
     static func performanceSummary(attempts: Int = 10, successfulStreamingAttempts: Int = 5,
                                    ttftSamples: Int = 4, requestTTFTSamples: Int? = 4,
                                    tpsSamples: Int = 3,
-                                   ttftP50MS: Double? = 1200, ttftP95MS: Double? = 2100,
-                                   requestTTFTP50MS: Double? = 1500, requestTTFTP95MS: Double? = 2400,
-                                   tpsP50: Double? = 42.3) -> [String: Any] {
+                                   ttftMeanMS: Double? = 1200, requestTTFTMeanMS: Double? = 1500,
+                                   tpsIncludingTTFT: Double? = 42.3,
+                                   requestTpsIncludingTTFT: Double? = 38.0,
+                                   tpsExcludingTTFT: Double? = 55.1) -> [String: Any] {
+        // Average-metric keys are always present (null when unmeasured), like the
+        // real payload, so the parser's key-presence check sees a mean-capable server.
         [
             "attempts": attempts,
             "successfulStreamingAttempts": successfulStreamingAttempts,
             "ttftSamples": ttftSamples,
             "requestTTFTSamples": intOrNull(requestTTFTSamples),
             "tpsSamples": tpsSamples,
-            "ttftP50MS": numeric(ttftP50MS),
-            "ttftP95MS": numeric(ttftP95MS),
-            "requestTTFTP50MS": numeric(requestTTFTP50MS),
-            "requestTTFTP95MS": numeric(requestTTFTP95MS),
-            "tpsP50": numeric(tpsP50),
+            "ttftMeanMS": numeric(ttftMeanMS),
+            "requestTTFTMeanMS": numeric(requestTTFTMeanMS),
+            "tpsIncludingTTFT": numeric(tpsIncludingTTFT),
+            "requestTpsIncludingTTFT": numeric(requestTpsIncludingTTFT),
+            "tpsExcludingTTFT": numeric(tpsExcludingTTFT),
+        ]
+    }
+
+    /// Payload from a server that predates the average metrics: only the old
+    /// percentile fields, no average-metric keys. Used to assert the update hint.
+    static func legacyPerformanceSummary(attempts: Int = 10, successfulStreamingAttempts: Int = 5,
+                                         ttftSamples: Int = 4, requestTTFTSamples: Int = 4,
+                                         tpsSamples: Int = 3) -> [String: Any] {
+        [
+            "attempts": attempts,
+            "successfulStreamingAttempts": successfulStreamingAttempts,
+            "ttftSamples": ttftSamples,
+            "requestTTFTSamples": requestTTFTSamples,
+            "tpsSamples": tpsSamples,
+            "ttftP50MS": 1200, "ttftP95MS": 2100,
+            "requestTTFTP50MS": 1500, "requestTTFTP95MS": 2400,
+            "tpsP50": 42.3,
         ]
     }
 

@@ -69,6 +69,12 @@ struct NativeSupplierModelList: NSViewRepresentable {
     var selectedModelID: UUID? = nil
     /// 用户在本表改变选中时回写工作区共享选中；程序化/同步选中不触发（避免回环）。
     var onSelectionChange: (UUID?) -> Void = { _ in }
+    /// 外部可插值高度容器（`CollapsibleBody`）的展开高度来源：真实行区净高变化时回调。
+    /// 表格始终挂载（identity 稳定），因此收起状态下也持续上报，展开动画才有准确目标高度。
+    var onContentHeightChange: (CGFloat) -> Void = { _ in }
+    /// 收起时内容不可交互：不参与键盘焦点循环，也不暴露辅助功能元素
+    /// （SwiftUI 的裁剪与 `allowsHitTesting` 只作用于 SwiftUI 层，挡不住 Tab 焦点）。
+    var isInteractive: Bool = true
     /// 紧凑行高（约 系统字号 + 11）：圆角内缩选中更贴合单行文本。
     var rowHeight: CGFloat = 24
 
@@ -80,6 +86,7 @@ struct NativeSupplierModelList: NSViewRepresentable {
         context.coordinator.apply(items: items)
         container.tableView.reloadData()
         context.coordinator.applySelectedModelID(selectedModelID)
+        context.coordinator.setInteractive(isInteractive)
         return container
     }
 
@@ -114,12 +121,16 @@ struct NativeSupplierModelList: NSViewRepresentable {
         }
         context.coordinator.apply(items: items)
         context.coordinator.applySelectedModelID(selectedModelID)
+        context.coordinator.setInteractive(isInteractive)
     }
 
     /// 高度只取行区净高：原生 `.inset` 的固定顶部内缩由容器滚出可视区，不占外层布局高度。
+    /// 同时把真实净高上报给外层可插值高度容器（收起时表格仍挂载，因此仍能上报）。
     func sizeThatFits(_ proposal: ProposedViewSize, nsView container: SupplierModelTableContainer,
                       context: Context) -> CGSize? {
-        CGSize(width: proposal.width ?? 240, height: container.tightContentHeight)
+        let height = container.tightContentHeight
+        context.coordinator.reportContentHeight(height)
+        return CGSize(width: proposal.width ?? 240, height: height)
     }
 
     /// 行模型由显示快照驱动：拖动期间不替换快照，落点行号始终对应用户看到的行。
@@ -149,9 +160,30 @@ struct NativeSupplierModelList: NSViewRepresentable {
         /// 结束编辑期间抑制 `controlTextDidEndEditing` 的二次取消/回写。
         private var isFinalizing = false
 
+        /// 上一次上报给外层的高度，避免每次布局都回写 SwiftUI 状态。
+        private var lastReportedHeight: CGFloat?
+        /// 当前是否可交互（收起时否）。
+        private var interactive = true
+        private let focusShield = NativeTableFocusShield()
+
         init(_ parent: NativeSupplierModelList) { self.parent = parent }
 
         func attach(_ tableView: NSTableView) { self.tableView = tableView }
+
+        /// 上报真实行区净高：只在变化时异步回写，避免在布局/更新期间改 SwiftUI 状态。
+        func reportContentHeight(_ height: CGFloat) {
+            guard lastReportedHeight != height else { return }
+            lastReportedHeight = height
+            let handler = parent.onContentHeightChange
+            DispatchQueue.main.async { handler(height) }
+        }
+
+        /// 收起时只拒绝焦点并禁用表内子控件；不隐藏表格，收起动画的绘制过渡不受影响。
+        func setInteractive(_ value: Bool) {
+            guard interactive != value else { return }
+            interactive = value
+            if let tableView { focusShield.apply(value, to: tableView) }
+        }
 
         /// 表格当前显示的模型顺序；拖动落点即按这个快照换算锚点。
         var displayedIDs: [UUID] { displayedItems.map(\.id) }
@@ -182,9 +214,9 @@ struct NativeSupplierModelList: NSViewRepresentable {
             parent.onSelectionChange(id)
         }
 
-        /// 仅显示行可选中。
+        /// 仅显示行可选中（收起态不可交互）。
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-            row >= 0 && row < displayedItems.count
+            interactive && row >= 0 && row < displayedItems.count
         }
 
         /// 选中某行并记录其稳定 ID；行号越界返回 false。
@@ -255,10 +287,10 @@ struct NativeSupplierModelList: NSViewRepresentable {
             return beginEditing(row: row)
         }
 
-        /// 对指定行开始原生就地 `NSTextField` 编辑并预选全部名称；拖动中或行号越界拒绝。
+        /// 对指定行开始原生就地 `NSTextField` 编辑并预选全部名称；拖动中、收起态或行号越界拒绝。
         @discardableResult
         func beginEditing(row: Int) -> Bool {
-            guard let tableView, !draggingActive,
+            guard let tableView, interactive, !draggingActive,
                   row >= 0, row < displayedItems.count else { return false }
             // 结束可能残留的上一个会话（恢复原值，不写入）。
             if editingID != nil { endEditingSession(restore: true) }
@@ -421,7 +453,7 @@ struct NativeSupplierModelList: NSViewRepresentable {
         // MARK: 拖动源（原生行拖动，写出与路由候选表相同的载荷）
 
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-            guard row >= 0, row < displayedItems.count else { return nil }
+            guard interactive, row >= 0, row < displayedItems.count else { return nil }
             // 编辑期间、或“结束编辑的同一次按下”都不发起拖动，避免拖动与就地编辑互相打断。
             if editingID != nil { return nil }
             if let table = tableView as? SupplierModelTableView,
@@ -470,6 +502,7 @@ struct NativeSupplierModelList: NSViewRepresentable {
                        proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
             // 显式本进程校验：跨进程拖动拿不到 draggingSource。
             guard info.draggingSource != nil,
+                  interactive,
                   parent.sortEnabled,
                   let payload = ModelDragPayload.decode(pasteboard: info.draggingPasteboard),
                   !SupplierModelReorder.sources(payload, provider: parent.provider,
@@ -488,17 +521,18 @@ struct NativeSupplierModelList: NSViewRepresentable {
             // 只接受 .above 插入线，且行下标必须在 [0, count]：row == count 表示追加末尾；
             // .on 或越界一律拒绝，避免被当成末尾插入而误报成功。
             guard info.draggingSource != nil,
+                  interactive,
                   dropOperation == .above,
                   row >= 0, row <= displayedItems.count,
                   let payload = ModelDragPayload.decode(pasteboard: info.draggingPasteboard) else { return false }
             return commitDrop(row: row, payload: payload)
         }
 
-        /// 已解码载荷的落点提交（测试直接调用）。筛选时禁用内部排序；
+        /// 已解码载荷的落点提交（测试直接调用）。收起态或筛选时禁用内部排序；
         /// 拖出到路由走的是拖动源路径，不受影响。
         @discardableResult
         func commitDrop(row: Int, payload: [ModelDragItem]) -> Bool {
-            guard parent.sortEnabled,
+            guard interactive, parent.sortEnabled,
                   row >= 0, row <= displayedItems.count else { return false }
             let anchor = SupplierModelReorder.anchor(row: row, ids: displayedItems.map(\.id))
             return parent.store.reorderSupplierModels(provider: parent.provider, payload: payload, before: anchor)
@@ -511,7 +545,7 @@ struct NativeSupplierModelList: NSViewRepresentable {
         // MARK: 右键菜单（重命名 / 删除）
 
         func contextMenu(row: Int) -> NSMenu? {
-            guard row >= 0, row < displayedItems.count else { return nil }
+            guard interactive, row >= 0, row < displayedItems.count else { return nil }
             let id = displayedItems[row].id
             let rename = NSMenuItem(title: "重命名", action: #selector(renameMenuItemClicked(_:)), keyEquivalent: "")
             rename.target = self

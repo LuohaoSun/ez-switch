@@ -23,6 +23,7 @@ private final class WorkspaceDraft: ObservableObject {
     @Published var query = ""
     @Published var collapsedProviders = Set<String>()
     @Published var collapsedRoutes = Set<UUID>()
+    @Published var supplierTableHeights: [String: CGFloat] = [:]
     @Published var sheet: WorkspaceSheet?
     @Published var providerToDelete: String?
     @Published var routeToDelete: UUID?
@@ -51,7 +52,7 @@ struct RouteWorkspaceView: View {
         .sheet(item: $ui.sheet) { target in
             switch target {
             case .newProvider:
-                RemoteEditSheet(store: store, source: nil)
+                NewProviderSheet(store: store)
             case .provider(let name):
                 if let group = store.groupedRemotes().first(where: { $0.provider == name }) {
                     ProviderEditSheet(store: store, group: group)
@@ -98,8 +99,14 @@ struct RouteWorkspaceView: View {
             HStack {
                 Text("供应商与模型").font(.headline)
                 Spacer()
-                Button { ui.sheet = .newProvider } label: { Image(systemName: "plus") }
-                    .buttonStyle(.borderless).help("添加供应商")
+                Button { ui.sheet = .newProvider } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .help("添加供应商")
+                .accessibilityLabel("添加供应商")
             }
             TextField("搜索供应商或模型", text: $ui.query)
                 .textFieldStyle(.roundedBorder)
@@ -119,43 +126,27 @@ struct RouteWorkspaceView: View {
 
     private func supplierGroup(_ group: RemoteGroup) -> some View {
         let expanded = !ui.query.isEmpty || !ui.collapsedProviders.contains(group.provider)
-        return DisclosureGroup(isExpanded: Binding(
-            get: { !ui.query.isEmpty || !ui.collapsedProviders.contains(group.provider) },
-            set: { expanded in
-                guard ui.query.isEmpty else { return }
-                if expanded { ui.collapsedProviders.remove(group.provider) }
-                else { ui.collapsedProviders.insert(group.provider) }
-            }
-        )) {
-            Divider()
-            NativeSupplierModelList(
-                items: group.remotes.map {
-                    SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: $0.needsCredentials)
+        return VStack(alignment: .leading, spacing: 0) {
+            CollapsibleCardHeader(
+                dragID: group.id,
+                dragEnabled: ui.query.isEmpty,
+                isExpanded: expanded,
+                toggle: {
+                    guard ui.query.isEmpty else { return }
+                    if expanded { ui.collapsedProviders.insert(group.provider) }
+                    else { ui.collapsedProviders.remove(group.provider) }
                 },
-                provider: group.provider,
-                sortEnabled: ui.query.isEmpty,
-                store: store,
-                onRename: { store.updateModel(id: $0, model: $1) },
-                onDelete: { id in
-                    store.removeRemote(id: id)
-                    if ui.selectedModelID == id { ui.selectedModelID = nil }
-                },
-                selectedModelID: selectedModelID,
-                onSelectionChange: { ui.selectedModelID = $0 }
-            )
-        } label: {
-            HStack(spacing: 8) {
-                Text(group.provider).font(.subheadline.bold()).lineLimit(1)
-                    .padding(.trailing, 50)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                    .modifier(NativeCardDragHandle(id: group.id, enabled: ui.query.isEmpty))
-                    .help("展开或收起；拖动标题调整供应商顺序")
-            }
-        }
-        .overlay(alignment: .topTrailing) {
-            HStack(spacing: 8) {
-                Text("\(group.remotes.count)").font(.caption).foregroundStyle(.secondary)
+                accessibilityLabel: "供应商 \(group.provider)，\(group.remotes.count) 个模型",
+                help: ui.query.isEmpty ? "展开或收起；拖动标题调整供应商顺序" : "展开或收起"
+            ) {
+                HStack(spacing: 8) {
+                    providerBrandIcon(group)
+                        .frame(width: 18, height: 18)
+                    Text(group.provider).font(.subheadline.bold()).lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text("\(group.remotes.count)").font(.caption).foregroundStyle(.secondary)
+                }
+            } accessory: {
                 Menu {
                     Button("获取模型列表…") { ui.sheet = .catalog(group.provider) }
                     Button("添加模型…") {
@@ -164,16 +155,64 @@ struct RouteWorkspaceView: View {
                     Button("编辑供应商…") { ui.sheet = .provider(group.provider) }
                     Divider()
                     Button("删除供应商…", role: .destructive) { ui.providerToDelete = group.provider }
-                } label: { Image(systemName: "ellipsis") }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).help("管理 \(group.provider)")
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .frame(width: 28, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                .help("管理 \(group.provider)")
+                .accessibilityLabel("管理 \(group.provider) 供应商")
+            }
+            CollapsibleBody(isExpanded: expanded,
+                            expandedHeight: CollapsibleMetrics.supplierBodyHeight(
+                                tableHeight: ui.supplierTableHeights[group.provider] ?? 0)) {
+                Divider().padding(.top, CollapsibleMetrics.supplierSeparatorTop)
+                NativeSupplierModelList(
+                    items: group.remotes.map {
+                        SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: $0.needsCredentials)
+                    },
+                    provider: group.provider,
+                    sortEnabled: ui.query.isEmpty,
+                    store: store,
+                    onRename: { store.updateModel(id: $0, model: $1) },
+                    onDelete: { id in
+                        store.removeRemote(id: id)
+                        if ui.selectedModelID == id { ui.selectedModelID = nil }
+                    },
+                    selectedModelID: selectedModelID,
+                    onSelectionChange: { ui.selectedModelID = $0 },
+                    onContentHeightChange: { height in
+                        // 表格上报的真实净高；高度变化不改 identity，拖动/选中/就地重命名不受影响。
+                        if ui.supplierTableHeights[group.provider] != height {
+                            ui.supplierTableHeights[group.provider] = height
+                        }
+                    },
+                    isInteractive: expanded
+                )
+            } collapsed: {
+                // 供应商卡片收起时不保留摘要，与原有行为一致。
+                EmptyView()
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
-        .animation(.easeInOut(duration: 0.2), value: expanded)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 11))
-        .overlay(RoundedRectangle(cornerRadius: 11)
+        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
-        .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
+    }
+
+    /// 标题左侧品牌图标：命中 catalog 品牌用其离线图标，否则用中性 server.rack 保持标题对齐。
+    @ViewBuilder
+    private func providerBrandIcon(_ group: RemoteGroup) -> some View {
+        switch ProviderBrandResolver.resolve(group) {
+        case .known(let iconName):
+            ProviderPresetIcon(brandKey: iconName, label: group.provider)
+        case .unknown:
+            Image(systemName: "server.rack")
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var routePanel: some View {
@@ -181,15 +220,16 @@ struct RouteWorkspaceView: View {
         return VStack(alignment: .leading, spacing: 12) {
             ServiceSummary(store: store)
             HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("路由 ID").font(.title2.bold())
-                    Text("拖动调整切换顺序；点击模型设为当前。")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
+                Text("路由 ID").font(.title2.bold())
                 Spacer()
                 Button { ui.sheet = .route(nil) } label: {
-                    Label("添加路由", systemImage: "plus")
+                    Image(systemName: "plus")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.borderless)
+                .help("添加路由")
+                .accessibilityLabel("添加路由")
             }
             if store.config.fakes.isEmpty {
                 EmptyState(title: "添加第一条路由", detail: "创建客户端模型 ID，然后从左侧拖入模型。", symbol: "arrow.triangle.branch")
@@ -206,26 +246,18 @@ struct RouteWorkspaceView: View {
     private func routeCard(_ fake: FakeModel, modelsByID: [UUID: RemoteModel]) -> some View {
         let expanded = !ui.collapsedRoutes.contains(fake.id)
         return VStack(alignment: .leading, spacing: 0) {
-            DisclosureGroup(isExpanded: Binding(
-                get: { !ui.collapsedRoutes.contains(fake.id) },
-                set: { expanded in
-                    if expanded { ui.collapsedRoutes.remove(fake.id) }
-                    else { ui.collapsedRoutes.insert(fake.id) }
-                }
-            )) {
-                Divider()
-                RouteCandidateList(store: store, fake: fake, modelsByID: modelsByID)
-            } label: {
-                HStack(spacing: 8) {
-                    Text(fake.fakeModelID).font(.system(.headline, design: .monospaced)).lineLimit(1)
-                        .padding(.trailing, 145)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .modifier(NativeCardDragHandle(id: fake.id))
-                        .help("展开或收起；拖动标题调整路由顺序")
-                }
-            }
-            .overlay(alignment: .topTrailing) {
+            CollapsibleCardHeader(
+                dragID: fake.id,
+                isExpanded: expanded,
+                toggle: {
+                    if expanded { ui.collapsedRoutes.insert(fake.id) }
+                    else { ui.collapsedRoutes.remove(fake.id) }
+                },
+                accessibilityLabel: "路由 \(fake.fakeModelID)",
+                help: "展开或收起；拖动标题调整路由顺序"
+            ) {
+                Text(fake.fakeModelID).font(.system(.headline, design: .monospaced)).lineLimit(1)
+            } accessory: {
                 HStack(spacing: 8) {
                     Toggle("自动切换", isOn: Binding(
                         get: { store.config.fakes.first(where: { $0.id == fake.id })?.autoFallback ?? false },
@@ -236,26 +268,41 @@ struct RouteWorkspaceView: View {
                         Button("复制路由 ID") { copyText(fake.fakeModelID) }
                         Divider()
                         Button("删除路由…", role: .destructive) { ui.routeToDelete = fake.id }
-                    } label: { Image(systemName: "ellipsis") }
-                        .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .frame(width: 28, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                    .accessibilityLabel("管理路由 \(fake.fakeModelID)")
                 }
             }
-            .padding(.horizontal, 14).padding(.vertical, 12)
-            if !expanded {
+            .padding(.horizontal, 14)
+            .padding(.top, 10)
+            CollapsibleBody(isExpanded: expanded,
+                            expandedHeight: CollapsibleMetrics.routeBodyHeight(
+                                candidateCount: fake.orderedRemoteIDs.count),
+                            collapsedHeight: CollapsibleMetrics.routeSummaryHeight) {
+                Divider().padding(.top, CollapsibleMetrics.routeSeparatorTop).padding(.horizontal, 14)
+                RouteCandidateList(store: store, fake: fake, modelsByID: modelsByID, isInteractive: expanded)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, CollapsibleMetrics.routeListBottom)
+            } collapsed: {
                 TimelineView(.periodic(from: .now, by: 2)) { _ in
                     let current = store.router.activeRemoteID(fakeID: fake.id).flatMap { modelsByID[$0] }
                     Text(current.map { "当前 · \($0.routeLabel)" } ?? "未配置模型")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                         .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.leading, 34).padding(.trailing, 14).padding(.bottom, 12)
+                .frame(height: CollapsibleMetrics.routeSummaryLine, alignment: .leading)
+                .padding(.leading, 34).padding(.trailing, 14)
+                .padding(.top, CollapsibleMetrics.routeSummaryTop)
+                .padding(.bottom, CollapsibleMetrics.routeSummaryBottom)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: expanded)
         .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
-        .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
     }
 
 }
@@ -266,6 +313,8 @@ private struct RouteCandidateList: View {
     @ObservedObject var store: ConfigStore
     let fake: FakeModel
     let modelsByID: [UUID: RemoteModel]
+    /// 收起时传给表格：不参与键盘焦点循环、不暴露辅助功能元素。
+    let isInteractive: Bool
 
     var body: some View {
         // 每 2s 取一次“当前”远端；行标识不变时代表层只就地更新指示，不会 reload 表格或打断拖动。
@@ -274,7 +323,8 @@ private struct RouteCandidateList: View {
                 items: candidateItems,
                 activeRemoteID: store.router.activeRemoteID(fakeID: fake.id),
                 store: store,
-                fakeID: fake.id
+                fakeID: fake.id,
+                isInteractive: isInteractive
             )
             .padding(.top, 4)
         }
