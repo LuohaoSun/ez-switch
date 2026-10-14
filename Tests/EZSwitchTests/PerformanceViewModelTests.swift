@@ -45,9 +45,9 @@ struct PerformanceViewModelTests {
     }
 
     private func makeRow(_ title: String,
-                         ttftP50: Double? = nil, ttftP95: Double? = nil,
-                         requestP50: Double? = nil, requestP95: Double? = nil,
-                         tpsP50: Double? = nil,
+                         ttftMean: Double? = nil, requestTTFTMean: Double? = nil,
+                         tpsIncluding: Double? = nil, requestTpsIncluding: Double? = nil,
+                         tpsExcluding: Double? = nil,
                          ttftSamples: Int = 0, tpsSamples: Int = 0,
                          requestSamples: Int = 0,
                          attempts: Int = 0) -> PerformanceGroupRow {
@@ -56,24 +56,24 @@ struct PerformanceViewModelTests {
         summary.ttftSamples = ttftSamples
         summary.tpsSamples = tpsSamples
         summary.requestTTFTSamples = requestSamples
-        summary.ttftP50MS = ttftP50
-        summary.ttftP95MS = ttftP95
-        summary.requestTTFTP50MS = requestP50
-        summary.requestTTFTP95MS = requestP95
-        summary.tpsP50 = tpsP50
+        summary.ttftMeanMS = ttftMean
+        summary.requestTTFTMeanMS = requestTTFTMean
+        summary.tpsIncludingTTFT = tpsIncluding
+        summary.requestTpsIncludingTTFT = requestTpsIncluding
+        summary.tpsExcludingTTFT = tpsExcluding
         return PerformanceGroupRow(id: title, title: title, subtitle: "", summary: summary)
     }
 
     private func makeSnapshot(attempts: Int,
-                              ttftP50: Double? = nil,
+                              ttftMean: Double? = nil,
                               requestSamples: Int = 0,
                               groups: [PerformanceGroupRow] = []) -> PerformanceSnapshot {
         var summary = PerformanceSummary()
         summary.attempts = attempts
         summary.successfulStreamingAttempts = attempts
-        summary.ttftSamples = ttftP50 == nil ? 0 : attempts
+        summary.ttftSamples = ttftMean == nil ? 0 : attempts
         summary.requestTTFTSamples = requestSamples
-        summary.ttftP50MS = ttftP50
+        summary.ttftMeanMS = ttftMean
         return PerformanceSnapshot(summary: summary, groups: groups)
     }
 
@@ -88,53 +88,71 @@ struct PerformanceViewModelTests {
 
     @Test func sortOrdersByKeyAndKeepsNilLastWhenAscending() {
         let rows = [
-            makeRow("c", ttftP50: 300),
+            makeRow("c", ttftMean: 300),
             makeRow("none"),
-            makeRow("a", ttftP50: 100),
-            makeRow("b", ttftP50: 200),
+            makeRow("a", ttftMean: 100),
+            makeRow("b", ttftMean: 200),
         ]
-        let sorted = PerformanceSort.sorted(rows, by: .ttftP50, grouping: .model, ascending: true)
+        let sorted = PerformanceSort.sorted(rows, by: .ttftMean, grouping: .model, ascending: true)
         #expect(sorted.map(\.title) == ["a", "b", "c", "none"])
     }
 
     @Test func sortKeepsNilLastWhenDescending() {
         let rows = [
-            makeRow("c", ttftP50: 300),
+            makeRow("c", ttftMean: 300),
             makeRow("none"),
-            makeRow("a", ttftP50: 100),
-            makeRow("b", ttftP50: 200),
+            makeRow("a", ttftMean: 100),
+            makeRow("b", ttftMean: 200),
         ]
-        let sorted = PerformanceSort.sorted(rows, by: .ttftP50, grouping: .model, ascending: false)
+        let sorted = PerformanceSort.sorted(rows, by: .ttftMean, grouping: .model, ascending: false)
         #expect(sorted.map(\.title) == ["c", "b", "a", "none"])
     }
 
-    /// 路由维度排序取 requestTTFT（含 fallback），其余维度取尝试 TTFT。
-    @Test func sortUsesRequestTTFTForRouteGrouping() {
-        let attemptFast = makeRow("attempt-fast", ttftP50: 10, requestP50: 900)
-        let requestFast = makeRow("request-fast", ttftP50: 900, requestP50: 10)
+    /// 路由维度排序取 requestTTFTMean（含 fallback），其余维度取尝试 TTFTMean。
+    @Test func sortUsesRequestTTFTMeanForRouteGrouping() {
+        let attemptFast = makeRow("attempt-fast", ttftMean: 10, requestTTFTMean: 900)
+        let requestFast = makeRow("request-fast", ttftMean: 900, requestTTFTMean: 10)
 
-        let byModel = PerformanceSort.sorted([requestFast, attemptFast], by: .ttftP50,
+        let byModel = PerformanceSort.sorted([requestFast, attemptFast], by: .ttftMean,
                                               grouping: .model, ascending: true)
         #expect(byModel.map(\.title) == ["attempt-fast", "request-fast"])
 
-        let byRoute = PerformanceSort.sorted([requestFast, attemptFast], by: .ttftP50,
+        let byRoute = PerformanceSort.sorted([requestFast, attemptFast], by: .ttftMean,
                                              grouping: .route, ascending: true)
         #expect(byRoute.map(\.title) == ["request-fast", "attempt-fast"])
     }
 
     @Test func sortIsStableByTitleOnTies() {
-        let rows = [makeRow("zeta", ttftP50: 100), makeRow("alpha", ttftP50: 100)]
-        let sorted = PerformanceSort.sorted(rows, by: .ttftP50, grouping: .model, ascending: true)
+        let rows = [makeRow("zeta", ttftMean: 100), makeRow("alpha", ttftMean: 100)]
+        let sorted = PerformanceSort.sorted(rows, by: .ttftMean, grouping: .model, ascending: true)
         #expect(sorted.map(\.title) == ["alpha", "zeta"])
     }
 
-    @Test func sortByTPSUsesTPSValue() {
+    /// 排序跟随所选列：含 TTFT 列在路由 / 模型维度取不同字段，不含 TTFT 列两维度共用。
+    @Test func sortByTPSFollowsSelectedColumn() {
         let rows = [
-            makeRow("slow", ttftP50: 100, tpsP50: 5),
-            makeRow("fast", ttftP50: 900, tpsP50: 80),
+            makeRow("slow", tpsIncluding: 5, tpsExcluding: 90),
+            makeRow("fast", tpsIncluding: 80, tpsExcluding: 10),
         ]
-        let sorted = PerformanceSort.sorted(rows, by: .tpsP50, grouping: .model, ascending: false)
-        #expect(sorted.map(\.title) == ["fast", "slow"])
+        let byIncluding = PerformanceSort.sorted(rows, by: .tpsIncludingTTFT, grouping: .model, ascending: false)
+        #expect(byIncluding.map(\.title) == ["fast", "slow"])
+
+        let byExcluding = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT, grouping: .model, ascending: false)
+        #expect(byExcluding.map(\.title) == ["slow", "fast"])
+
+        let routeRows = [
+            makeRow("a", tpsIncluding: 100, requestTpsIncluding: 10),
+            makeRow("b", tpsIncluding: 10, requestTpsIncluding: 100),
+        ]
+        let byRouteIncluding = PerformanceSort.sorted(routeRows, by: .tpsIncludingTTFT,
+                                                      grouping: .route, ascending: false)
+        #expect(byRouteIncluding.map(\.title) == ["b", "a"])
+    }
+
+    @Test func sortKeyTitlesUseTheThreeMetricNames() {
+        #expect(PerformanceSortKey.ttftMean.title(for: .model) == "平均TTFT")
+        #expect(PerformanceSortKey.tpsIncludingTTFT.title(for: .route) == "平均TPS(含TTFT)")
+        #expect(PerformanceSortKey.tpsExcludingTTFT.columnTitle(for: .model) == "平均TPS(不含TTFT)")
     }
 
     // MARK: - 格式化
@@ -165,7 +183,7 @@ struct PerformanceViewModelTests {
         #expect(model.section == .usage)
         #expect(model.performanceGrouping == .model)
         #expect(model.grouping == .route)
-        #expect(model.performanceSortKey == .ttftP50)
+        #expect(model.performanceSortKey == .ttftMean)
         #expect(model.performanceSortAscending)
     }
 
@@ -197,6 +215,64 @@ struct PerformanceViewModelTests {
         #expect(model.reloadKey == base)
     }
 
+    /// 自定义「近 N 天」变化时 reloadKey 必须变化以触发重查；非自定义预设下 N 不影响键。
+    @Test func reloadKeyTracksCustomLastNDaysForCustomPreset() {
+        let model = UsageViewModel()
+        model.preset = .custom
+        model.customLastNDays = 7
+        let seven = model.reloadKey
+
+        model.customLastNDays = 30
+        #expect(model.reloadKey != seven)
+
+        model.customLastNDays = 7
+        #expect(model.reloadKey == seven)
+
+        // 非自定义预设区间不含 N，编辑 N 不应触发无谓刷新。
+        model.preset = .today
+        let todayKey = model.reloadKey
+        model.customLastNDays = 30
+        #expect(model.reloadKey == todayKey)
+    }
+
+    /// 非法输入（空 / 非数字 / <1）不改变有效天数与 reloadKey，提交后回退到有效值。
+    @Test func commitCustomLastNDaysInputRejectsInvalidWithoutChangingRange() {
+        let model = UsageViewModel()
+        model.preset = .custom
+        model.customLastNDays = 7
+        model.customLastNDaysInput = "7"
+        let before = model.reloadKey
+
+        model.customLastNDaysInput = "0"
+        model.commitCustomLastNDaysInput()
+        #expect(model.customLastNDays == 7)
+        #expect(model.reloadKey == before)
+        #expect(model.customLastNDaysInput == "7")
+
+        model.customLastNDaysInput = "abc"
+        model.commitCustomLastNDaysInput()
+        #expect(model.customLastNDays == 7)
+        #expect(model.customLastNDaysInput == "7")
+
+        model.customLastNDaysInput = " 30 "
+        model.commitCustomLastNDaysInput()
+        #expect(model.customLastNDays == 30)
+        #expect(model.customLastNDaysInput == "30")
+        #expect(model.reloadKey != before)
+    }
+
+    @Test func setCustomLastNDaysClampsAndSyncsInput() {
+        let model = UsageViewModel()
+        model.preset = .custom
+        model.setCustomLastNDays(0)
+        #expect(model.customLastNDays == 1)
+        #expect(model.customLastNDaysInput == "1")
+
+        model.setCustomLastNDays(14)
+        #expect(model.customLastNDays == 14)
+        #expect(model.customLastNDaysInput == "14")
+    }
+
     // MARK: - 空态判定
 
     @Test func emptyPredicatesDistinguishNoHistoryFromNoSamples() async {
@@ -208,21 +284,21 @@ struct PerformanceViewModelTests {
         #expect(model.performanceIsEmpty)
 
         // 有历史但全部是非流式/失败：无有效样本。
-        await load(makeSnapshot(attempts: 5, ttftP50: nil), into: model)
+        await load(makeSnapshot(attempts: 5, ttftMean: nil), into: model)
         #expect(!model.performanceIsEmpty)
         #expect(model.performanceHasNoSamples)
 
         // 有样本：两者都不成立。
-        await load(makeSnapshot(attempts: 5, ttftP50: 120), into: model)
+        await load(makeSnapshot(attempts: 5, ttftMean: 120), into: model)
         #expect(!model.performanceIsEmpty)
         #expect(!model.performanceHasNoSamples)
     }
 
     @Test func onlyTTFTWithoutTPSSamplesStillHasSamples() async {
         let model = UsageViewModel()
-        var snapshot = makeSnapshot(attempts: 3, ttftP50: 200)
+        var snapshot = makeSnapshot(attempts: 3, ttftMean: 200)
         snapshot.summary.tpsSamples = 0
-        snapshot.summary.tpsP50 = nil
+        snapshot.summary.tpsIncludingTTFT = nil
         await load(snapshot, into: model)
         #expect(!model.performanceIsEmpty)
         #expect(!model.performanceHasNoSamples)
@@ -235,9 +311,8 @@ struct PerformanceViewModelTests {
         model.section = .performance
         model.performanceGrouping = .route
 
-        var snapshot = makeSnapshot(attempts: 8, ttftP50: 150, requestSamples: 0)
-        snapshot.summary.requestTTFTP50MS = nil
-        snapshot.summary.requestTTFTP95MS = nil
+        var snapshot = makeSnapshot(attempts: 8, ttftMean: 150, requestSamples: 0)
+        snapshot.summary.requestTTFTMeanMS = nil
         await load(snapshot, into: model)
 
         #expect(!model.performanceIsEmpty)          // 有历史
@@ -256,11 +331,10 @@ struct PerformanceViewModelTests {
         model.section = .performance
         model.performanceGrouping = .route
 
-        var snapshot = makeSnapshot(attempts: 6, ttftP50: 100, requestSamples: 0)
-        snapshot.summary.requestTTFTP50MS = nil
-        snapshot.summary.requestTTFTP95MS = nil
+        var snapshot = makeSnapshot(attempts: 6, ttftMean: 100, requestSamples: 0)
+        snapshot.summary.requestTTFTMeanMS = nil
         snapshot.summary.tpsSamples = 6
-        snapshot.summary.tpsP50 = 42
+        snapshot.summary.tpsIncludingTTFT = 42
         await load(snapshot, into: model)
 
         #expect(!model.performanceIsEmpty)
@@ -272,11 +346,11 @@ struct PerformanceViewModelTests {
 
     @Test func refreshPerformanceLoadsSnapshotAndMarksLoaded() async {
         let model = UsageViewModel()
-        await load(makeSnapshot(attempts: 7, ttftP50: 321), into: model)
+        await load(makeSnapshot(attempts: 7, ttftMean: 321), into: model)
 
         #expect(model.performancePhase == .loaded)
         #expect(model.performanceSnapshot.summary.attempts == 7)
-        #expect(model.performanceSnapshot.summary.ttftP50MS == 321)
+        #expect(model.performanceSnapshot.summary.ttftMeanMS == 321)
         #expect(model.performanceLastError == nil)
     }
 
@@ -293,7 +367,7 @@ struct PerformanceViewModelTests {
 
     @Test func refreshFailureKeepsPreviousSnapshot() async {
         let model = UsageViewModel()
-        await load(makeSnapshot(attempts: 4, ttftP50: 100), into: model)
+        await load(makeSnapshot(attempts: 4, ttftMean: 100), into: model)
         await model.refreshPerformance { _, _, _ in throw LoadFailure() }
 
         #expect(model.performancePhase == .loaded)
@@ -309,8 +383,8 @@ struct PerformanceViewModelTests {
         model.section = .performance
         model.performanceGrouping = .model
 
-        let slow = makeSnapshot(attempts: 1, ttftP50: 999)
-        let fast = makeSnapshot(attempts: 2, ttftP50: 111)
+        let slow = makeSnapshot(attempts: 1, ttftMean: 999)
+        let fast = makeSnapshot(attempts: 2, ttftMean: 111)
 
         let gate = StepGate()
         let stale = Task { @MainActor in
@@ -330,7 +404,7 @@ struct PerformanceViewModelTests {
         await stale.value
 
         #expect(model.performanceSnapshot.summary.attempts == 2)
-        #expect(model.performanceSnapshot.summary.ttftP50MS == 111)
+        #expect(model.performanceSnapshot.summary.ttftMeanMS == 111)
         #expect(model.performancePhase == .loaded)
     }
 
@@ -348,12 +422,12 @@ struct PerformanceViewModelTests {
         let model = UsageViewModel()
         var snapshot = PerformanceSnapshot()
         snapshot.groups = [
-            makeRow("b", ttftP50: 200, tpsP50: 20),
-            makeRow("a", ttftP50: 100, tpsP50: 50),
+            makeRow("b", ttftMean: 200, tpsExcluding: 20),
+            makeRow("a", ttftMean: 100, tpsExcluding: 50),
         ]
         await load(snapshot, into: model)
 
-        model.performanceSortKey = .tpsP50
+        model.performanceSortKey = .tpsExcludingTTFT
         model.performanceSortAscending = false
         #expect(model.sortedPerformanceGroups.map(\.title) == ["a", "b"])
 

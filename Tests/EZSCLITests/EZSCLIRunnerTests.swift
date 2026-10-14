@@ -112,7 +112,7 @@ struct EZSCLIRunnerTests {
         // The usage report is still printed, followed by the performance section.
         #expect(output.contains("Totals"))
         #expect(output.contains("Performance (model)"))
-        #expect(output.contains("TTFT basis: upstream attempt"))
+        #expect(output.contains("Overall basis: request scope (includes fallback)"))
     }
 
     @Test func usagePerformanceJSONPrintsCombinedObjects() throws {
@@ -139,6 +139,25 @@ struct EZSCLIRunnerTests {
         } catch {
             #expect(error.localizedDescription.contains("performance"))
             #expect(error.localizedDescription.contains("update and restart"))
+        }
+    }
+
+    /// A server that returns a `performance` object with only the old percentile
+    /// fields predates the average metrics; the CLI must ask for an update rather
+    /// than print an all-dash report.
+    @Test func usagePerformanceAgainstPercentileOnlyServerGivesUpgradeHint() {
+        let response: [String: Any] = [
+            "ok": true,
+            "usage": UsageFixture.usageObject(),
+            "performance": UsageFixture.performanceObject(summary: UsageFixture.legacyPerformanceSummary()),
+        ]
+        let (runner, _) = self.runner(response)
+        do {
+            _ = try runner.run(["usage", "--performance"])
+            Issue.record("expected an error")
+        } catch {
+            #expect(error.localizedDescription.contains("update and restart"))
+            #expect(!error.localizedDescription.contains("invalid usage response"))
         }
     }
 

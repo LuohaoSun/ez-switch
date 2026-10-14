@@ -114,6 +114,12 @@ struct CLIUsageTests {
         return formatter.string(from: date)
     }
 
+    /// JSON 往返后的浮点比较需容差；nil 视为不匹配。
+    private func approx(_ value: Double?, _ expected: Double, tolerance: Double = 0.001) -> Bool {
+        guard let value else { return false }
+        return abs(value - expected) <= tolerance
+    }
+
     // MARK: - 默认与 schema
 
     @Test
@@ -625,11 +631,17 @@ struct CLIUsageTests {
         #expect(summary["requestTTFTSamples"] as? Int == 0)
         #expect(summary["tpsSamples"] as? Int == 0)
         // 缺失统计序列化为 JSON null（而非省略），保证形状稳定。
-        #expect(summary["ttftP50MS"] is NSNull)
-        #expect(summary["ttftP95MS"] is NSNull)
-        #expect(summary["requestTTFTP50MS"] is NSNull)
-        #expect(summary["requestTTFTP95MS"] is NSNull)
-        #expect(summary["tpsP50"] is NSNull)
+        #expect(summary["ttftMeanMS"] is NSNull)
+        #expect(summary["requestTTFTMeanMS"] is NSNull)
+        #expect(summary["tpsIncludingTTFT"] is NSNull)
+        #expect(summary["requestTpsIncludingTTFT"] is NSNull)
+        #expect(summary["tpsExcludingTTFT"] is NSNull)
+        // 旧的百分位字段必须已从契约中移除。
+        #expect(summary["ttftP50MS"] == nil)
+        #expect(summary["ttftP95MS"] == nil)
+        #expect(summary["requestTTFTP50MS"] == nil)
+        #expect(summary["requestTTFTP95MS"] == nil)
+        #expect(summary["tpsP50"] == nil)
 
         #expect((try? JSONSerialization.data(withJSONObject: reply)) != nil)
     }
@@ -695,13 +707,48 @@ struct CLIUsageTests {
         #expect(summary["ttftSamples"] as? Int == 4)
         #expect(summary["requestTTFTSamples"] as? Int == 4)
         #expect(summary["tpsSamples"] as? Int == 4)
-        // nearest-rank P50 / P95 of [100, 200, 300, 400]。
-        #expect(summary["ttftP50MS"] as? Double == 200)
-        #expect(summary["ttftP95MS"] as? Double == 400)
-        #expect(summary["requestTTFTP50MS"] as? Double == 210)
-        #expect(summary["requestTTFTP95MS"] as? Double == 410)
-        // TPS = 100 tokens * 1000 / 2000 ms = 50 tok/s。
-        #expect(summary["tpsP50"] as? Double == 50)
+        // 均值（不是中位数）：TTFT 250，请求级 260。
+        #expect(approx(summary["ttftMeanMS"] as? Double, 250))
+        #expect(approx(summary["requestTTFTMeanMS"] as? Double, 260))
+        // 加权吞吐 = Σ输出 × 1000 / Σ时长。
+        #expect(approx(summary["tpsIncludingTTFT"] as? Double, 400.0 * 1000 / 9000))
+        #expect(approx(summary["requestTpsIncludingTTFT"] as? Double, 400.0 * 1000 / 9040))
+        #expect(approx(summary["tpsExcludingTTFT"] as? Double, 400.0 * 1000 / 8000))
+    }
+
+    /// 非对称 2 样本回归：加权 TPS（总 token / 总时长）绝不等同于逐请求速率的算术平均；
+    /// 含请求级计时的分母与含尝试级的分母必须区分。
+    @Test
+    func performanceWeightedSummaryUsesTotalsNotAverageOfRates() async throws {
+        let (store, directory) = try makeStore()
+        defer { cleanup(directory) }
+        let store1 = store.usageStore
+        // 100 token / 1s 与 100 token / 9s：加权（排除 TTFT）= 200000 / 10000 = 20。
+        store1.record(record(timestamp: day(2026, 5, 10, hour: 9), output: 100,
+                             performance: streamingPerformance(ttftMS: 1000, requestTTFTMS: 2000,
+                                                              generationMS: 1000)))
+        store1.record(record(timestamp: day(2026, 5, 10, hour: 9, minute: 1), output: 100,
+                             performance: streamingPerformance(ttftMS: 3000, requestTTFTMS: 4000,
+                                                              generationMS: 9000)))
+        try await store1.flush()
+
+        let reply = try await send(store, ["command": "usage", "performance": "true", "group": "model"],
+                                   now: day(2026, 5, 10))
+        let performance = try performancePayload(reply)
+        let summary = try performanceSummary(performance)
+        #expect(summary["tpsSamples"] as? Int == 2)
+        // 20 tok/s，而不是 (100 + 11.111)/2 ≈ 55.56 的算术平均。
+        #expect(approx(summary["tpsExcludingTTFT"] as? Double, 20))
+        #expect(approx(summary["tpsIncludingTTFT"] as? Double, 200.0 * 1000 / 14000))
+        #expect(approx(summary["requestTpsIncludingTTFT"] as? Double, 200.0 * 1000 / 16000))
+        #expect(approx(summary["ttftMeanMS"] as? Double, 2000))
+        #expect(approx(summary["requestTTFTMeanMS"] as? Double, 3000))
+
+        // 分组级摘要同样使用加权口径。
+        let group = try #require(performanceGroups(performance).first)
+        let groupSummary = try #require(group["summary"] as? [String: Any])
+        #expect(approx(groupSummary["tpsExcludingTTFT"] as? Double, 20))
+        #expect(approx(groupSummary["ttftMeanMS"] as? Double, 2000))
     }
 
     @Test
@@ -713,6 +760,7 @@ struct CLIUsageTests {
             store1.record(record(timestamp: day(2026, 5, 10, hour: 9, minute: index),
                                  provider: "OpenAI", model: model, output: 10,
                                  performance: streamingPerformance(ttftMS: Double(100 * (index + 1)),
+                                                                   requestTTFTMS: Double(100 * (index + 1) + 50),
                                                                    generationMS: 1000)))
         }
         try await store1.flush()
@@ -728,6 +776,7 @@ struct CLIUsageTests {
         // summary 是全量，不受 limit 影响。
         #expect(try performanceSummary(performance)["attempts"] as? Int == 3)
         #expect(try performanceSummary(performance)["ttftSamples"] as? Int == 3)
+        #expect(try performanceSummary(performance)["tpsSamples"] as? Int == 3)
     }
 
     // MARK: - 原始 sqlite 辅助（仅测试）

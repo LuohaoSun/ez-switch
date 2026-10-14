@@ -2,16 +2,16 @@ import SwiftUI
 
 /// 性能统计视图，嵌在「用量」页内，与用量共用时间区间筛选。
 ///
-/// 顶部三张指标卡（TTFT P50 / P95、TPS P50，各带独立样本数），
+/// 顶部三张平均指标卡（平均 TTFT、平均 TPS 含 TTFT、平均 TPS 不含 TTFT，各带独立样本数），
 /// 下方是可切换分组（路由 / 供应商 / 模型）与排序字段的比较表。
-/// 路由维度的 TTFT 是含自动回退的请求总等待；供应商 / 模型维度是单次尝试 TTFT。
+/// 路由维度的 TTFT / 含 TTFT 的 TPS 是含自动回退的请求口径；供应商 / 模型维度是单次上游尝试口径；
+/// 不含 TTFT 的 TPS 两个维度共用同一字段。顶部总览固定为请求口径（与旧的 overall requestTTFT 一致）。
 struct PerformanceView: View {
     @ObservedObject var model: UsageViewModel
     let store: UsageStore
 
-    private let columnWidth: CGFloat = 96
-    /// 样本少于此值时提示 P95 仅供参考。
-    private let lowSampleThreshold = 20
+    /// 三列指标与一列样本数；表头与卡片同名，留出足够宽度。
+    private let columnWidth: CGFloat = 120
 
     var body: some View {
         content
@@ -19,27 +19,19 @@ struct PerformanceView: View {
 
     private var summary: PerformanceSummary { model.performanceSnapshot.summary }
 
-    /// 路由维度用含自动回退的请求总等待，其余维度用单次尝试首输出。
+    /// 路由维度用含自动回退的请求口径，其余维度用单次上游尝试口径。
     private var isRouteGrouping: Bool { model.performanceGrouping == .route }
 
-    private var ttftLabelSuffix: String { isRouteGrouping ? "（总等待）" : "" }
+    // MARK: - 总览取值（固定请求口径）
 
-    private var ttftUnit: String { isRouteGrouping ? "总等待" : "首输出" }
-
-    private var ttftP50Value: Double? {
-        isRouteGrouping ? summary.requestTTFTP50MS : summary.ttftP50MS
-    }
-
-    private var ttftP95Value: Double? {
-        isRouteGrouping ? summary.requestTTFTP95MS : summary.ttftP95MS
-    }
+    private var summaryTTFTValue: Double? { summary.requestTTFTMeanMS }
+    private var summaryTPSIncludingValue: Double? { summary.requestTpsIncludingTTFT }
+    private var summaryTPSExcludingValue: Double? { summary.tpsExcludingTTFT }
 
     /// 当前分组对应的有效 TTFT 样本：路由用 requestTTFT 样本，其余用尝试 TTFT 样本。
     private func ttftSampleCount(_ s: PerformanceSummary) -> Int {
         isRouteGrouping ? s.requestTTFTSamples : s.ttftSamples
     }
-
-    private var activeTTFTSamples: Int { ttftSampleCount(summary) }
 
     // MARK: - 主体分派
 
@@ -86,38 +78,31 @@ struct PerformanceView: View {
 
     private var metricsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
+            // 总览固定请求口径；口径说明只放在各卡片 tooltip，不常驻成行。
+            Text("总览").font(.headline)
+
             HStack(spacing: 12) {
-                metricTile(title: "TTFT P50\(ttftLabelSuffix)",
-                           value: PerformanceFormat.milliseconds(ttftP50Value),
-                           unit: ttftUnit,
-                           samples: activeTTFTSamples,
-                           help: isRouteGrouping
-                               ? "含自动回退的请求总等待（从请求开始到首个输出片段）的中位数。"
-                               : "单次尝试首输出延迟的中位数；含推理/工具产生的有效输出片段。")
-                metricTile(title: "TTFT P95\(ttftLabelSuffix)",
-                           value: PerformanceFormat.milliseconds(ttftP95Value),
-                           unit: ttftUnit,
-                           samples: activeTTFTSamples,
-                           help: isRouteGrouping
-                               ? "含自动回退的请求总等待的 95 分位。样本偏少时波动较大。"
-                               : "单次尝试首输出延迟的 95 分位。样本偏少时波动较大。")
-                metricTile(title: "TPS P50",
-                           value: PerformanceFormat.tps(summary.tpsP50),
+                metricTile(title: "平均TTFT",
+                           value: PerformanceFormat.milliseconds(summaryTTFTValue),
+                           unit: "总等待",
+                           samples: summary.requestTTFTSamples,
+                           help: ttftMeanHelp(requestScope: true))
+                metricTile(title: "平均TPS(含TTFT)",
+                           value: PerformanceFormat.tps(summaryTPSIncludingValue),
                            unit: "Tokens/秒",
                            samples: summary.tpsSamples,
-                           help: "上游平均输出吞吐（上游报告的输出 token 数 / 首输出至完成）的中位数；不足 2 个输出片段或 2 个输出 token 不计 TPS。")
+                           help: tpsMeanHelp(includingTTFT: true))
+                metricTile(title: "平均TPS(不含TTFT)",
+                           value: PerformanceFormat.tps(summaryTPSExcludingValue),
+                           unit: "Tokens/秒",
+                           samples: summary.tpsSamples,
+                           help: tpsMeanHelp(includingTTFT: false))
             }
 
             Label(coverageText, systemImage: "info.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .help(coverageHelp)
-
-            if activeTTFTSamples > 0 && activeTTFTSamples < lowSampleThreshold {
-                Text("有效 TTFT 样本较少（\(activeTTFTSamples) < \(lowSampleThreshold)），P95 波动较大，仅供参考。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
         }
         .cardSurface()
     }
@@ -142,18 +127,30 @@ struct PerformanceView: View {
         .accessibilityElement(children: .combine)
     }
 
+    private func ttftMeanHelp(requestScope: Bool) -> String {
+        requestScope
+            ? "平均首输出延迟：含自动回退的请求总等待（从请求进入路由器到首个有效输出片段）的平均值，按样本逐条平均。"
+            : "平均首输出延迟：单次上游尝试首输出（不含自动回退等待）的平均值。"
+    }
+
+    private func tpsMeanHelp(includingTTFT: Bool) -> String {
+        includingTTFT
+            ? "平均输出吞吐（含 TTFT，请求口径）：同一批有效样本的上游输出 token 总量 ÷（请求总等待 + 生成时长）总量，按总时长加权，不是逐请求速率的平均；输出 token 含推理 token。"
+            : "平均输出吞吐（不含 TTFT，请求口径）：同一批有效样本的上游输出 token 总量 ÷ 生成时长总量（不含 TTFT），按生成时长加权；输出 token 含推理 token。"
+    }
+
     /// 中性样本覆盖行：只报告各指标的有效样本数，不把旧历史中的失败尝试渲染成警告。
     private var coverageText: String {
         let s = summary
         guard s.attempts > 0 else { return "区间内暂无转发尝试" }
-        return "有效样本 TTFT \(ttftSampleCount(s)) · TPS \(s.tpsSamples)"
+        return "有效样本：TTFT \(PerformanceFormat.samples(s.requestTTFTSamples)) · TPS \(PerformanceFormat.samples(s.tpsSamples))"
     }
 
-    /// 分母解释：成功流式的资格口径，以及包含升级前无性能数据的全部尝试历史。
+    /// 分母解释：只统计成功流式请求，以及包含升级前无性能数据的全部尝试历史。
     private var coverageHelp: String {
         let s = summary
         guard s.attempts > 0 else { return "区间内没有转发尝试，因此没有可统计的性能样本。" }
-        return "TTFT / TPS 只统计成功完成的流式请求：区间内共 \(s.attempts) 次转发尝试，其中 \(s.successfulStreamingAttempts) 次为成功流式、进入资格分母。升级前的历史未采集性能数据，可能计入尝试却没有有效样本。"
+        return "TTFT / TPS 只统计成功完成的流式请求：区间内共 \(s.attempts) 次转发尝试，其中 \(s.successfulStreamingAttempts) 次为成功流式、进入有效样本。升级前的历史未采集性能数据，可能计入尝试却没有有效样本。"
     }
 
     // MARK: - 比较表
@@ -219,26 +216,16 @@ struct PerformanceView: View {
     /// 分组口径不再单独占说明行，改为分组控件的 tooltip。
     private var groupingHelp: String {
         isRouteGrouping
-            ? "按路由分组：TTFT 为含自动回退的请求总等待（从请求开始到首个输出片段）。"
-            : "按供应商 / 模型分组：TTFT 为单次尝试首输出（不含自动回退等待）。"
-    }
-
-    private var ttftP50Header: String {
-        isRouteGrouping ? "总等待 P50" : "首输出 P50"
-    }
-
-    private var ttftP95Header: String {
-        isRouteGrouping ? "总等待 P95" : "首输出 P95"
+            ? "按路由分组：TTFT 与含 TTFT 的 TPS 为含自动回退的请求口径（从请求进入路由器到首个输出片段）。"
+            : "按供应商 / 模型分组：TTFT 与含 TTFT 的 TPS 为单次上游尝试口径（不含自动回退等待）。"
     }
 
     private var tableHeader: some View {
         HStack(spacing: 12) {
             Text("名称").frame(maxWidth: .infinity, alignment: .leading)
-            Text(ttftP50Header).frame(width: columnWidth, alignment: .trailing)
-                .help(ttftHeaderHelp)
-            Text(ttftP95Header).frame(width: columnWidth, alignment: .trailing)
-                .help(ttftHeaderHelp)
-            Text("TPS P50").frame(width: columnWidth, alignment: .trailing)
+            headerCell(.ttftMean)
+            headerCell(.tpsIncludingTTFT)
+            headerCell(.tpsExcludingTTFT)
             Text("TTFT / TPS").frame(width: columnWidth, alignment: .trailing)
                 .help("有效样本数：TTFT 样本 / TPS 样本（两者可能不同）")
         }
@@ -247,20 +234,36 @@ struct PerformanceView: View {
         .padding(.bottom, 6)
     }
 
+    private func headerCell(_ key: PerformanceSortKey) -> some View {
+        Text(key.columnTitle(for: model.performanceGrouping))
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .frame(width: columnWidth, alignment: .trailing)
+            .help(columnHelp(key))
+    }
+
     /// 列口径进入表头 tooltip，替代原先独立的分组说明行。
-    private var ttftHeaderHelp: String {
-        isRouteGrouping
-            ? "路由维度：含自动回退的请求总等待（从请求开始到首个输出片段，含推理/工具产生的有效输出片段）的分位数。"
-            : "供应商 / 模型维度：单次尝试首输出（不含自动回退等待，含推理/工具产生的有效输出片段）的分位数。"
+    private func columnHelp(_ key: PerformanceSortKey) -> String {
+        switch key {
+        case .ttftMean:
+            return isRouteGrouping
+                ? "路由维度：含自动回退的请求总等待（从请求进入路由器到首个有效输出片段）的平均值。"
+                : "供应商 / 模型维度：单次上游尝试首输出（不含自动回退等待）的平均值。"
+        case .tpsIncludingTTFT:
+            return isRouteGrouping
+                ? "含 TTFT 的平均吞吐：请求口径下按（总等待 + 生成时长）总量加权，输出 token 含推理。"
+                : "含 TTFT 的平均吞吐：按（上游首输出 + 生成时长）总量加权，输出 token 含推理。"
+        case .tpsExcludingTTFT:
+            return "不含 TTFT 的平均吞吐：输出 token 总量 ÷ 生成时长总量（不含 TTFT），按生成时长加权，输出 token 含推理。"
+        }
     }
 
     private func groupRow(_ row: PerformanceGroupRow) -> some View {
         let s = row.summary
-        let p50 = PerformanceFormat.milliseconds(isRouteGrouping ? s.requestTTFTP50MS : s.ttftP50MS)
-        let p95 = PerformanceFormat.milliseconds(isRouteGrouping ? s.requestTTFTP95MS : s.ttftP95MS)
-        let tps = PerformanceFormat.tps(s.tpsP50)
+        let ttft = PerformanceFormat.milliseconds(isRouteGrouping ? s.requestTTFTMeanMS : s.ttftMeanMS)
+        let tpsIncluding = PerformanceFormat.tps(isRouteGrouping ? s.requestTpsIncludingTTFT : s.tpsIncludingTTFT)
+        let tpsExcluding = PerformanceFormat.tps(s.tpsExcludingTTFT)
         let sampleCount = ttftSampleCount(s)
-        let lowSample = sampleCount > 0 && sampleCount < lowSampleThreshold
 
         return HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
@@ -275,18 +278,13 @@ struct PerformanceView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
-                if lowSample {
-                    Text("样本较少")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
             }
             .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             .help(row.subtitle.isEmpty ? row.title : "\(row.title)\n\(row.subtitle)")
 
-            valueCell(p50, help: "\(ttftP50Header)：\(sampleCount) 个 TTFT 样本")
-            valueCell(p95, help: "\(ttftP95Header)：\(sampleCount) 个 TTFT 样本")
-            valueCell(tps, help: "TPS P50：\(s.tpsSamples) 个 TPS 样本")
+            valueCell(ttft, help: "\(PerformanceSortKey.ttftMean.columnTitle(for: model.performanceGrouping))：\(sampleCount) 个 TTFT 样本")
+            valueCell(tpsIncluding, help: "\(PerformanceSortKey.tpsIncludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
+            valueCell(tpsExcluding, help: "\(PerformanceSortKey.tpsExcludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
             samplesCell(s)
         }
         .padding(.vertical, 7)
@@ -313,7 +311,7 @@ struct PerformanceView: View {
     private var noHistoryState: some View {
         VStack(spacing: 14) {
             EmptyState(title: "当前区间暂无记录",
-                       detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史性能；这里会统计流式请求的首输出延迟与吞吐。",
+                       detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史性能；这里会统计流式请求的平均首输出延迟与平均吞吐。",
                        symbol: "speedometer")
             Text("转发本身不受影响。")
                 .font(.caption)

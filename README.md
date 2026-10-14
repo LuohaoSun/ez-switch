@@ -36,7 +36,7 @@ http://127.0.0.1:8788
 在“供应商与路由”页左侧添加供应商，填写连接信息：
 
 - 供应商名称
-- Chat Completions、Responses、Messages 三类接口是否启用
+- Chat Completions、Responses、Messages、Gemini 原生四类接口是否启用
 - 每类接口对应的完整 Base URL
 - API Key 和可选额外请求头
 
@@ -61,7 +61,7 @@ http://127.0.0.1:8788
 
 ### 4. 用量与隐私
 
-侧栏“用量”按今日、近 7 天、本月或自定义日期查看输入／输出、缓存命中与请求数，提供每日趋势、按路由／供应商／模型分组及 CSV 导出。侧栏“性能”是独立入口，按日期区间查看流式请求的首输出延迟（TTFT）与吞吐（TPS）。统计仅覆盖经过本机代理的请求，从启用后开始，不代表供应商账单，也不估算费用；缺失的 usage 标记为未知，不记成零。数据保存在配置目录的本地 `usage.sqlite`（使用 macOS 系统 SQLite），不存提示词、回答正文或密钥，数据库异常不影响转发。详见[用量统计说明](Docs/token-usage.md)。
+侧栏“用量”按今天、近 7 天、近 30 天或自定义区间查看输入／输出、缓存命中与请求数，提供趋势图（今天按小时、其余按天）、按路由／供应商／模型分组及 CSV 导出。侧栏“性能”是独立入口，复用同一组区间查看流式请求的首输出延迟（TTFT）与吞吐（TPS）。统计仅覆盖经过本机代理的请求，从启用后开始，不代表供应商账单，也不估算费用；缺失的 usage 标记为未知，不记成零。数据保存在配置目录的本地 `usage.sqlite`（使用 macOS 系统 SQLite），不存提示词、回答正文或密钥，数据库异常不影响转发。详见[用量统计说明](Docs/token-usage.md)。
 
 ## 支持的接口
 
@@ -70,8 +70,14 @@ http://127.0.0.1:8788
 | `/v1/chat/completions` | OpenAI Chat Completions | Base URL + `/chat/completions` |
 | `/v1/responses` | OpenAI Responses / Codex | Base URL + `/responses` |
 | `/v1/messages` | Anthropic Messages / Claude Code | Base URL + `/v1/messages` |
+| `POST /v1beta/models/{model}:generateContent` | Gemini 原生生成 | Base URL + `/models/{model}:generateContent` |
+| `POST /v1beta/models/{model}:streamGenerateContent?alt=sse` | Gemini 原生流式生成 | Base URL + `/models/{model}:streamGenerateContent?alt=sse` |
+| `POST /v1beta/models/{model}:countTokens` | Gemini Token 计数 | Base URL + `/models/{model}:countTokens` |
+| `GET /v1beta/models`、`GET /v1beta/models/{model}` | Gemini 格式的本地路由目录 | 本地返回，仅展示支持 Gemini 的路由 |
 
 默认按原协议转发，不做协议翻译；上游不支持某类接口时会原样返回上游错误。
+
+原生 Gemini 的模型 ID 写在请求路径里：本机请求 `POST http://127.0.0.1:8788/v1beta/models/main:generateContent` 会按路径中的 `main` 选路，再替换为远端模型 ID。Gemini 的原生 Base URL 填完整版本前缀（预设为 `https://generativelanguage.googleapis.com/v1beta`），路由器追加 `/models/{model}:{操作}`。正文保持 Gemini 原生格式，上游认证使用配置中的 `x-goog-api-key`，客户端查询参数里的 `key` 不会转发。流式请求保留客户端选择的 SSE 或 JSON 数组格式；JSON 数组可提取最终用量，但不提供流式 TTFT/TPS。`countTokens` 的预估结果不计实际消耗、不改变生成请求的运行时首选。暂不提供 Vertex AI OAuth、文件／缓存资源管理、Live API 或 Gemini 跨协议翻译。
 
 供应商的 Responses 可设为“转发到 Chat”，经 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 转换器对接仅支持 Chat Completions 的上游：Codex 仍请求本机 `/v1/responses`，应用由内置转换器生成 Chat 请求并把响应转回 Responses。该模式要求 Codex 发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩，转换并非无损；未启用转换的路由保持原生 Responses 转发。
 
@@ -89,7 +95,7 @@ ezs usage
 ezs usage --period 7d --group provider
 ezs usage --from 2026-01-01 --to 2026-01-31 --limit 1000
 ezs usage --json
-# 追加流式性能：TTFT P50/P95 与 TPS P50，默认按模型分组
+# 追加流式性能：平均 TTFT 与加权 TPS，默认按模型分组
 ezs usage --performance
 ```
 

@@ -18,6 +18,13 @@ Bundle layout in `EZSwitch.app/Contents/Resources/`:
   `ThirdPartyLicenses/swift/index.json`. Current pins: swift-nio 2.103.0,
   swift-atomics 1.3.1, swift-collections 1.6.0 and swift-system 1.8.1, all
   Apache-2.0; SwiftNIO also ships a `NOTICE.txt`.
+- `EZSwitch_EZSwitch.bundle/` — the SwiftPM resource bundle for the `EZSwitch`
+  target (`.copy("Resources/ProviderIcons")`). It carries the provider preset
+  brand icons at `ProviderIcons/<key>.png` and their MIT notice at
+  `ProviderIcons/LICENSE.txt`; see `ThirdParty/provider-icons/`.
+- `ThirdPartyLicenses/provider-icons/` — `LICENSE` (verbatim
+  `provider-icons/lobe-icons/LICENSE`, lobehub/lobe-icons, MIT) and `README.md`
+  for those icons.
 
 Attribution conventions:
 
@@ -61,3 +68,16 @@ Current packaging includes the CLIProxyAPI and Go dependency notices collected
 by `Tools/ResponsesBridge/collect-licenses.py`, and the pinned Swift packages'
 licenses and notices collected by `Tools/collect-swift-licenses.py` from 0.3.2.
 The 0.3.1 DMG contains the Go notices but predates the Swift license packaging fix.
+
+## Provider preset brand icons
+
+The "add provider" preset picker renders a brand icon for each
+`ProviderPreset.iconName`. These come from
+[lobehub/lobe-icons](https://github.com/lobehub/lobe-icons), MIT licensed,
+pinned at commit `05a9b8c41e4735a4a2b6d2f1e43574bd8ec6c8cb`. Upstream SVGs are
+stored verbatim under `provider-icons/lobe-icons/` and rendered offline to PNG by
+`provider-icons/render.sh` (AppKit's SVG support is unreliable, so the app ships
+PNG). `provider-icons/README.md` lists the key→source mapping and the
+monochrome/color policy. The bundle ships the PNGs in
+`EZSwitch_EZSwitch.bundle/ProviderIcons/` and the license and source notes under
+`ThirdPartyLicenses/provider-icons/`.

@@ -14,6 +14,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 APP_NAME=EZSwitch
 OLD_APP_NAME=ModelRouter
+# SwiftPM 为 EZSwitch 包内 EZSwitch target 生成的资源 bundle（<包名>_<target名>.bundle），
+# 内含 Resources/ProviderIcons 的预设品牌图标；必须随 .app 一起分发，
+# 否则 ProviderPresetIcon 只能回退到 SwiftPM 产物、.app 将依赖 .build。
+SWIFT_RESOURCE_BUNDLE="${APP_NAME}_${APP_NAME}.bundle"
 BUNDLE_ID=local.sunluohao.ezswitch
 INSTALL_DIR=/Applications
 DIST=dist/$APP_NAME.app
@@ -36,7 +40,13 @@ cp .build/ezs-responses-bridge "$DIST/Contents/MacOS/ezs-responses-bridge"
 cp -R .build/bridge-licenses "$DIST/Contents/Resources/ThirdPartyLicenses"
 cp -R .build/swift-licenses "$DIST/Contents/Resources/ThirdPartyLicenses/swift"
 cp ThirdParty/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/README.md"
+# 预设品牌图标来源（lobehub/lobe-icons，MIT）的许可与来源说明。
+mkdir -p "$DIST/Contents/Resources/ThirdPartyLicenses/provider-icons"
+cp ThirdParty/provider-icons/lobe-icons/LICENSE "$DIST/Contents/Resources/ThirdPartyLicenses/provider-icons/LICENSE"
+cp ThirdParty/provider-icons/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/provider-icons/README.md"
 cp LICENSE "$DIST/Contents/Resources/LICENSE.txt"
+echo "==> 复制 SwiftPM 资源 bundle：$SWIFT_RESOURCE_BUNDLE"
+cp -R ".build/release/$SWIFT_RESOURCE_BUNDLE" "$DIST/Contents/Resources/$SWIFT_RESOURCE_BUNDLE"
 codesign --force -s - "$DIST/Contents/MacOS/ezs-responses-bridge"
 cp Resources/Info.plist "$DIST/Contents/Info.plist"
 cp Resources/AppIcon.icns "$DIST/Contents/Resources/AppIcon.icns"

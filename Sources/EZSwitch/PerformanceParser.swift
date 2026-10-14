@@ -5,16 +5,18 @@ import NIOCore
 /// Which raw upstream protocol produced a streaming body. Performance is always
 /// measured on the *raw upstream* bytes (before Responses→Chat translation, before
 /// reorder).
-enum PerformanceSource: Sendable {
+enum PerformanceSource: Sendable, Equatable {
     case chat
     case responses
     case messages
+    case gemini
 
     init(endpoint: EndpointKind) {
         switch endpoint {
         case .chat: self = .chat
         case .responses: self = .responses
         case .messages: self = .messages
+        case .gemini: self = .gemini
         }
     }
 }
@@ -35,11 +37,20 @@ enum PerformanceSource: Sendable {
 /// Valid semantic content: Chat `content` / `reasoning_content` / non-empty
 /// `tool_calls[].function.arguments`; Responses `output_text`, `reasoning_text`,
 /// `reasoning_summary_text`, `function_call_arguments` deltas; Anthropic
-/// `content_block_delta` with `text_delta` / `thinking_delta` / `input_json_delta`.
+/// `content_block_delta` with `text_delta` / `thinking_delta` / `input_json_delta`;
+/// Gemini `candidates[].content.parts[].text` (thought parts included), a
+/// `functionCall` with a non-empty name (zero-arg calls, `args` absent or `{}`,
+/// are legal), or a valid `inlineData` (mime type + non-empty payload).
 /// Heartbeats, `role`-only deltas, `created`/lifecycle events, empty deltas, the
 /// terminal usage-only event and non-text metadata are excluded. Text fields must
 /// be non-empty Strings; Chat `content` arrays are non-standard for streaming
-/// deltas and are not counted.
+/// deltas and are not counted. Gemini signature-only parts (`thoughtSignature`),
+/// empty parts, and candidate-level `safetyRatings`/`finishReason`/`role` or a
+/// top-level usage-only event never count.
+///
+/// Gemini native streaming is measured only over SSE (`alt=sse`); the non-SSE
+/// `streamGenerateContent` JSON array is not parsed for timing, so it yields no
+/// performance samples at all (usage is still captured by `UsageParser`).
 ///
 /// Any parsing loss (oversized line/event, or a non-`[DONE]` payload that is not
 /// valid JSON) means the output can no longer be fully counted: `generationMS`
@@ -218,6 +229,7 @@ struct PerformanceParser {
         case .chat: return chatHasDelta(object)
         case .responses: return responsesHasDelta(object)
         case .messages: return messagesHasDelta(object)
+        case .gemini: return geminiHasDelta(object)
         }
     }
 
@@ -254,6 +266,32 @@ struct PerformanceParser {
         case "input_json_delta": return PerformanceParser.hasText(delta["partial_json"])
         default: return false
         }
+    }
+
+    private func geminiHasDelta(_ object: [String: Any]) -> Bool {
+        guard let candidates = object["candidates"] as? [[String: Any]] else { return false }
+        for candidate in candidates {
+            guard let content = candidate["content"] as? [String: Any],
+                  let parts = content["parts"] as? [[String: Any]] else { continue }
+            for part in parts where PerformanceParser.geminiPartHasOutput(part) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// A Gemini part is real output when it carries non-empty text (thought parts
+    /// included) or a function call with a non-empty name (zero-arg calls may omit
+    /// `args` or pass `{}`), or valid inline multimodal data. Signature-only parts,
+    /// empty parts and lifecycle/metadata fields are not output.
+    private static func geminiPartHasOutput(_ part: [String: Any]) -> Bool {
+        if let text = part["text"] as? String, !text.isEmpty { return true }
+        if let call = part["functionCall"] as? [String: Any],
+           let name = call["name"] as? String, !name.isEmpty { return true }
+        if let inline = part["inlineData"] as? [String: Any],
+           let mime = inline["mimeType"] as? String, !mime.isEmpty,
+           let payload = inline["data"] as? String, !payload.isEmpty { return true }
+        return false
     }
 
     /// Only a non-empty String counts as real output content (non-text metadata

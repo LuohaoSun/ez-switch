@@ -6,12 +6,18 @@ import SwiftUI   // Array.move(fromOffsets:toOffset:)（fake 排序）来自 Swi
 
 enum EndpointKind: String, Codable, CaseIterable {
     case chat, responses, messages
+    /// 原生 Gemini（generativelanguage.googleapis.com）。与前三者不同，它的上游
+    /// 路径不是「Base URL + 固定后缀」，而是 `Base URL + /models/{model}:{operation}`，
+    /// 由 `GeminiEndpoint` 构建；入站路径里的 model 是本地路由 id，转发前改写为真实模型。
+    /// 仅显式启用：旧配置迁移与 `APIEndpointSettings.all(baseURL:)` 都不会打开它。
+    case gemini
 
     var displayName: String {
         switch self {
         case .chat: return "Chat Completions"
         case .responses: return "Responses"
         case .messages: return "Messages"
+        case .gemini: return "Gemini"
         }
     }
 
@@ -19,11 +25,14 @@ enum EndpointKind: String, Codable, CaseIterable {
     /// 例如 OpenAI 填 `https://api.openai.com/v1`，最终请求 `/v1/chat/completions`；
     /// GLM Coding Plan 填 `https://open.bigmodel.cn/api/coding/paas/v4`，最终请求
     /// `/api/coding/paas/v4/chat/completions`。
+    /// Gemini 无固定后缀（见 `GeminiEndpoint`），这里返回空串仅为穷尽 switch；
+    /// `Forwarder.upstreamURL` 对 Gemini 直接返回 nil，避免拼出错误地址。
     var upstreamPath: String {
         switch self {
         case .chat: return "/chat/completions"
         case .responses: return "/responses"
         case .messages: return "/v1/messages"
+        case .gemini: return ""
         }
     }
 }
@@ -51,13 +60,18 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
     var chat: EndpointSetting
     var responses: EndpointSetting
     var messages: EndpointSetting
+    /// 原生 Gemini 协议配置。默认 `.disabled`：旧配置解码与历史工厂都不启用它，
+    /// 需要用户显式打开（`enabled(_:baseURL:)` 会把 `.gemini` 映射进来）。
+    var gemini: EndpointSetting
     var responsesTransport: ResponsesTransport
 
     init(chat: EndpointSetting, responses: EndpointSetting, messages: EndpointSetting,
+         gemini: EndpointSetting = .disabled,
          responsesTransport: ResponsesTransport = .native) {
         self.chat = chat
         self.responses = responses
         self.messages = messages
+        self.gemini = gemini
         self.responsesTransport = responsesTransport
     }
 
@@ -66,6 +80,7 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
         chat = try c.decodeIfPresent(EndpointSetting.self, forKey: .chat) ?? .disabled
         responses = try c.decodeIfPresent(EndpointSetting.self, forKey: .responses) ?? .disabled
         messages = try c.decodeIfPresent(EndpointSetting.self, forKey: .messages) ?? .disabled
+        gemini = try c.decodeIfPresent(EndpointSetting.self, forKey: .gemini) ?? .disabled
         responsesTransport = try c.decodeIfPresent(ResponsesTransport.self, forKey: .responsesTransport) ?? .native
     }
 
@@ -75,6 +90,7 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
             case .chat: return chat
             case .responses: return responses
             case .messages: return messages
+            case .gemini: return gemini
             }
         }
         set {
@@ -82,6 +98,7 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
             case .chat: chat = newValue
             case .responses: responses = newValue
             case .messages: messages = newValue
+            case .gemini: gemini = newValue
             }
         }
     }
@@ -113,6 +130,7 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
         }
     }
 
+    /// 历史工厂：与旧配置语义一致，只启用原始三种协议，绝不含糊地打开 Gemini。
     static func all(baseURL: String) -> APIEndpointSettings {
         APIEndpointSettings(
             chat: EndpointSetting(enabled: true, baseURL: baseURL),
@@ -121,11 +139,13 @@ struct APIEndpointSettings: Codable, Equatable, Hashable {
         )
     }
 
+    /// 只启用 `kinds` 中的协议（Gemini 需显式包含在 `kinds` 中才会打开）。
     static func enabled(_ kinds: Set<EndpointKind>, baseURL: String) -> APIEndpointSettings {
         APIEndpointSettings(
             chat: EndpointSetting(enabled: kinds.contains(.chat), baseURL: kinds.contains(.chat) ? baseURL : ""),
             responses: EndpointSetting(enabled: kinds.contains(.responses), baseURL: kinds.contains(.responses) ? baseURL : ""),
-            messages: EndpointSetting(enabled: kinds.contains(.messages), baseURL: kinds.contains(.messages) ? baseURL : "")
+            messages: EndpointSetting(enabled: kinds.contains(.messages), baseURL: kinds.contains(.messages) ? baseURL : ""),
+            gemini: EndpointSetting(enabled: kinds.contains(.gemini), baseURL: kinds.contains(.gemini) ? baseURL : "")
         )
     }
 }
@@ -191,12 +211,16 @@ struct RemoteModel: Codable, Identifiable, Equatable, Hashable {
         try c.encode(apiEndpoints, forKey: .apiEndpoints)
     }
 
+    /// 旧配置不含 gemini 字段；字段内只有原始三种协议，迁移时也绝不推断出 Gemini。
+    /// `allCases` 如今含 `.gemini`，故此处显式列出历史三种，避免旧配置被静默启用 Gemini。
+    static let legacyMigrationKinds: Set<EndpointKind> = [.chat, .responses, .messages]
+
     private static func inferLegacyEndpoints(baseURL: String) -> Set<EndpointKind> {
         let lower = baseURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lower.isEmpty else { return [] }
         if lower.contains("open.bigmodel.cn/api/anthropic") {
             // GLM Coding Plan 同一份订阅分别提供 Chat / Responses / Messages 地址。
-            return Set(EndpointKind.allCases)
+            return legacyMigrationKinds
         }
         if lower.contains("/api/anthropic") || lower.contains("api.anthropic.com") {
             return [.messages]
@@ -207,7 +231,7 @@ struct RemoteModel: Codable, Identifiable, Equatable, Hashable {
         if lower.contains("open.bigmodel.cn/api") {
             return [.responses]
         }
-        return Set(EndpointKind.allCases)
+        return legacyMigrationKinds
     }
 
     /// 旧配置只有一个 Base URL，且旧转发逻辑会固定追加 `/v1/...`。
@@ -232,6 +256,9 @@ struct RemoteModel: Codable, Identifiable, Equatable, Hashable {
                 return addingLegacyVersionPrefix(to: base)
             case .messages:
                 return removingLegacyVersionSuffix(from: base)
+            case .gemini:
+                // 旧配置从不包含 Gemini；仅为穷尽 switch。
+                return base
             }
         }
 
@@ -242,6 +269,9 @@ struct RemoteModel: Codable, Identifiable, Equatable, Hashable {
             return "https://open.bigmodel.cn/api/v1"
         case .messages:
             return "https://open.bigmodel.cn/api/anthropic"
+        case .gemini:
+            // 旧配置从不包含 Gemini；仅为穷尽 switch，保持 Base URL 原样。
+            return base
         }
     }
 
@@ -335,7 +365,7 @@ struct FakeModel: Codable, Identifiable, Equatable {
     }
 }
 
-struct AppConfig: Codable {
+struct AppConfig: Codable, Equatable {
     var port: Int = 8788
     var remotes: [RemoteModel] = []
     var fakes: [FakeModel] = []
@@ -542,6 +572,18 @@ final class Router {
         defer { lock.unlock() }
         var seen = Set<String>()
         return allFakes.filter { seen.insert($0.fakeModelID).inserted }
+    }
+
+    /// 至少有一个已绑定远端支持 `endpoint` 的 fake（config 顺序；id 去重）。
+    /// 本地 Gemini `models.list`/`models.get` 只暴露这些「Gemini 兼容」路由。
+    func fakes(supporting endpoint: EndpointKind) -> [FakeModel] {
+        lock.lock()
+        defer { lock.unlock() }
+        var seen = Set<String>()
+        return allFakes.filter { fake in
+            guard seen.insert(fake.fakeModelID).inserted else { return false }
+            return fake.orderedRemoteIDs.contains { remotes[$0]?.supports(endpoint) ?? false }
+        }
     }
 }
 
@@ -844,7 +886,10 @@ final class ConfigStore: ObservableObject {
 
     /// 拖动排序：config.fakes 的顺序就是菜单栏里的显示顺序。
     func moveFakes(from source: IndexSet, to destination: Int) {
-        config.fakes.move(fromOffsets: source, toOffset: destination)
+        var reordered = config.fakes
+        reordered.move(fromOffsets: source, toOffset: destination)
+        guard reordered != config.fakes else { return }
+        config.fakes = reordered
         router.update(config)
         save()
         Log.shared.log("fake: 排序更新（\(config.fakes.count) 个）")
@@ -1288,10 +1333,17 @@ final class ConfigStore: ObservableObject {
             let (baseNormalized, didNormalizeBaseURLs) = ConfigStore.normalizeBaseURLs(decoded)
             let (merged, didMerge) = ConfigStore.mergeDuplicateRemotes(baseNormalized)
             let (normalizedFakes, didNormalizeFakes) = ConfigStore.normalizeFakes(merged)
-            config = normalizedFakes
-            router.update(config)
-            Log.shared.log("reload: ok (\(config.remotes.count) remotes)")
-            if didNormalizeBaseURLs || didMerge || didNormalizeFakes || shouldPersistMigration {
+            let needsPersist = didNormalizeBaseURLs || didMerge || didNormalizeFakes || shouldPersistMigration
+            // 文件监控也会收到本应用的写入；相同内容无需再次发布，但仍须保留迁移写回。
+            if normalizedFakes == config, !needsPersist {
+                return
+            }
+            if normalizedFakes != config {
+                config = normalizedFakes
+                router.update(config)
+                Log.shared.log("reload: ok (\(config.remotes.count) remotes)")
+            }
+            if needsPersist {
                 if shouldPersistMigration {
                     Log.shared.log("reload: 迁移旧远端字段为三协议配置，写回文件")
                 }

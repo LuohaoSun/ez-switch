@@ -8,6 +8,7 @@ import AppKit
 final class RemotesViewDraft: ObservableObject {
     @Published var query = ""
     @Published var target: RemoteEditTarget?
+    @Published var addingProvider = false
     @Published var provider: RemoteGroup?
     @Published var selection: RemoteListSelection?
     @Published var newModel = ""
@@ -156,7 +157,7 @@ struct RemotesView: View {
         .navigationTitle("供应商")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { ui.target = RemoteEditTarget(remote: nil) } label: {
+                Button { ui.addingProvider = true } label: {
                     Label("添加供应商", systemImage: "plus")
                 }.help("添加供应商")
                 Button { editProvider() } label: {
@@ -174,6 +175,9 @@ struct RemotesView: View {
                 ui.selection = .provider(name)
                 UserDefaults.standard.set(name, forKey: "selectedProvider")
             }.id(group.id)
+        }
+        .sheet(isPresented: $ui.addingProvider) {
+            NewProviderSheet(store: store)
         }
         .sheet(item: $ui.target) { t in
             RemoteEditSheet(store: store, source: t.remote)
@@ -450,16 +454,31 @@ final class RemoteEditDraft: ObservableObject {
     @Published var catalogModels: [String]?
     @Published var selectedModels = Set<String>()
 
-    init(source: RemoteModel?) {
-        let split = splitProviderModel(source?.name ?? "")
-        providerName = source == nil ? "" : split.provider
-        model = source?.model ?? ""
-        endpoints = source?.apiEndpoints ?? APIEndpointSettings(
-            chat: .disabled, responses: .disabled, messages: .disabled)
-        apiKey = source?.apiKey ?? ""
-        headers = (source?.extraHeaders ?? [:])
-            .sorted { $0.key < $1.key }
-            .map { HeaderRow(key: $0.key, value: $0.value) }
+    /// source/template 优先；新建预设分支只预填名称/协议/请求头，凭据留空。
+    init(source: RemoteModel?, preset: ProviderPreset? = nil, existingProviders: Set<String> = []) {
+        if let source {
+            providerName = splitProviderModel(source.name).provider
+            model = source.model
+            endpoints = source.apiEndpoints
+            apiKey = source.apiKey
+            headers = source.extraHeaders
+                .sorted { $0.key < $1.key }
+                .map { HeaderRow(key: $0.key, value: $0.value) }
+        } else if let preset {
+            providerName = ProviderPresetNaming.suggestedName(base: preset.name, existing: existingProviders)
+            model = ""
+            endpoints = preset.endpoints
+            apiKey = ""
+            headers = preset.extraHeaders
+                .sorted { $0.key < $1.key }
+                .map { HeaderRow(key: $0.key, value: $0.value) }
+        } else {
+            providerName = ""
+            model = ""
+            endpoints = APIEndpointSettings(chat: .disabled, responses: .disabled, messages: .disabled)
+            apiKey = ""
+            headers = []
+        }
     }
 }
 
@@ -468,16 +487,22 @@ struct RemoteEditSheet: View {
     let source: RemoteModel?
     private let managesConnection: Bool
     private let addingModelToProvider: Bool
+    /// 非 nil 时页脚显示“返回”，交回预设列表（新增供应商的第二步）。
+    private let onBackToPresets: (() -> Void)?
 
     @StateObject private var draft: RemoteEditDraft
     @Environment(\.dismiss) private var dismiss
 
-    init(store: ConfigStore, source: RemoteModel?, template: RemoteModel? = nil) {
+    init(store: ConfigStore, source: RemoteModel?, template: RemoteModel? = nil,
+         preset: ProviderPreset? = nil, existingProviders: Set<String> = [],
+         onBackToPresets: (() -> Void)? = nil) {
         self.store = store
         self.source = source
+        self.onBackToPresets = onBackToPresets
         self.managesConnection = source == nil && template == nil
         self.addingModelToProvider = source == nil && template != nil
-        let initial = RemoteEditDraft(source: source ?? template)
+        let initial = RemoteEditDraft(source: source ?? template, preset: preset,
+                                      existingProviders: existingProviders)
         if source == nil { initial.model = "" }
         _draft = StateObject(wrappedValue: initial)
     }
@@ -597,6 +622,11 @@ struct RemoteEditSheet: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
+            if let onBackToPresets {
+                Button("返回") { onBackToPresets() }
+                    .disabled(draft.fetchingModels)
+                    .help("返回预设列表")
+            }
             if source != nil {
                 Button("删除") { draft.confirmDelete = true }
                     .foregroundColor(.red)

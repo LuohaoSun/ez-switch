@@ -9,12 +9,16 @@ struct RouteCandidateItem: Identifiable, Equatable {
 }
 
 /// 用原生 `NSTableView` 承载单条路由候选：行几何、拖动发起与插入落点（固定 `.above`）都归表格；
-/// 行内容是最简 AppKit cell（删除按钮吞掉自身点击），表格不自滚动，高度由外层 SwiftUI 滚动视图决定。
+/// 行内容是最简 AppKit cell（删除按钮仅悬停/键盘焦点时显现、吞掉自身点击；右键菜单提供同一操作），
+/// 表格不自滚动，高度由外层 SwiftUI 滚动视图决定。
 struct NativeRouteCandidateList: NSViewRepresentable {
     let items: [RouteCandidateItem]
     let activeRemoteID: UUID?
     let store: ConfigStore
     let fakeID: UUID
+    /// 收起时内容不可交互：不参与键盘焦点循环，也不暴露辅助功能元素
+    /// （SwiftUI 的裁剪与 `allowsHitTesting` 只作用于 SwiftUI 层，挡不住 Tab 焦点）。
+    var isInteractive: Bool = true
     var rowHeight: CGFloat = 34
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -25,6 +29,7 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         context.coordinator.apply(items: items, active: activeRemoteID)
         // 空路由时 apply 不会 reload；这里确保末尾占位行从首次显示起就存在。
         container.tableView.reloadData()
+        context.coordinator.setInteractive(isInteractive)
         return container
     }
 
@@ -44,6 +49,8 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         }
         // 新一次按下清掉上一次拖动遗留的点击抑制；若本次按下随即开始拖动，willBegin 会再抑制。
         tableView.onMouseDown = { [weak coordinator] in coordinator?.newMouseDown() }
+        // 原生右键菜单：为非鼠标操作提供“从路由移除”入口（不改动“当前”选中）。
+        tableView.contextMenuProvider = { [weak coordinator] row in coordinator?.contextMenu(row: row) }
         coordinator.attach(tableView)
     }
 
@@ -53,6 +60,7 @@ struct NativeRouteCandidateList: NSViewRepresentable {
             container.tableView.rowHeight = rowHeight
         }
         context.coordinator.apply(items: items, active: activeRemoteID)
+        context.coordinator.setInteractive(isInteractive)
     }
 
     /// 高度含末尾常驻的占位行（“拖入模型”）。
@@ -77,10 +85,20 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         private var pendingReload = false
         /// 本次拖动结束后短暂抑制行点击，保证拖动不改动“当前”选中模型。
         private var suppressClick = false
+        /// 当前是否可交互（收起时否）。
+        private var interactive = true
+        private let focusShield = NativeTableFocusShield()
 
         init(_ parent: NativeRouteCandidateList) { self.parent = parent }
 
         func attach(_ tableView: NSTableView) { self.tableView = tableView }
+
+        /// 收起时只拒绝焦点并禁用表内子控件；不隐藏表格，收起动画的绘制过渡不受影响。
+        func setInteractive(_ value: Bool) {
+            guard interactive != value else { return }
+            interactive = value
+            if let tableView { focusShield.apply(value, to: tableView) }
+        }
 
         /// 表格当前显示的行标识；拖动落点即按这个快照换算锚点。
         var displayedIDs: [UUID] { displayedItems.map(\.id) }
@@ -93,8 +111,10 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
             guard row >= 0, row <= displayedItems.count else { return nil }
             guard row < displayedItems.count else {
-                return (tableView.makeView(withIdentifier: RouteCandidatePlaceholderCell.reuseIdentifier, owner: nil)
-                        as? RouteCandidatePlaceholderCell) ?? RouteCandidatePlaceholderCell()
+                let cell = (tableView.makeView(withIdentifier: RouteCandidatePlaceholderCell.reuseIdentifier, owner: nil)
+                            as? RouteCandidatePlaceholderCell) ?? RouteCandidatePlaceholderCell()
+                cell.configure(isEmpty: displayedItems.isEmpty)
+                return cell
             }
             let item = displayedItems[row]
             let cell = (tableView.makeView(withIdentifier: RouteCandidateCell.reuseIdentifier, owner: nil)
@@ -107,7 +127,7 @@ struct NativeRouteCandidateList: NSViewRepresentable {
 
         /// 末尾占位行不可选中，因此也不能作为行拖拽的来源。
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-            row >= 0 && row < displayedItems.count
+            interactive && row >= 0 && row < displayedItems.count
         }
 
         // MARK: 视图更新（不打断拖动）
@@ -155,18 +175,21 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         }
 
         /// 行点击选择模型；拖动结束窗口内返回 false，保证拖动不改动显式选中模型。
+        /// 收起态不可交互：不改变“当前”模型。
         @discardableResult
         func handleClick(row: Int) -> Bool {
-            guard !suppressClick, row >= 0, row < displayedItems.count else { return false }
+            guard interactive, !suppressClick, row >= 0, row < displayedItems.count else { return false }
             select(itemID: displayedItems[row].id)
             return true
         }
 
         private func select(itemID: UUID) {
+            guard interactive else { return }
             _ = parent.store.selectRouteModel(fakeID: parent.fakeID, remoteID: itemID)
         }
 
         private func remove(itemID: UUID) {
+            guard interactive else { return }
             guard let current = parent.store.config.fakes.first(where: { $0.id == parent.fakeID }) else { return }
             let remaining = current.orderedRemoteIDs.filter { $0 != itemID }
             guard remaining != current.orderedRemoteIDs else { return }
@@ -174,10 +197,27 @@ struct NativeRouteCandidateList: NSViewRepresentable {
                                             autoFallback: current.autoFallback)
         }
 
+            // MARK: 右键菜单
+
+        func contextMenu(row: Int) -> NSMenu? {
+            guard interactive, row >= 0, row < displayedItems.count else { return nil }
+            let delete = NSMenuItem(title: "从路由移除", action: #selector(removeMenuItemClicked(_:)), keyEquivalent: "")
+            delete.target = self
+            delete.representedObject = displayedItems[row].id
+            let menu = NSMenu()
+            menu.addItem(delete)
+            return menu
+        }
+
+        @objc func removeMenuItemClicked(_ sender: NSMenuItem) {
+            guard let id = sender.representedObject as? UUID else { return }
+            remove(itemID: id)
+        }
+
         // MARK: 拖动源（标准 NSTableView 行拖动）
 
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-            guard row >= 0, row < displayedItems.count else { return nil }
+            guard interactive, row >= 0, row < displayedItems.count else { return nil }
             return ModelDragPayload.pasteboardItem(ModelDragItem(id: displayedItems[row].id))
         }
 
@@ -223,7 +263,8 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
                        proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
             // 全有或全无：任一条目类型不符或 Codable 解码失败都拒绝；来源身份按当前配置判定。
-            guard let payload = ModelDragPayload.decode(pasteboard: info.draggingPasteboard) else { return [] }
+            guard interactive,
+                  let payload = ModelDragPayload.decode(pasteboard: info.draggingPasteboard) else { return [] }
             let valid = Set(parent.store.config.remotes.map(\.id))
             guard !RouteCandidateReorder.sources(payload, validRemoteIDs: valid).isEmpty else { return [] }
             // 始终固定为 .above：末尾占位行（row == count）在系统提出 .on 时也转成末尾插入线。
@@ -237,7 +278,8 @@ struct NativeRouteCandidateList: NSViewRepresentable {
 
         func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
                        row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
-            guard let payload = ModelDragPayload.decode(pasteboard: info.draggingPasteboard) else { return false }
+            guard interactive,
+                  let payload = ModelDragPayload.decode(pasteboard: info.draggingPasteboard) else { return false }
             // 末尾占位行：row == count（或系统仍给出 .on）都表示追加到末尾。
             if row >= displayedItems.count { return parent.commit(payload, slot: .end) }
             guard dropOperation == .above else { return false }
@@ -247,10 +289,11 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         }
     }
 
-    /// 提交一次候选重排：来源须为已知远端；落点锚点须仍存在于当前配置。
+    /// 提交一次候选重排：来源须为已知远端；落点锚点须仍存在于当前配置。收起态拒绝。
     @MainActor
     func commit(_ payload: [ModelDragItem], slot: RouteCandidateReorder.Slot) -> Bool {
-        store.reorderRouteCandidates(fakeID: fakeID, payload: payload, slot: slot)
+        guard isInteractive else { return false }
+        return store.reorderRouteCandidates(fakeID: fakeID, payload: payload, slot: slot)
     }
 }
 
@@ -280,10 +323,19 @@ final class CandidateTableView: NSTableView {
     var onDraggingStateChange: ((Bool) -> Void)?
     /// 每次新按下都会回调，用于清除上一次拖动遗留的点击抑制。
     var onMouseDown: (() -> Void)?
+    /// 右键时按命中行构造菜单（占位行返回 nil）。
+    var contextMenuProvider: ((Int) -> NSMenu?)?
 
     override func mouseDown(with event: NSEvent) {
         onMouseDown?()
         super.mouseDown(with: event)
+    }
+
+    /// 右键命中候选行：只弹删除菜单，不改动“当前”选中；占位行/空白不弹菜单。
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let row = self.row(at: convert(event.locationInWindow, from: nil))
+        guard row >= 0 else { return nil }
+        return contextMenuProvider?(row)
     }
 
     /// 进入目的表格：冻结显示快照。
@@ -315,6 +367,45 @@ final class CandidateTableView: NSTableView {
     override func draggingEnded(_ sender: NSDraggingInfo) {
         onDraggingStateChange?(false)
         super.draggingEnded(sender)
+    }
+}
+
+/// 收起态键盘焦点屏蔽（路由候选表与供应商模型表共用）：只动自己这张表及其子控件，不跨卡片。
+/// 不隐藏表格（隐藏会让收起动画的内容瞬间消失）；只拒绝焦点、禁用子控件并隐藏 AX，绘制保持。
+final class NativeTableFocusShield {
+    private var disabledControls: [NSControl] = []
+
+    func apply(_ interactive: Bool, to table: NSTableView) {
+        if interactive {
+            for control in disabledControls {
+                control.isEnabled = true
+                control.refusesFirstResponder = false
+            }
+            disabledControls = []
+        } else {
+            // 只禁用本表子树里原本可用的子控件（行内按钮 / 文本域），表格自身不动以保持绘制。
+            disabledControls = Self.controls(in: table).filter { $0 !== table && $0.isEnabled }
+            for control in disabledControls {
+                control.isEnabled = false
+                control.refusesFirstResponder = true
+            }
+        }
+        table.refusesFirstResponder = !interactive
+        table.setAccessibilityHidden(!interactive)
+        if !interactive, let window = table.window,
+           let responder = window.firstResponder as? NSView, responder.isDescendant(of: table) {
+            window.makeFirstResponder(nil)
+        }
+    }
+
+    private static func controls(in root: NSView) -> [NSControl] {
+        var result: [NSControl] = []
+        var stack: [NSView] = [root]
+        while let view = stack.popLast() {
+            if let control = view as? NSControl { result.append(control) }
+            stack.append(contentsOf: view.subviews)
+        }
+        return result
     }
 }
 
@@ -362,9 +453,8 @@ final class CandidateTableContainer: NSScrollView {
     }
 }
 
-/// 单行 cell：拖动手柄 + 模型名 + “当前”指示 + 删除按钮。
-/// 手柄/名称/指示都让出命中测试，让表格统一处理点击（选择）与拖动（重排）；
-/// 删除按钮保留命中测试，因此点击它既不会选中模型，也不会发起拖动。
+/// 单行 cell：拖动手柄、模型名、“当前”指示和按需显示的删除按钮。
+/// 删除按钮独立命中，其他内容的点击和拖动交给表格。
 final class RouteCandidateCell: NSTableCellView {
     static let reuseIdentifier = NSUserInterfaceItemIdentifier("RouteCandidateCell")
 
@@ -373,8 +463,10 @@ final class RouteCandidateCell: NSTableCellView {
     private let currentIcon = PassthroughImageView()
     private let currentText = PassthroughTextField(labelWithString: "当前")
     private let currentStack = NSStackView()
-    private let removeButton = NSButton()
+    private let removeButton = RouteRemoveButton()
     private let contentStack = NSStackView()
+    /// 悬停跟踪区：`.inVisibleRect` 让 AppKit 随尺寸/位置自动更新，无需重建。
+    private var hoverTrackingArea: NSTrackingArea?
 
     var onRemove: (() -> Void)?
     var onSelect: (() -> Void)?
@@ -390,7 +482,49 @@ final class RouteCandidateCell: NSTableCellView {
     func configure(item: RouteCandidateItem, isActive: Bool) {
         title.stringValue = item.label
         title.setAccessibilityTitle(item.label)
+        removeButton.setAccessibilityLabel("从路由移除 \(item.label)")
         currentStack.isHidden = !isActive
+        // 复用行可能带着上一行的悬停状态：按指针实际位置重算，避免按钮假显。
+        isHovering = pointerIsInside()
+        updateRemoveButtonVisibility()
+    }
+
+    // MARK: 悬停显示删除按钮
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        // `.inVisibleRect` 会随视图移动/缩放自动维护矩形，只需创建一次，绝不重复重建。
+        guard hoverTrackingArea == nil else { return }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+        updateRemoveButtonVisibility()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+        updateRemoveButtonVisibility()
+    }
+
+    private var isHovering = false
+
+    /// 悬停时显现删除按钮；直切状态，不做动画。隐藏只清图标，按钮仍留在可访问性树中。
+    private func updateRemoveButtonVisibility() {
+        removeButton.setRevealed(isHovering)
+    }
+
+    /// 指针是否落在本行内（复用/刷新时校准悬停状态）。
+    /// 与跟踪区 `.activeInKeyWindow` 语义一致：无非 key 窗口时视为未悬停。
+    private func pointerIsInside() -> Bool {
+        guard let window, window.isVisible, window.isKeyWindow else { return false }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return bounds.contains(point)
     }
 
     private func build() {
@@ -428,13 +562,16 @@ final class RouteCandidateCell: NSTableCellView {
         currentStack.setContentHuggingPriority(.required, for: .horizontal)
 
         removeButton.isBordered = false
-        removeButton.image = NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "从路由移除")
         removeButton.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
         removeButton.imagePosition = .imageOnly
         removeButton.contentTintColor = .secondaryLabelColor
         removeButton.toolTip = "从路由移除"
         removeButton.target = self
         removeButton.action = #selector(removeTapped)
+        // 图标仅作显现/隐藏的开关：隐藏时清空图标，view 本身始终留在层次与可访问性树中。
+        removeButton.revealImage = NSImage(systemSymbolName: "minus.circle", accessibilityDescription: "从路由移除")
+        removeButton.setRevealed(false)
+        removeButton.setAccessibilityLabel("从路由移除")
         removeButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             removeButton.widthAnchor.constraint(equalToConstant: 20),
@@ -460,6 +597,46 @@ final class RouteCandidateCell: NSTableCellView {
     @objc private func removeTapped() { onRemove?() }
 }
 
+/// 图标隐藏时保留按钮的布局与辅助功能入口，并让出鼠标命中。
+private final class RouteRemoveButton: NSButton {
+    var revealImage: NSImage?
+    private var hovered = false
+    private var keyboardFocused = false
+    private var isRevealed = true
+
+    func setRevealed(_ revealed: Bool) {
+        hovered = revealed
+        updateAppearance()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        keyboardFocused = true
+        updateAppearance()
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        guard super.resignFirstResponder() else { return false }
+        keyboardFocused = false
+        updateAppearance()
+        return true
+    }
+
+    private func updateAppearance() {
+        let revealed = hovered || keyboardFocused
+        guard revealed != isRevealed else { return }
+        isRevealed = revealed
+        image = revealed ? revealImage : nil
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        isRevealed ? super.hitTest(point) : nil
+    }
+
+    override func isAccessibilityElement() -> Bool { true }
+}
+
 /// 命中测试直接让出，点击/拖动落到表格本身。
 private final class PassthroughImageView: NSImageView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -482,13 +659,16 @@ private final class CandidateTitleField: NSTextField {
     override func accessibilityLabel() -> String? { stringValue }
 }
 
-/// 末尾常驻占位行“拖入模型”：追加到末尾/空路由拖入的唯一原生落点，保留原有虚线外观。
+/// 末尾常驻占位行“拖入模型”：追加到末尾/空路由拖入的唯一原生落点，保留虚线落点语义。
+/// 行高恒为 34pt；仅调整虚线/图标/文字的视觉权重（空路由强调、非空路由弱化），不影响落点与总高。
 /// 它不可选中，也不作为拖拽来源（bounds guard 在 pasteboardWriterForRow / shouldSelectRow / handleClick）。
 final class RouteCandidatePlaceholderCell: NSTableCellView {
     static let reuseIdentifier = NSUserInterfaceItemIdentifier("RouteCandidatePlaceholderCell")
 
     private let slot = DashedSlotView()
     private let content = NSStackView()
+    private let icon = NSImageView()
+    private let label = NSTextField(labelWithString: "拖入模型")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -498,13 +678,22 @@ final class RouteCandidatePlaceholderCell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    /// 非空路由：常态弱化虚线/图标/文字，仅保留落点语义；空路由：强调为明确的拖入邀请。
+    /// 行高始终为 34pt，因此 `(行数 × rowHeight)` 的总高与落点映射不变。
+    func configure(isEmpty: Bool) {
+        slot.emphasis = isEmpty ? 1 : 0.45
+        let tint: NSColor = isEmpty ? .secondaryLabelColor : .tertiaryLabelColor
+        icon.contentTintColor = tint
+        label.textColor = tint
+        label.stringValue = isEmpty ? "拖入第一个模型" : "拖入模型"
+        setAccessibilityLabel(isEmpty ? "拖入第一个模型" : "拖入模型")
+    }
+
     private func build() {
-        let icon = NSImageView()
         icon.image = NSImage(systemSymbolName: "plus.circle.dashed", accessibilityDescription: "拖入模型")
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
         icon.contentTintColor = .secondaryLabelColor
 
-        let label = NSTextField(labelWithString: "拖入模型")
         label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         label.textColor = .secondaryLabelColor
 
@@ -530,12 +719,17 @@ final class RouteCandidatePlaceholderCell: NSTableCellView {
 }
 
 /// 只画一个虚线圆角边框，作为占位行背景。
+/// `emphasis` 控制线条强度：空路由（1）清晰可辨，非空路由（<1）常态弱化为低调落点提示。
 final class DashedSlotView: NSView {
+    var emphasis: CGFloat = 1 {
+        didSet { if emphasis != oldValue { needsDisplay = true } }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
         path.lineWidth = 1
         path.setLineDash([4, 4], count: 2, phase: 0)
-        NSColor.labelColor.withAlphaComponent(0.12).setStroke()
+        NSColor.labelColor.withAlphaComponent(0.12 * max(0, min(1, emphasis))).setStroke()
         path.stroke()
     }
 }

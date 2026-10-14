@@ -128,8 +128,11 @@ enum Forwarder {
         return URLSession(configuration: cfg)
     }()
 
-    /// 上游 URL：供应商为当前协议配置的完整 Base URL 前缀 + 协议相对路径 + 原 query
+    /// 上游 URL：供应商为当前协议配置的完整 Base URL 前缀 + 协议相对路径 + 原 query。
+    /// Gemini 的路径是 `{base}/models/{model}:{operation}`（见 `GeminiEndpoint`），
+    /// 不存在静态后缀，故这里直接返回 nil，由 `buildRequest` 的 Gemini 分支处理。
     static func upstreamURL(remote: RemoteModel, endpoint: EndpointKind, query: String) -> URL? {
+        guard endpoint != .gemini else { return nil }
         let setting = remote.apiEndpoints[endpoint]
         guard setting.enabled else { return nil }
         var base = setting.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -180,6 +183,11 @@ enum Forwarder {
 
     static func buildRequest(clientHead: HTTPRequestHead, body: Data,
                              endpoint: EndpointKind, remote: RemoteModel, query: String) throws -> URLRequest {
+        // Native Gemini has its own path/body/auth shaping derived from the client
+        // URI; the generic base+suffix flow does not apply.
+        if endpoint == .gemini {
+            return try buildGeminiRequest(clientHead: clientHead, body: body, remote: remote)
+        }
         let upstreamEndpoint: EndpointKind = endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
         guard remote.apiEndpoints[upstreamEndpoint].enabled else {
             throw ForwarderError.endpointDisabled(upstreamEndpoint)
@@ -200,18 +208,7 @@ enum Forwarder {
         }
         req.httpBody = upstreamBody
 
-        // 端到端透传客户端请求头：普通头（SDK/会话/自定义头…）原样转发，只剔除
-        // hop-by-hop、URLSession 接管的 Host/Content-Length/Accept-Encoding，以及必须
-        // 按端点替换的供应商鉴权头。重复出现的头由 URLRequest 逐值追加重建。
-        let h = clientHead.headers
-        let excluded = excludedRequestHeaders.union(hopByHopTokens(in: h))
-        for (name, value) in h {
-            guard !excluded.contains(name.lowercased()) else { continue }
-            req.addValue(value, forHTTPHeaderField: name)
-        }
-        if req.value(forHTTPHeaderField: "content-type") == nil {
-            req.setValue("application/json", forHTTPHeaderField: "content-type")
-        }
+        applyForwardedHeaders(&req, from: clientHead)
 
         switch endpoint {
         case .chat, .responses:
@@ -222,6 +219,8 @@ enum Forwarder {
             if req.value(forHTTPHeaderField: "anthropic-version") == nil {
                 req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             }
+        case .gemini:
+            break // 已在上方 Gemini 分支处理
         }
 
         if url.host == "opencode.ai", url.path.hasPrefix("/zen/go/v1/") {
@@ -234,6 +233,54 @@ enum Forwarder {
             }
         }
 
+        for (k, v) in remote.extraHeaders {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+        return req
+    }
+
+    /// 端到端透传客户端请求头：普通头（SDK/会话/自定义头…）原样转发，只剔除
+    /// hop-by-hop、URLSession 接管的 Host/Content-Length/Accept-Encoding，以及必须
+    /// 按端点替换的供应商鉴权头。重复出现的头由 URLRequest 逐值追加重建。
+    private static func applyForwardedHeaders(_ req: inout URLRequest, from clientHead: HTTPRequestHead) {
+        let h = clientHead.headers
+        let excluded = excludedRequestHeaders.union(hopByHopTokens(in: h))
+        for (name, value) in h {
+            guard !excluded.contains(name.lowercased()) else { continue }
+            req.addValue(value, forHTTPHeaderField: name)
+        }
+        if req.value(forHTTPHeaderField: "content-type") == nil {
+            req.setValue("application/json", forHTTPHeaderField: "content-type")
+        }
+    }
+
+    /// Gemini 原生请求：从 clientHead.uri 解析本地路由与操作，路径改写为真实模型，
+    /// 生成类 body 逐字节透传（不重排、不 strip），countTokens 仅改写嵌套
+    /// `generateContentRequest.model`；客户端 query 里的 `key` 已在解析时剔除，
+    /// 上游鉴权一律用 `x-goog-api-key`（供应商 key）。
+    private static func buildGeminiRequest(clientHead: HTTPRequestHead, body: Data,
+                                           remote: RemoteModel) throws -> URLRequest {
+        guard case .operation(let context)? = GeminiEndpoint.parse(uri: clientHead.uri, method: clientHead.method) else {
+            throw ForwarderError.badResponse
+        }
+        guard remote.apiEndpoints[.gemini].enabled else {
+            throw ForwarderError.endpointDisabled(.gemini)
+        }
+        let base = remote.apiEndpoints[.gemini].baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else {
+            throw ForwarderError.missingEndpointBaseURL(.gemini)
+        }
+        guard let url = GeminiEndpoint.upstreamURL(baseURL: base, realModel: remote.model, context: context) else {
+            throw ForwarderError.badResponse
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = clientHead.method.rawValue
+        req.httpBody = context.isCountTokens
+            ? GeminiEndpoint.rewriteCountTokensBody(body, realModel: remote.model)
+            : body
+        applyForwardedHeaders(&req, from: clientHead)
+        // 客户端 x-goog-api-key 已在 excludedRequestHeaders 中剔除，这里替换为供应商 key。
+        req.setValue(remote.apiKey, forHTTPHeaderField: "x-goog-api-key")
         for (k, v) in remote.extraHeaders {
             req.setValue(v, forHTTPHeaderField: k)
         }
@@ -253,6 +300,13 @@ enum Forwarder {
             && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
         var req = try buildRequest(clientHead: clientHead, body: body,
                                    endpoint: endpoint, remote: remote, query: query)
+        // countTokens 不做 usage/performance 采集：直接返回原始响应，不包 accumulating，
+        // 使 upstream.usage/performance 保持 nil（Router 侧也零记账）。
+        if endpoint == .gemini,
+           case .operation(let context)? = GeminiEndpoint.parse(uri: clientHead.uri, method: clientHead.method),
+           context.isCountTokens {
+            return try await perform(req, session: session)
+        }
         if endpoint == .responses, remote.apiEndpoints.responsesTransport == .chatCompletions {
             let translator = try ResponseTranslator()
             do {

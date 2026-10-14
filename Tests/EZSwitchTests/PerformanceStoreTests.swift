@@ -3,8 +3,9 @@ import Testing
 @testable import EZSwitch
 
 /// `UsageStore.performanceSnapshot` 的数据层语义：
-/// 资格口径（成功 + 2xx + 流式）、缺失/失败/取消/非流式的排除、最近秩分位数、
-/// 分组身份隔离、短输出 TPS 归零（nil），以及跨重开的持久化。
+/// 资格口径（成功 + 2xx + 流式）、缺失/失败/取消/非流式的排除、加权吞吐（总 token / 总时长）、
+/// TTFT 均值样本的独立性、TPS 有效队列的公共分母、分组身份隔离、跨重开的持久化，
+/// 以及空/无效一律为 nil（绝不伪造成 0）。
 @Suite("Performance store")
 struct PerformanceStoreTests {
 
@@ -31,6 +32,7 @@ struct PerformanceStoreTests {
         return Calendar.current.date(from: components)!
     }
 
+    /// `requestTTFT` 默认 nil：默认记录只进 TTFT 队列、不进 TPS 有效队列（需显式给出请求级计时）。
     private func performance(streaming: Bool = true, ttft: Double? = 100, requestTTFT: Double? = nil,
                              generation: Double? = 1000, deltaCount: Int = 10) -> UsagePerformance {
         UsagePerformance(streaming: streaming, ttftMS: ttft, requestTTFTMS: requestTTFT,
@@ -61,7 +63,12 @@ struct PerformanceStoreTests {
                                             to: from.addingTimeInterval(3600), grouping: grouping)
     }
 
-    // MARK: - 分位数算法
+    private func approx(_ value: Double?, _ expected: Double, tolerance: Double = 0.001) -> Bool {
+        guard let value else { return false }
+        return abs(value - expected) <= tolerance
+    }
+
+    // MARK: - 原始工具
 
     @Test
     func nearestRankQuantileMatchesSortedSamples() {
@@ -78,8 +85,50 @@ struct PerformanceStoreTests {
         #expect(nearestRankPercentile([10, 20, 30, 40], 1) == 40)
     }
 
+    // MARK: - 加权吞吐回归（非对称 2 样本）
+
+    /// 核心回归：加权吞吐 = Σ输出 / Σ时长，绝不取逐请求速率的算术平均；
+    /// TTFT 是有效样本的算术平均，绝不是中位数。
+    /// 样本：100 token / 1s 与 100 token / 9s。
     @Test
-    func summaryQuantilesUseAllSamplesWithoutTruncation() async throws {
+    func weightedRatesUseTotalsNotAverageOfPerRequestRates() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let start = day(2026, 5, 10)
+        let store = UsageStore(url: url)
+
+        // 样本 1：生成 1s、输出 100；样本 2：生成 9s、输出 100。
+        store.record(record(timestamp: start, output: 100,
+                            performance: performance(ttft: 1000, requestTTFT: 2000, generation: 1000)))
+        store.record(record(timestamp: start.addingTimeInterval(1), output: 100,
+                            performance: performance(ttft: 3000, requestTTFT: 4000, generation: 9000)))
+        try await store.flush()
+
+        let summary = try await snapshot(store, from: start).summary
+        #expect(summary.attempts == 2)
+        #expect(summary.successfulStreamingAttempts == 2)
+        #expect(summary.ttftSamples == 2)
+        #expect(summary.requestTTFTSamples == 2)
+        #expect(summary.tpsSamples == 2)
+
+        // 加权（排除 TTFT）：Σ输出 200 × 1000 / Σ生成 10000 = 20 tok/s。
+        // 逐请求速率的算术平均是 (100 + 11.111) / 2 ≈ 55.56 —— 绝不能出现。
+        #expect(approx(summary.tpsExcludingTTFT, 20))
+        // 加权（含尝试 TTFT）：200 × 1000 / (2000 + 12000) = 14.2857。
+        #expect(approx(summary.tpsIncludingTTFT, 200.0 * 1000 / 14000))
+        // 加权（含请求 TTFT）：200 × 1000 / (3000 + 13000) = 12.5。
+        #expect(approx(summary.requestTpsIncludingTTFT, 12.5))
+        // 含请求级计时的分母显著大于含尝试级，两个速率必须不同（回退请求 vs 单次尝试口径）。
+        #expect(summary.requestTpsIncludingTTFT != summary.tpsIncludingTTFT)
+
+        // TTFT 均值：(1000 + 3000) / 2 = 2000；中位数（最近秩 p50）是 1000，绝不能用中位数。
+        #expect(approx(summary.ttftMeanMS, 2000))
+        #expect(approx(summary.requestTTFTMeanMS, 3000))
+        #expect(nearestRankPercentile([1000, 3000], 0.5) == 1000)
+    }
+
+    @Test
+    func meanQuantilesUseAllSamplesWithoutTruncation() async throws {
         let url = try makeDatabaseURL()
         defer { cleanup(url) }
         let start = day(2026, 5, 10)
@@ -94,19 +143,51 @@ struct PerformanceStoreTests {
         }
         try await store.flush()
 
-        let snapshot = try await snapshot(store, from: start)
-        #expect(snapshot.summary.attempts == 4)
-        #expect(snapshot.summary.successfulStreamingAttempts == 4)
-        #expect(snapshot.summary.ttftSamples == 4)
-        #expect(snapshot.summary.ttftP50MS == 200)
-        #expect(snapshot.summary.ttftP95MS == 400)
-        // requestTTFT 样本 [50,100,150,200]，独立计数。
-        #expect(snapshot.summary.requestTTFTSamples == 4)
-        #expect(snapshot.summary.requestTTFTP50MS == 100)
-        #expect(snapshot.summary.requestTTFTP95MS == 200)
-        // tps = output * 1000 / generation = [10,20,30,40]。
-        #expect(snapshot.summary.tpsSamples == 4)
-        #expect(snapshot.summary.tpsP50 == 20)
+        let summary = try await snapshot(store, from: start).summary
+        #expect(summary.attempts == 4)
+        #expect(summary.successfulStreamingAttempts == 4)
+        #expect(summary.ttftSamples == 4)
+        #expect(approx(summary.ttftMeanMS, 250))          // (100+200+300+400)/4
+        #expect(summary.requestTTFTSamples == 4)
+        #expect(approx(summary.requestTTFTMeanMS, 125))   // (50+100+150+200)/4
+        #expect(summary.tpsSamples == 4)
+        // 生成均为 1000ms：tpsExcludingTTFT = Σ输出 100 × 1000 / Σ生成 4000 = 25。
+        #expect(approx(summary.tpsExcludingTTFT, 25))
+        // tpsIncludingTTFT = 100000 / (100+200+300+400 + 4000) = 100000/5000 = 20。
+        #expect(approx(summary.tpsIncludingTTFT, 20))
+        // requestTpsIncludingTTFT = 100000 / (50+100+150+200 + 4000) = 100000/4500。
+        #expect(approx(summary.requestTpsIncludingTTFT, 100000.0 / 4500))
+    }
+
+    // MARK: - TPS 公共队列与 TTFT 独立样本
+
+    /// 缺 requestTTFT 的记录从三个 TPS 中一并排除，但仍计入尝试 TTFT 队列。
+    @Test
+    func missingRequestTTFTExcludedFromAllTpsButStillCountsAttemptTTFT() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let start = day(2026, 5, 10)
+        let store = UsageStore(url: url)
+
+        // 缺 requestTTFT：计入 ttft 样本，但三个 TPS 都不采纳。
+        store.record(record(timestamp: start, output: 100,
+                            performance: performance(ttft: 100, requestTTFT: nil, generation: 1000)))
+        // 完整记录：进入公共 TPS 队列。
+        store.record(record(timestamp: start.addingTimeInterval(1), output: 100,
+                            performance: performance(ttft: 100, requestTTFT: 200, generation: 1000)))
+        try await store.flush()
+
+        let summary = try await snapshot(store, from: start).summary
+        #expect(summary.successfulStreamingAttempts == 2)
+        #expect(summary.ttftSamples == 2)
+        #expect(summary.requestTTFTSamples == 1)
+        #expect(summary.tpsSamples == 1)          // 公共队列只有 1 条
+        #expect(approx(summary.ttftMeanMS, 100))  // TTFT 均值独立于 TPS 队列
+        #expect(approx(summary.requestTTFTMeanMS, 200))
+        // 只有完整记录参与，分母都是它自己的时长。
+        #expect(approx(summary.tpsIncludingTTFT, 100000.0 / 1100))
+        #expect(approx(summary.requestTpsIncludingTTFT, 100000.0 / 1200))
+        #expect(approx(summary.tpsExcludingTTFT, 100))
     }
 
     // MARK: - 资格与排除
@@ -118,35 +199,41 @@ struct PerformanceStoreTests {
         let start = day(2026, 5, 10)
         let store = UsageStore(url: url)
 
-        // 合格：成功 + 2xx + 流式 + 有效 ttft。
-        store.record(record(timestamp: start, performance: performance(ttft: 100)))
+        // 合格：成功 + 2xx + 流式 + 有效 ttft 与 requestTTFT。
+        store.record(record(timestamp: start,
+                            performance: performance(ttft: 100, requestTTFT: 150)))
         // 失败：outcome=failure。
         store.record(record(timestamp: start.addingTimeInterval(1), outcome: "failure",
-                            performance: performance(ttft: 110)))
+                            performance: performance(ttft: 110, requestTTFT: 160)))
         // 取消。
         store.record(record(timestamp: start.addingTimeInterval(2), outcome: "cancelled",
-                            performance: performance(ttft: 120)))
+                            performance: performance(ttft: 120, requestTTFT: 170)))
         // 非 2xx（即便 outcome=success）。
         store.record(record(timestamp: start.addingTimeInterval(3), status: 500,
-                            performance: performance(ttft: 130)))
+                            performance: performance(ttft: 130, requestTTFT: 180)))
         // 非流式。
         store.record(record(timestamp: start.addingTimeInterval(4),
-                            performance: performance(streaming: false, ttft: 140)))
-        // 成功流式但缺 ttft → 计入资格分母，但不产生 ttft/tps 样本。
-        store.record(record(timestamp: start.addingTimeInterval(5), performance: performance(ttft: nil)))
+                            performance: performance(streaming: false, ttft: 140, requestTTFT: 190)))
+        // 成功流式但缺 ttft → 计入资格分母与 requestTTFT 样本，但不产生 ttft/TPS 样本。
+        store.record(record(timestamp: start.addingTimeInterval(5),
+                            performance: performance(ttft: nil, requestTTFT: 250)))
         // 旧记录：无性能数据。
         store.record(record(timestamp: start.addingTimeInterval(6), performance: nil))
         try await store.flush()
 
-        let snapshot = try await snapshot(store, from: start)
-        #expect(snapshot.summary.attempts == 7)
-        #expect(snapshot.summary.successfulStreamingAttempts == 2)
-        #expect(snapshot.summary.ttftSamples == 1)
-        #expect(snapshot.summary.ttftP50MS == 100)
-        #expect(snapshot.summary.ttftP95MS == 100)
-        // 无任何 request TTFT 采样；不应被 ttftSamples 虚报。
-        #expect(snapshot.summary.requestTTFTSamples == 0)
-        #expect(snapshot.summary.tpsSamples == 1)
+        let summary = try await snapshot(store, from: start).summary
+        #expect(summary.attempts == 7)
+        #expect(summary.successfulStreamingAttempts == 2)
+        #expect(summary.ttftSamples == 1)
+        #expect(approx(summary.ttftMeanMS, 100))
+        // 两条成功流式都带 requestTTFT（含缺 ttft 的那条）：独立计数。
+        #expect(summary.requestTTFTSamples == 2)
+        #expect(approx(summary.requestTTFTMeanMS, 200))
+        // 仅合格记录进入公共 TPS 队列。
+        #expect(summary.tpsSamples == 1)
+        #expect(approx(summary.tpsIncludingTTFT, 20000.0 / 1100))
+        #expect(approx(summary.requestTpsIncludingTTFT, 20000.0 / 1150))
+        #expect(approx(summary.tpsExcludingTTFT, 20))
     }
 
     @Test
@@ -157,16 +244,20 @@ struct PerformanceStoreTests {
         let store = UsageStore(url: url)
         // 缺 usage（无 output token）仍可出 TTFT；无 generation 故无 TPS。
         store.record(record(timestamp: start, input: nil, output: nil,
-                            performance: performance(ttft: 250, generation: nil, deltaCount: 0)))
+                            performance: performance(ttft: 250, requestTTFT: 300,
+                                                     generation: nil, deltaCount: 0)))
         try await store.flush()
 
-        let snapshot = try await snapshot(store, from: start)
-        #expect(snapshot.summary.successfulStreamingAttempts == 1)
-        #expect(snapshot.summary.ttftSamples == 1)
-        #expect(snapshot.summary.ttftP50MS == 250)
-        #expect(snapshot.summary.requestTTFTSamples == 0)
-        #expect(snapshot.summary.tpsSamples == 0)
-        #expect(snapshot.summary.tpsP50 == nil)
+        let summary = try await snapshot(store, from: start).summary
+        #expect(summary.successfulStreamingAttempts == 1)
+        #expect(summary.ttftSamples == 1)
+        #expect(approx(summary.ttftMeanMS, 250))
+        #expect(summary.requestTTFTSamples == 1)
+        #expect(approx(summary.requestTTFTMeanMS, 300))
+        #expect(summary.tpsSamples == 0)
+        #expect(summary.tpsIncludingTTFT == nil)
+        #expect(summary.requestTpsIncludingTTFT == nil)
+        #expect(summary.tpsExcludingTTFT == nil)
     }
 
     @Test
@@ -176,46 +267,51 @@ struct PerformanceStoreTests {
         let start = day(2026, 5, 10)
         let store = UsageStore(url: url)
         // outputTokens < 2。
-        store.record(record(timestamp: start, output: 1, performance: performance()))
+        store.record(record(timestamp: start, output: 1,
+                            performance: performance(ttft: 100, requestTTFT: 150)))
         // deltaCount < 2。
         store.record(record(timestamp: start.addingTimeInterval(1), output: 100,
-                            performance: performance(deltaCount: 1)))
+                            performance: performance(ttft: 100, requestTTFT: 150, deltaCount: 1)))
         // generation 非正。
         store.record(record(timestamp: start.addingTimeInterval(2), output: 100,
-                            performance: performance(generation: 0)))
+                            performance: performance(ttft: 100, requestTTFT: 150, generation: 0)))
         // output 未知。
         store.record(record(timestamp: start.addingTimeInterval(3), output: nil,
-                            performance: performance()))
+                            performance: performance(ttft: 100, requestTTFT: 150)))
         try await store.flush()
 
-        let snapshot = try await snapshot(store, from: start)
-        #expect(snapshot.summary.attempts == 4)
-        #expect(snapshot.summary.successfulStreamingAttempts == 4)
-        #expect(snapshot.summary.ttftSamples == 4)
-        #expect(snapshot.summary.tpsSamples == 0)
-        #expect(snapshot.summary.tpsP50 == nil)
+        let summary = try await snapshot(store, from: start).summary
+        #expect(summary.attempts == 4)
+        #expect(summary.successfulStreamingAttempts == 4)
+        #expect(summary.ttftSamples == 4)
+        #expect(summary.tpsSamples == 0)
+        #expect(summary.tpsIncludingTTFT == nil)
+        #expect(summary.requestTpsIncludingTTFT == nil)
+        #expect(summary.tpsExcludingTTFT == nil)
     }
 
+    /// 无效时长（负数 / NaN / 无穷）在读写两侧都被归一为缺失：不进入任何样本，也不污染均值。
     @Test
     func invalidDurationsAreSanitizedAndDropped() async throws {
         let url = try makeDatabaseURL()
         defer { cleanup(url) }
         let start = day(2026, 5, 10)
         let store = UsageStore(url: url)
-        // 负数 / NaN / 无穷全部无效 → 不进入任何分位数样本；负 deltaCount 归 0。
         store.record(record(timestamp: start, performance: performance(ttft: -5,
                                                                        requestTTFT: .infinity,
                                                                        generation: .nan,
                                                                        deltaCount: -3)))
         try await store.flush()
 
-        let snapshot = try await snapshot(store, from: start)
-        #expect(snapshot.summary.attempts == 1)
-        #expect(snapshot.summary.successfulStreamingAttempts == 1)
-        #expect(snapshot.summary.ttftSamples == 0)
-        #expect(snapshot.summary.ttftP50MS == nil)
-        #expect(snapshot.summary.requestTTFTP50MS == nil)
-        #expect(snapshot.summary.tpsSamples == 0)
+        let summary = try await snapshot(store, from: start).summary
+        #expect(summary.attempts == 1)
+        #expect(summary.successfulStreamingAttempts == 1)
+        #expect(summary.ttftSamples == 0)
+        #expect(summary.ttftMeanMS == nil)
+        #expect(summary.requestTTFTSamples == 0)
+        #expect(summary.requestTTFTMeanMS == nil)
+        #expect(summary.tpsSamples == 0)
+        #expect(summary.tpsExcludingTTFT == nil)
     }
 
     // MARK: - 分组身份
@@ -258,31 +354,39 @@ struct PerformanceStoreTests {
     }
 
     @Test
-    func routeGroupUsesLatestNameAndAggregatesPerGroup() async throws {
+    func routeGroupUsesLatestNameAndAggregatesWeightedPerGroup() async throws {
         let url = try makeDatabaseURL()
         defer { cleanup(url) }
         let start = day(2026, 5, 10)
         let store = UsageStore(url: url)
-        store.record(record(timestamp: start, routeID: "r1", routeName: "Alpha",
-                            performance: performance(ttft: 100)))
+        store.record(record(timestamp: start, routeID: "r1", routeName: "Alpha", output: 100,
+                            performance: performance(ttft: 100, requestTTFT: 150, generation: 1000)))
         store.record(record(timestamp: start.addingTimeInterval(1), routeID: "r1", routeName: "Beta",
-                            performance: performance(ttft: 300)))
-        // 失败尝试：计入 attempts，不进入分位数。
+                            output: 300,
+                            performance: performance(ttft: 300, requestTTFT: 350, generation: 3000)))
+        // 失败尝试：计入 attempts，不进入任何样本。
         store.record(record(timestamp: start.addingTimeInterval(2), routeID: "r2", routeName: "Gamma",
-                            outcome: "failure", performance: performance(ttft: 50)))
+                            outcome: "failure", performance: performance(ttft: 50, requestTTFT: 80)))
         try await store.flush()
 
         let byRoute = try await snapshot(store, from: start, grouping: .route)
         #expect(byRoute.groups.count == 2)
         #expect(byRoute.groups.map(\.id) == ["r1", "r2"]) // attempts 降序
         #expect(byRoute.groups[0].title == "Beta")        // 最近一次的名字
-        #expect(byRoute.groups[0].summary.attempts == 2)
-        #expect(byRoute.groups[0].summary.successfulStreamingAttempts == 2)
-        #expect(byRoute.groups[0].summary.ttftSamples == 2)
-        #expect(byRoute.groups[0].summary.ttftP50MS == 100) // [100,300] 最近秩 p50 → 100
-        #expect(byRoute.groups[1].summary.attempts == 1)
-        #expect(byRoute.groups[1].summary.successfulStreamingAttempts == 0)
-        #expect(byRoute.groups[1].summary.ttftSamples == 0)
+        let r1 = byRoute.groups[0].summary
+        #expect(r1.attempts == 2)
+        #expect(r1.successfulStreamingAttempts == 2)
+        #expect(r1.ttftSamples == 2)
+        #expect(approx(r1.ttftMeanMS, 200))               // (100+300)/2，不是中位数 100
+        #expect(r1.tpsSamples == 2)
+        #expect(approx(r1.tpsExcludingTTFT, 400000.0 / 4000))   // Σ输出 400 / Σ生成 4000
+        #expect(approx(r1.tpsIncludingTTFT, 400000.0 / 4400))   // Σ(ttft+gen)=4400
+        #expect(approx(r1.requestTpsIncludingTTFT, 400000.0 / 4500))
+        let r2 = byRoute.groups[1].summary
+        #expect(r2.attempts == 1)
+        #expect(r2.successfulStreamingAttempts == 0)
+        #expect(r2.ttftSamples == 0)
+        #expect(r2.tpsExcludingTTFT == nil)
     }
 
     // MARK: - 区间与持久化
@@ -293,13 +397,16 @@ struct PerformanceStoreTests {
         defer { cleanup(url) }
         let start = day(2026, 5, 10)
         let store = UsageStore(url: url)
-        store.record(record(timestamp: start, performance: performance()))
+        store.record(record(timestamp: start, performance: performance(ttft: 100, requestTTFT: 150)))
         try await store.flush()
 
         let snapshot = try await store.performanceSnapshot(from: start, to: start, grouping: .route)
         #expect(snapshot.summary.attempts == 0)
-        #expect(snapshot.summary.ttftP50MS == nil)
-        #expect(snapshot.summary.tpsP50 == nil)
+        #expect(snapshot.summary.ttftMeanMS == nil)
+        #expect(snapshot.summary.requestTTFTMeanMS == nil)
+        #expect(snapshot.summary.tpsIncludingTTFT == nil)
+        #expect(snapshot.summary.requestTpsIncludingTTFT == nil)
+        #expect(snapshot.summary.tpsExcludingTTFT == nil)
         #expect(snapshot.groups.isEmpty)
     }
 
@@ -316,11 +423,13 @@ struct PerformanceStoreTests {
         try await first.flush()
 
         let reopened = UsageStore(url: url)
-        let snapshot = try await snapshot(reopened, from: start)
-        #expect(snapshot.summary.attempts == 1)
-        #expect(snapshot.summary.ttftP50MS == 123.5)
-        #expect(snapshot.summary.requestTTFTP50MS == 45.5)
-        #expect(snapshot.summary.tpsP50 == 15) // 30 * 1000 / 2000
+        let summary = try await snapshot(reopened, from: start).summary
+        #expect(summary.attempts == 1)
+        #expect(approx(summary.ttftMeanMS, 123.5))
+        #expect(approx(summary.requestTTFTMeanMS, 45.5))
+        #expect(approx(summary.tpsExcludingTTFT, 15))       // 30 * 1000 / 2000
+        #expect(approx(summary.tpsIncludingTTFT, 30000.0 / 2123.5))
+        #expect(approx(summary.requestTpsIncludingTTFT, 30000.0 / 2045.5))
     }
 
     @Test
@@ -339,8 +448,9 @@ struct PerformanceStoreTests {
         #expect(snapshot.summary.attempts == 3)
         #expect(snapshot.summary.successfulStreamingAttempts == 0)
         #expect(snapshot.summary.ttftSamples == 0)
-        #expect(snapshot.summary.ttftP50MS == nil)
+        #expect(snapshot.summary.ttftMeanMS == nil)
         #expect(snapshot.summary.tpsSamples == 0)
+        #expect(snapshot.summary.tpsExcludingTTFT == nil)
         #expect(snapshot.groups.count == 1)
         #expect(snapshot.groups[0].summary.attempts == 3)
     }

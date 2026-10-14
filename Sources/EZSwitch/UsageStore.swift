@@ -25,6 +25,8 @@ final class UsageStore: @unchecked Sendable {
 
     private let url: URL
     private let notificationCenter: NotificationCenter
+    /// 小时分桶使用的日历（含时区）；默认 `.current`。
+    private let calendar: Calendar
     private let queue = DispatchQueue(label: "com.ezswitch.usage-store", qos: .utility)
 
     // 以下成员仅在 `queue` 上访问（init/deinit 除外）。
@@ -33,9 +35,11 @@ final class UsageStore: @unchecked Sendable {
     private var lastOpenAttempt: Date?
     private var writeError: Error?
 
-    init(url: URL, notificationCenter: NotificationCenter = .default) {
+    init(url: URL, notificationCenter: NotificationCenter = .default,
+         calendar: Calendar = .current) {
         self.url = url
         self.notificationCenter = notificationCenter
+        self.calendar = calendar
     }
 
     deinit {
@@ -78,11 +82,13 @@ final class UsageStore: @unchecked Sendable {
     // MARK: - 查询
 
     /// 统计 `[from, to)` 内的用量，按本地日历天分桶（含 DST）。
-    func snapshot(from: Date, to: Date, grouping: UsageGrouping) async throws -> UsageSnapshot {
+    /// `includeHourly` 为 true 时额外按本地日历小时分桶（`hours`）；默认 false，不执行小时查询。
+    func snapshot(from: Date, to: Date, grouping: UsageGrouping,
+                  includeHourly: Bool = false) async throws -> UsageSnapshot {
         try await onQueue { [self] in
             let db = try requireDB(force: true)
             try throwPendingWriteError()
-            return try snapshot(db, from: from, to: to, grouping: grouping)
+            return try snapshot(db, from: from, to: to, grouping: grouping, includeHourly: includeHourly)
         }
     }
 
@@ -346,7 +352,7 @@ final class UsageStore: @unchecked Sendable {
     // MARK: - 查询实现
 
     private func snapshot(_ db: OpaquePointer, from: Date, to: Date,
-                          grouping: UsageGrouping) throws -> UsageSnapshot {
+                          grouping: UsageGrouping, includeHourly: Bool = false) throws -> UsageSnapshot {
         var snapshot = UsageSnapshot()
         guard from < to else { return snapshot }
         let lo = from.timeIntervalSince1970
@@ -354,6 +360,9 @@ final class UsageStore: @unchecked Sendable {
         snapshot.totals = try totals(db, lo: lo, hi: hi)
         snapshot.days = try days(db, lo: lo, hi: hi)
         snapshot.groups = try groups(db, lo: lo, hi: hi, grouping: grouping)
+        if includeHourly {
+            snapshot.hours = try hours(db, lo: lo, hi: hi)
+        }
         return snapshot
     }
 
@@ -407,6 +416,52 @@ final class UsageStore: @unchecked Sendable {
                                    output: Int(sqlite3_column_int64(statement, 2))))
         }
         return result
+    }
+
+    /// 按本地日历小时分桶（半开区间 `[from, to)`）。
+    /// 逐行用 `calendar.dateInterval(of: .hour, for:)` 求桶起点，正确处理 DST 重复/缺失小时
+    /// 与半小时偏移时区（不按 epoch/3600 或本地时间字符串分组）；NULL token 计为 0、
+    /// 某小时无记录不补桶，求和沿用饱和约定。
+    private func hours(_ db: OpaquePointer, lo: Double, hi: Double) throws -> [UsageDay] {
+        let sql = """
+        SELECT ts, input_tokens, output_tokens
+        FROM usage_records
+        WHERE ts >= ? AND ts < ?
+        ORDER BY ts ASC;
+        """
+        let statement = try prepare(db, sql)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, lo)
+        sqlite3_bind_double(statement, 2, hi)
+
+        var buckets: [Date: (input: Int, output: Int)] = [:]
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else {
+                throw UsageStoreError.sqlite(message: lastErrorMessage(db), code: sqlite3_errcode(db))
+            }
+            let timestamp = Date(timeIntervalSince1970: sqlite3_column_double(statement, 0))
+            // DST 回退时同一墙钟小时的两个真实起点不同，自然分成两个桶。
+            guard let start = calendar.dateInterval(of: .hour, for: timestamp)?.start else { continue }
+            let input = sqlite3_column_type(statement, 1) == SQLITE_NULL
+                ? 0 : Int(sqlite3_column_int64(statement, 1))
+            let output = sqlite3_column_type(statement, 2) == SQLITE_NULL
+                ? 0 : Int(sqlite3_column_int64(statement, 2))
+            let existing = buckets[start] ?? (0, 0)
+            buckets[start] = (Self.saturatingAdd(existing.input, input),
+                              Self.saturatingAdd(existing.output, output))
+        }
+        return buckets.keys.sorted().map {
+            let bucket = buckets[$0] ?? (0, 0)
+            return UsageDay(date: $0, input: bucket.input, output: bucket.output)
+        }
+    }
+
+    /// 饱和求和：与 `UsageTotals.total` 同一约定，溢出钳到 `Int.max`。
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : sum
     }
 
     private func groups(_ db: OpaquePointer, lo: Double, hi: Double,
@@ -501,11 +556,18 @@ final class UsageStore: @unchecked Sendable {
     /// - `attempts` 统计全部记录（含失败 / 取消 / 非流式）。
     /// - `successfulStreamingAttempts` = `outcome=success` 且 HTTP 2xx 且流式的尝试数，
     ///   是 TTFT 的资格分母（无论是否带 usage）。
-    /// - TTFT 样本：成功流式且有合法 ttft；缺 usage 不影响 TTFT。
-    /// - TPS 样本：成功流式且 `UsagePerformance.tps(outputTokens:)` 非空
-    ///   （内含有效 ttft、outputTokens≥2、deltaCount≥2、generation>0 的要求）。
-    /// - 失败 / 取消保留在 `attempts` 中，但不进入任何分位数样本。
-    /// - 分位数用实际样本的最近秩（见 `nearestRankPercentile`），全量参与，不截尾。
+    /// - TTFT 均值样本：成功流式且有合法 attempt TTFT（`ttftMeanMS`）/ 合法 request TTFT
+    ///   （`requestTTFTMeanMS`）；两者独立计数，缺 usage 不影响 TTFT。
+    /// - TPS 有效队列（三个加权速率共用，保证可比）：成功流式 + 有限非负 attempt TTFT +
+    ///   有限非负 request TTFT + 有限正 generation + outputTokens≥2 + deltaCount≥2。
+    ///   三个速率均为 Σ输出 / Σ时长，绝不取逐请求速率的算术平均：
+    ///   `tpsIncludingTTFT` = Σ输出×1000 / Σ(ttft+generation)，
+    ///   `requestTpsIncludingTTFT` = Σ输出×1000 / Σ(requestttft+generation)，
+    ///   `tpsExcludingTTFT` = Σ输出×1000 / Σgeneration。
+    ///   缺 request TTFT 的记录从三者中一并排除，避免不同分母混用。
+    /// - output 求和用 Double 累加避免 Int 溢出；任一求和非有限（上溢）时相应速率为 `nil`。
+    /// - 失败 / 取消保留在 `attempts` 中，但不进入任何样本。
+    /// - 队列为空或总时长为 0 时速率为 `nil`，不伪造 0。
     private func performanceSnapshot(_ db: OpaquePointer, from: Date, to: Date,
                                      grouping: UsageGrouping) throws -> PerformanceSnapshot {
         var snapshot = PerformanceSnapshot()
@@ -588,15 +650,24 @@ final class UsageStore: @unchecked Sendable {
         return snapshot
     }
 
-    /// 单组/总览的性能累加器（引用类型：字典内原地追加样本，避免逐行复制样本数组）。
+    /// 单组/总览的性能累加器（引用类型：字典内原地累加，避免逐行复制样本数组）。
+    /// 求和量一律用 `Double`，既避免 Int 溢出，也让加权速率的分母/分子全程保持浮点。
     private final class PerformanceAggregator {
         var title: String
         var subtitle: String
         private var attempts = 0
         private var successfulStreamingAttempts = 0
-        private var ttft: [Double] = []
-        private var requestTTFT: [Double] = []
-        private var tps: [Double] = []
+        // TTFT 均值样本（独立队列）。
+        private var ttftSum = 0.0
+        private var ttftCount = 0
+        private var requestTTFTSum = 0.0
+        private var requestTTFTCount = 0
+        // TPS 有效队列（三个加权速率共用）。
+        private var tpsCount = 0
+        private var tpsOutputSum = 0.0
+        private var tpsTTFTSum = 0.0
+        private var tpsRequestTTFTSum = 0.0
+        private var tpsGenerationSum = 0.0
 
         init(title: String = "", subtitle: String = "") {
             self.title = title
@@ -609,27 +680,66 @@ final class UsageStore: @unchecked Sendable {
                   outcome.lowercased() == "success",
                   let status, (200...299).contains(status) else { return }
             successfulStreamingAttempts += 1
-            if let ttftMS = performance.ttftMS { ttft.append(ttftMS) }
-            if let requestTTFTMS = performance.requestTTFTMS { requestTTFT.append(requestTTFTMS) }
-            // TPS 需合法生成时长与足量输出样本；有效 TTFT 由 `tps` 内部把关。缺 usage 的记录不产生 TPS 样本。
-            if let value = performance.tps(outputTokens: outputTokens) {
-                tps.append(value)
+            // 读取时已做非有限/负数归一，这里仍显式校验，保证样本口径自洽。
+            let ttft = Self.validDuration(performance.ttftMS)
+            let requestTTFT = Self.validDuration(performance.requestTTFTMS)
+            if let ttft {
+                ttftSum += ttft
+                ttftCount += 1
             }
+            if let requestTTFT {
+                requestTTFTSum += requestTTFT
+                requestTTFTCount += 1
+            }
+            // TPS 有效队列：三个加权速率共用同一分母口径（含 request TTFT），缺一即整体排除。
+            guard let ttft, let requestTTFT,
+                  let generation = performance.generationMS, generation.isFinite, generation > 0,
+                  let outputTokens, outputTokens >= 2,
+                  performance.outputDeltaCount >= 2 else { return }
+            tpsCount += 1
+            tpsOutputSum += Double(outputTokens)
+            tpsTTFTSum += ttft
+            tpsRequestTTFTSum += requestTTFT
+            tpsGenerationSum += generation
         }
 
         func summary() -> PerformanceSummary {
             var summary = PerformanceSummary()
             summary.attempts = attempts
             summary.successfulStreamingAttempts = successfulStreamingAttempts
-            summary.ttftSamples = ttft.count
-            summary.requestTTFTSamples = requestTTFT.count
-            summary.tpsSamples = tps.count
-            summary.ttftP50MS = nearestRankPercentile(ttft, 0.5)
-            summary.ttftP95MS = nearestRankPercentile(ttft, 0.95)
-            summary.requestTTFTP50MS = nearestRankPercentile(requestTTFT, 0.5)
-            summary.requestTTFTP95MS = nearestRankPercentile(requestTTFT, 0.95)
-            summary.tpsP50 = nearestRankPercentile(tps, 0.5)
+            summary.ttftSamples = ttftCount
+            summary.requestTTFTSamples = requestTTFTCount
+            summary.tpsSamples = tpsCount
+            summary.ttftMeanMS = Self.mean(sum: ttftSum, count: ttftCount)
+            summary.requestTTFTMeanMS = Self.mean(sum: requestTTFTSum, count: requestTTFTCount)
+            summary.tpsIncludingTTFT = Self.rate(outputSum: tpsOutputSum,
+                                                 timeSumMS: tpsTTFTSum + tpsGenerationSum, count: tpsCount)
+            summary.requestTpsIncludingTTFT = Self.rate(outputSum: tpsOutputSum,
+                                                        timeSumMS: tpsRequestTTFTSum + tpsGenerationSum,
+                                                        count: tpsCount)
+            summary.tpsExcludingTTFT = Self.rate(outputSum: tpsOutputSum,
+                                                 timeSumMS: tpsGenerationSum, count: tpsCount)
             return summary
+        }
+
+        /// 有限非负时长视为有效样本；否则视为缺失。
+        private static func validDuration(_ value: Double?) -> Double? {
+            guard let value, value.isFinite, value >= 0 else { return nil }
+            return value
+        }
+
+        /// 算术平均：空样本或非有限求和返回 `nil`（不伪造 0）。
+        private static func mean(sum: Double, count: Int) -> Double? {
+            guard count > 0, sum.isFinite else { return nil }
+            let value = sum / Double(count)
+            return value.isFinite ? value : nil
+        }
+
+        /// 加权速率 = Σ输出×1000 / Σ时长(ms)：空队列、零/非有限时长或非有限求和返回 `nil`。
+        private static func rate(outputSum: Double, timeSumMS: Double, count: Int) -> Double? {
+            guard count > 0, outputSum.isFinite, timeSumMS.isFinite, timeSumMS > 0 else { return nil }
+            let value = outputSum * 1000 / timeSumMS
+            return value.isFinite ? value : nil
         }
     }
 

@@ -143,24 +143,31 @@ struct UsageFormatTests {
         return try #require(parsed.performance)
     }
 
-    @Test func routeGroupingReportsRequestTTFTWithFallback() throws {
+    /// The overview is always request scope, while the group list follows the grouping.
+    @Test func routeGroupingSummaryAndGroupsUseRequestScope() throws {
         let report = try performance(UsageFixture.performanceObject(grouping: "route"))
         let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
-        #expect(text.hasPrefix("Performance (route)\nTTFT basis: request (includes fallback)\n"))
-        // Request-level values (1500/2400 ms) are shown, not the attempt-level 1200/2100 ms.
-        #expect(text.contains("TTFT P50: 1.50 s  TTFT P95: 2.40 s"))
-        #expect(!text.contains("TTFT P50: 1.20 s"))
-        #expect(text.contains("Successful streaming: 5/10 attempts"))
-        #expect(text.contains("TTFT samples: 4  TPS samples: 3"))
-        #expect(text.contains("TPS P50: 42.3 tok/s"))
+        #expect(text.hasPrefix("Performance (route)\nOverall basis: request scope (includes fallback)\n"))
+        #expect(text.contains("  Average TTFT: 1.50 s"))
+        #expect(text.contains("  Average TPS (incl TTFT): 38.0 tok/s"))
+        #expect(text.contains("  Average TPS (excl TTFT): 55.1 tok/s"))
+        #expect(text.contains("Groups — basis: request (includes fallback)"))
+        #expect(text.contains("    Average TTFT 1.50 s  Average TPS (incl TTFT) 38.0 tok/s  "
+            + "Average TPS (excl TTFT) 55.1 tok/s"))
+        // The upstream attempt value (1200 ms) is not the request-scope number shown here.
+        #expect(!text.contains("1.20 s"))
     }
 
-    @Test func nonRouteGroupingReportsUpstreamAttemptTTFT() throws {
+    /// Even under model grouping the summary stays request scope; the group rows switch
+    /// to the upstream attempt basis (and its explainable column values).
+    @Test func modelGroupingSummaryIsRequestScopeButGroupsUseAttempt() throws {
         let report = try performance(UsageFixture.performanceObject(grouping: "model"))
         let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
-        #expect(text.hasPrefix("Performance (model)\nTTFT basis: upstream attempt\n"))
-        #expect(text.contains("TTFT P50: 1.20 s  TTFT P95: 2.10 s"))
-        #expect(!text.contains("TTFT P50: 1.50 s"))
+        #expect(text.hasPrefix("Performance (model)\nOverall basis: request scope (includes fallback)\n"))
+        #expect(text.contains("  Average TTFT: 1.50 s"))
+        #expect(text.contains("Groups — basis: upstream attempt"))
+        #expect(text.contains("    Average TTFT 1.20 s  Average TPS (incl TTFT) 42.3 tok/s  "
+            + "Average TPS (excl TTFT) 55.1 tok/s"))
     }
 
     @Test func durationAndRateHelpersUseExplicitUnits() {
@@ -180,46 +187,49 @@ struct UsageFormatTests {
     @Test func noSamplesShowDashesAndANote() throws {
         let summary = UsageFixture.performanceSummary(attempts: 0, successfulStreamingAttempts: 0,
                                                       ttftSamples: 0, requestTTFTSamples: 0, tpsSamples: 0,
-                                                      ttftP50MS: nil, ttftP95MS: nil,
-                                                      requestTTFTP50MS: nil, requestTTFTP95MS: nil,
-                                                      tpsP50: nil)
+                                                      ttftMeanMS: nil, requestTTFTMeanMS: nil,
+                                                      tpsIncludingTTFT: nil, requestTpsIncludingTTFT: nil,
+                                                      tpsExcludingTTFT: nil)
         let report = try performance(UsageFixture.performanceObject(groupCount: 0, summary: summary, groups: []))
         let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
         #expect(text.contains("No performance data recorded."))
-        #expect(text.contains("TTFT P50: —  TTFT P95: —"))
-        #expect(text.contains("TPS P50: —"))
+        #expect(text.contains("  Average TTFT: —"))
+        #expect(text.contains("  Average TPS (incl TTFT): —"))
+        #expect(text.contains("  Average TPS (excl TTFT): —"))
     }
 
-    @Test func routeGroupingUsesRequestTTFSampleCount() throws {
+    /// The summary always reports request-level samples; the group rows use the
+    /// grouping-appropriate sample count.
+    @Test func summaryUsesRequestSamplesAndGroupsUseGroupingSamples() throws {
         let summary = UsageFixture.performanceSummary(ttftSamples: 9, requestTTFTSamples: 4, tpsSamples: 3)
-        let report = try performance(UsageFixture.performanceObject(grouping: "route", summary: summary))
-        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
-        // Route grouping shows requestTTFTSamples (4), not ttftSamples (9).
-        #expect(text.contains("TTFT samples: 4  TPS samples: 3"))
-        #expect(!text.contains("TTFT samples: 9"))
-    }
 
-    @Test func routeGroupingWithoutRequestTTFTWarnsAndDoesNotSubstituteUpstream() throws {
-        let summary = UsageFixture.performanceSummary(ttftSamples: 5, requestTTFTSamples: nil,
-                                                      requestTTFTP50MS: nil, requestTTFTP95MS: nil)
-        let route = try performance(UsageFixture.performanceObject(grouping: "route", summary: summary))
-        let routeText = UsageTextFormatter.renderPerformance(route, options: UsageOptions())
-        #expect(routeText.contains("TTFT samples: 0  TPS samples: 3"))
-        #expect(routeText.contains("Warning: no request-level TTFT samples"))
-        #expect(routeText.contains("TTFT P50: —"))
-
-        // The same summary under model grouping uses the upstream attempt count.
         let model = try performance(UsageFixture.performanceObject(grouping: "model", summary: summary))
         let modelText = UsageTextFormatter.renderPerformance(model, options: UsageOptions())
-        #expect(modelText.contains("TTFT samples: 5"))
-        #expect(!modelText.contains("Warning:"))
-        #expect(modelText.contains("TTFT P50: 1.20 s"))
+        #expect(modelText.contains("  TTFT samples: 4  TPS samples: 3"))
+        #expect(modelText.contains("    TTFT samples 9  TPS samples 3"))
+
+        let route = try performance(UsageFixture.performanceObject(grouping: "route", summary: summary))
+        let routeText = UsageTextFormatter.renderPerformance(route, options: UsageOptions())
+        #expect(routeText.contains("  TTFT samples: 4  TPS samples: 3"))
+        #expect(routeText.contains("    TTFT samples 4  TPS samples 3"))
+    }
+
+    /// A missing requestTTFTSamples reads as 0 samples (never the upstream count) and
+    /// shows dashes without substituting the attempt value anywhere.
+    @Test func missingRequestTTFTSamplesReadsAsZeroNotUpstream() throws {
+        let summary = UsageFixture.performanceSummary(ttftSamples: 5, requestTTFTSamples: nil,
+                                                      requestTTFTMeanMS: nil)
+        let report = try performance(UsageFixture.performanceObject(grouping: "route", summary: summary))
+        let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
+        #expect(text.contains("  TTFT samples: 0  TPS samples: 3"))
+        #expect(text.contains("  Average TTFT: —"))
+        #expect(!text.contains("Warning:"))
     }
 
     @Test func truncatedPerformanceGroupsAreAnnounced() throws {
         let report = try performance(UsageFixture.performanceObject(groupCount: 5, truncated: true))
         let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
-        #expect(text.contains("Groups — showing 1 of 5 groups; raise --limit to see more"))
+        #expect(text.contains("Groups — basis: upstream attempt — showing 1 of 5 groups; raise --limit to see more"))
     }
 
     @Test func performanceGroupTitlesAreSanitized() throws {
@@ -242,7 +252,9 @@ struct UsageFormatTests {
         #expect(object["usage"] != nil)
         let perf = try #require(object["performance"] as? [String: Any])
         #expect(perf["grouping"] as? String == "model")
-        #expect((perf["summary"] as? [String: Any])?["attempts"] as? Int == 10)
+        let summary = try #require(perf["summary"] as? [String: Any])
+        #expect(summary["attempts"] as? Int == 10)
+        #expect(summary["ttftMeanMS"] as? Double == 1200)
         #expect(Set(object.keys) == ["usage", "performance"])
     }
 }

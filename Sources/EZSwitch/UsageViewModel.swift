@@ -4,19 +4,25 @@ import UniformTypeIdentifiers
 
 // MARK: - 区间与格式化
 
-/// 用量页的时间区间预设。`custom` 的两个日期都用原生 DatePicker 选择。
+/// 用量页的时间区间预设。页面选择器只用 `pagePresets`
+/// （今天 / 近7天 / 近30天 / 自定义）；`thisMonth` 保留给 CLI 的 `period=month`，不进入页面选择器。
 enum UsageRangePreset: String, CaseIterable, Identifiable {
     case today
     case last7Days
+    case last30Days
     case thisMonth
     case custom
 
     var id: String { rawValue }
 
+    /// 页面选择器展示的预设与顺序。
+    static let pagePresets: [UsageRangePreset] = [.today, .last7Days, .last30Days, .custom]
+
     var title: String {
         switch self {
-        case .today: return "今日"
-        case .last7Days: return "近 7 天"
+        case .today: return "今天"
+        case .last7Days: return "近7天"
+        case .last30Days: return "近30天"
         case .thisMonth: return "本月"
         case .custom: return "自定义"
         }
@@ -35,9 +41,20 @@ struct UsageDateRange: Equatable {
 }
 
 enum UsageRangeResolver {
+    /// 自定义「近 N 天」上限：由日历可表示范围推导，仅防日期加法溢出，非产品级限制。
+    static func maxLastNDays(now: Date = Date(), calendar: Calendar = .current) -> Int {
+        let today = calendar.startOfDay(for: now)
+        let earliest = calendar.startOfDay(for: Date.distantPast)
+        guard let days = calendar.dateComponents([.day], from: earliest, to: today).day else { return 1 }
+        return max(1, days + 1)
+    }
+
+    /// 解析区间；`customLastNDays` 非空表示「近 N 天（含今天）」，
+    /// 为 nil 时保留既有 `customStart`/`customEnd`（含倒置）语义，供 CLI 的 from/to 调用方使用。
     static func resolve(preset: UsageRangePreset,
-                        customStart: Date,
-                        customEnd: Date,
+                        customStart: Date = Date(),
+                        customEnd: Date = Date(),
+                        customLastNDays: Int? = nil,
                         now: Date = Date(),
                         calendar: Calendar = .current) -> UsageDateRange {
         let today = calendar.startOfDay(for: now)
@@ -48,12 +65,17 @@ enum UsageRangeResolver {
         case .today:
             return UsageDateRange(from: today, to: tomorrow)
         case .last7Days:
-            let start = calendar.date(byAdding: .day, value: -6, to: today) ?? today
-            return UsageDateRange(from: start, to: tomorrow)
+            return daysBackRange(7, today: today, tomorrow: tomorrow, calendar: calendar)
+        case .last30Days:
+            return daysBackRange(30, today: today, tomorrow: tomorrow, calendar: calendar)
         case .thisMonth:
             let start = calendar.date(from: calendar.dateComponents([.year, .month], from: now)) ?? today
             return UsageDateRange(from: start, to: tomorrow)
         case .custom:
+            if let requested = customLastNDays {
+                let days = min(max(requested, 1), maxLastNDays(now: now, calendar: calendar))
+                return daysBackRange(days, today: today, tomorrow: tomorrow, calendar: calendar)
+            }
             // 允许用户把两个日期选反；取较小值作为起点，较大值作为结束日。
             let a = calendar.startOfDay(for: customStart)
             let b = calendar.startOfDay(for: customEnd)
@@ -62,6 +84,41 @@ enum UsageRangeResolver {
             let end = calendar.date(byAdding: .day, value: 1, to: last)
                 ?? last.addingTimeInterval(24 * 60 * 60)
             return UsageDateRange(from: start, to: end)
+        }
+    }
+
+    /// `[today - (days - 1), tomorrow)`：含今天共 `days` 个自然日，日历加法保证 DST 自然边界。
+    private static func daysBackRange(_ days: Int,
+                                      today: Date,
+                                      tomorrow: Date,
+                                      calendar: Calendar) -> UsageDateRange {
+        let count = max(1, days)
+        let start = calendar.date(byAdding: .day, value: -(count - 1), to: today) ?? today
+        return UsageDateRange(from: start, to: tomorrow)
+    }
+}
+
+/// 图表 X 轴刻度：只在 `[from, to)` 内取，绝不含排他上界 `to`（避免把次日零点标成今天最后一格）。
+enum UsageAxisTicks {
+    /// 按天取刻度，锚点落每天正午（避开午夜与 DST 歧义），最多约 `maxTicks` 个。
+    static func days(from: Date, to: Date, maxTicks: Int = 7, calendar: Calendar = .current) -> [Date] {
+        let total = calendar.dateComponents([.day], from: from, to: to).day ?? 1
+        let count = max(1, total)
+        let step = max(1, Int(ceil(Double(count) / Double(max(1, maxTicks)))))
+        return stride(from: 0, to: count, by: step).compactMap { offset in
+            guard let day = calendar.date(byAdding: .day, value: offset, to: from) else { return nil }
+            guard let noon = calendar.date(bySettingHour: 12, minute: 0, second: 0, of: day) else { return nil }
+            return noon < to ? noon : nil
+        }
+    }
+
+    /// 按小时取刻度，偏移量按日历实际小时数计算（23/25 小时日自适应），并用 `to` 过滤。
+    static func hours(from: Date, to: Date, stepHours: Int = 3, calendar: Calendar = .current) -> [Date] {
+        let totalHours = calendar.dateComponents([.hour], from: from, to: to).hour ?? 24
+        let step = max(1, stepHours)
+        return stride(from: 0, to: max(1, totalHours), by: step).compactMap { offset in
+            guard let date = calendar.date(byAdding: .hour, value: offset, to: from) else { return nil }
+            return date < to ? date : nil
         }
     }
 }
@@ -96,6 +153,13 @@ enum UsageFormat {
         return f
     }()
 
+    private static let axisHourFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.setLocalizedDateFormatFromTemplate("Hm")
+        return f
+    }()
+
     static func compact(_ value: Int) -> String {
         // 用 Double 取幅值，避免 Int.min 上 abs 溢出陷阱。
         let magnitude = abs(Double(value))
@@ -118,6 +182,7 @@ enum UsageFormat {
 
     static func day(_ date: Date) -> String { dayFormatter.string(from: date) }
     static func axisDay(_ date: Date) -> String { axisFormatter.string(from: date) }
+    static func axisHour(_ date: Date) -> String { axisHourFormatter.string(from: date) }
     static func fileDate(_ date: Date) -> String { isoFormatter.string(from: date) }
 }
 
@@ -141,22 +206,28 @@ enum UsageSection: String, CaseIterable, Identifiable {
     var title: String { self == .usage ? "用量" : "性能" }
 }
 
-/// 性能比较表的排序字段。路由维度用含 fallback 的 requestTTFT，其余维度用单次尝试 TTFT。
+/// 性能比较表的排序字段，与三张平均指标一一对应：
+/// 平均 TTFT、平均 TPS（含 TTFT）、平均 TPS（不含 TTFT）。
+/// 路由维度取含自动回退的 request 级指标，其余维度取单次上游尝试指标；
+/// 不含 TTFT 的 TPS 两个维度共用同一字段。
 enum PerformanceSortKey: String, CaseIterable, Identifiable {
-    case ttftP50
-    case ttftP95
-    case tpsP50
+    case ttftMean
+    case tpsIncludingTTFT
+    case tpsExcludingTTFT
 
     var id: String { rawValue }
 
+    /// 指标名称：三张卡与表头使用同一组名称；路由 / 尝试口径差异只放在 tooltip。
     func title(for grouping: UsageGrouping) -> String {
-        let prefix = grouping == .route ? "总等待" : "首输出"
         switch self {
-        case .ttftP50: return "\(prefix) P50"
-        case .ttftP95: return "\(prefix) P95"
-        case .tpsP50: return "TPS P50"
+        case .ttftMean: return "平均TTFT"
+        case .tpsIncludingTTFT: return "平均TPS(含TTFT)"
+        case .tpsExcludingTTFT: return "平均TPS(不含TTFT)"
         }
     }
+
+    /// 表格表头与卡片同名，保持口径名词唯一。
+    func columnTitle(for grouping: UsageGrouping) -> String { title(for: grouping) }
 }
 
 /// 排序取值与比较：nil（未测/未知）恒定排在最后，与升降序无关；同值时按标题稳定排序。
@@ -164,10 +235,14 @@ enum PerformanceSort {
     static func value(_ key: PerformanceSortKey,
                       row: PerformanceGroupRow,
                       grouping: UsageGrouping) -> Double? {
+        let summary = row.summary
         switch key {
-        case .ttftP50: return grouping == .route ? row.summary.requestTTFTP50MS : row.summary.ttftP50MS
-        case .ttftP95: return grouping == .route ? row.summary.requestTTFTP95MS : row.summary.ttftP95MS
-        case .tpsP50: return row.summary.tpsP50
+        case .ttftMean:
+            return grouping == .route ? summary.requestTTFTMeanMS : summary.ttftMeanMS
+        case .tpsIncludingTTFT:
+            return grouping == .route ? summary.requestTpsIncludingTTFT : summary.tpsIncludingTTFT
+        case .tpsExcludingTTFT:
+            return summary.tpsExcludingTTFT
         }
     }
 
@@ -219,14 +294,16 @@ enum PerformanceFormat {
 @MainActor
 final class UsageViewModel: ObservableObject {
     @Published var preset: UsageRangePreset = .today
-    @Published var customStart: Date = Calendar.current.date(byAdding: .day, value: -6, to: Date()) ?? Date()
-    @Published var customEnd: Date = Date()
+    /// 自定义「近 N 天（含今天）」有效值，恒 >= 1，驱动查询区间与 reloadKey。
+    @Published var customLastNDays: Int = 7
+    /// 数字输入缓冲；仅合法正整数提交到 `customLastNDays`，非法输入不改变区间。
+    @Published var customLastNDaysInput: String = "7"
     @Published var section: UsageSection = .usage
     @Published var grouping: UsageGrouping = .route
 
     /// 性能视图独立分组（默认按模型 = 供应商 + 模型），与用量表的分组互不影响。
     @Published var performanceGrouping: UsageGrouping = .model
-    @Published var performanceSortKey: PerformanceSortKey = .ttftP50
+    @Published var performanceSortKey: PerformanceSortKey = .ttftMean
     @Published var performanceSortAscending: Bool = true
 
     @Published private(set) var snapshot = UsageSnapshot()
@@ -253,13 +330,34 @@ final class UsageViewModel: ObservableObject {
         self.section = section
     }
 
-    /// `.task(id:)` 的键：区间、分组或当前视图变化时重启刷新循环，立即拉取新数据。
+    /// `.task(id:)` 键：区间/分组/视图变化即重启刷新；近 N 天只在自定义预设下计入。
     var reloadKey: String {
-        "\(section.rawValue)|\(preset.rawValue)|\(grouping.rawValue)|\(performanceGrouping.rawValue)|\(customStart.timeIntervalSince1970)|\(customEnd.timeIntervalSince1970)"
+        let custom = preset == .custom ? "\(customLastNDays)" : ""
+        return "\(section.rawValue)|\(preset.rawValue)|\(grouping.rawValue)|\(performanceGrouping.rawValue)|\(custom)"
     }
 
     var range: UsageDateRange {
-        UsageRangeResolver.resolve(preset: preset, customStart: customStart, customEnd: customEnd)
+        UsageRangeResolver.resolve(preset: preset, customLastNDays: customLastNDays)
+    }
+
+    /// 自定义天数上限（日历可表示范围，非产品限制）。
+    var maxCustomLastNDays: Int { UsageRangeResolver.maxLastNDays() }
+
+    /// 设置有效天数并同步输入缓冲：下限 1，上限由日历范围决定。
+    func setCustomLastNDays(_ value: Int) {
+        let clamped = min(max(value, 1), maxCustomLastNDays)
+        customLastNDays = clamped
+        customLastNDaysInput = String(clamped)
+    }
+
+    /// 提交输入（回车/失焦）：合法正整数生效；否则回退到当前有效值，不改变区间。
+    func commitCustomLastNDaysInput() {
+        let trimmed = customLastNDaysInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Int(trimmed), value >= 1 else {
+            customLastNDaysInput = String(customLastNDays)
+            return
+        }
+        setCustomLastNDays(value)
     }
 
     var isEmpty: Bool { snapshot.totals.attempts == 0 }
@@ -332,9 +430,12 @@ final class UsageViewModel: ObservableObject {
         let requestedKey = reloadKey
         if !hasLoadedSnapshot { phase = .loading }
         let current = range
+        // 仅用量页的「今天」需要小时级分桶作图；其余区间与性能页不查小时数据。
+        let includeHourly = section == .usage && preset == .today
 
         do {
-            let fresh = try await store.snapshot(from: current.from, to: current.to, grouping: grouping)
+            let fresh = try await store.snapshot(from: current.from, to: current.to,
+                                                 grouping: grouping, includeHourly: includeHourly)
             guard !Task.isCancelled, currentRequest == token, requestedKey == reloadKey else { return }
             snapshot = fresh
             lastError = nil

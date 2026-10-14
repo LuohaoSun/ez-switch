@@ -112,7 +112,8 @@ final class SettingsNav: ObservableObject {
 }
 
 struct SettingsView: View {
-    @ObservedObject var store: ConfigStore
+    // 子页面自行观察配置；外层只转发对象，避免每次排序都更新整个设置宿主。
+    let store: ConfigStore
     @ObservedObject var nav: SettingsNav
 
     var body: some View {

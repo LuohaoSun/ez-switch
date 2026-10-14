@@ -6,20 +6,20 @@
 
 - **请求数**：已经尝试调用上游的客户端模型请求数。一个请求发生自动切换时仍记一次。
 - **上游尝试**：每次调用候选模型单独记录。失败、取消及中断的尝试也保留；它们可能产生用量。
-- **输入与输出**：来自上游响应的 `usage`，不根据文本长度估算。缺失字段保留为空，不当作零；显式的零是有效用量。
-- **缓存命中与写入**：输入的细分。OpenAI 风格接口通常已经把缓存计入输入；Anthropic 的普通输入、缓存读取和缓存写入需要归一化为总输入。统计时不能把缓存再次加到总量上。
-- **推理 tokens**：输出的细分，仅在上游提供时记录，不重复计入总量。
+- **输入与输出**：来自上游响应的 `usage`／`usageMetadata`，不根据文本长度估算。缺失字段保留为空，不当作零；显式的零是有效用量。原生 Gemini 的输入是 `promptTokenCount` 与 `toolUsePromptTokenCount` 之和（`promptTokenCount` 已包含缓存内容），输出是 `candidatesTokenCount` 与 `thoughtsTokenCount` 之和，因此标准字段齐全时本页合计与上游 `totalTokenCount`（prompt + tool-use prompt + thoughts + candidates）一致。
+- **缓存命中与写入**：输入的细分。OpenAI 风格接口通常已经把缓存计入输入；Anthropic 的普通输入、缓存读取和缓存写入需要归一化为总输入；Gemini 的 `cachedContentTokenCount` 已包含在 `promptTokenCount` 内，同样不再加一次。统计时不能把缓存再次加到总量上。
+- **推理 tokens**：输出的细分，仅在上游提供时记录，不重复计入总量。Gemini 的 `thoughtsTokenCount` 是输出的一部分，同时作为推理子项单独记录。
 - **覆盖率**：输入、输出均已获得的上游尝试数占全部尝试的比例。显示的 token 合计是已获得的部分，存在未知用量时不代表全部实际消耗。
 
-流式事件中的累计用量取最新有效值，不逐条相加。Chat Completions、Responses、Messages 的流式和普通 JSON 响应分别适配。协议转换保留原始上游的用量，不能把转换器补出的零当作真实 usage。Chat 流式请求未指定 `stream_options.include_usage` 时会补为 `true`，显式值（包括 `false`）保留；供应商不支持该选项时仍按原有规则返回错误，不额外重试。DeepSeek 的 `prompt_cache_hit_tokens` 也可用于缓存命中统计。
+流式事件中的累计用量取最新有效值，不逐条相加。Gemini 的输入／输出分量（prompt、tool-use prompt、candidates、thoughts）各自独立保留上次有效值：后续累计快照省略已上报的可选分量时不会把它从合计里丢掉，只有显式 `0` 才重置，无效值不覆盖，从未上报的可选分量按 0 计入其所属合计。Chat Completions、Responses、Messages、原生 Gemini（`generateContent` 与 `streamGenerateContent`）的流式和普通 JSON 响应分别适配。Gemini 非 SSE 的 `streamGenerateContent` 会在完整的有界缓冲内按 JSON 数组解析，取最后一个累计快照；`:countTokens` 返回的 `totalTokens` 只是输入预估，不计入生成用量，也不进性能样本。协议转换保留原始上游的用量，不能把转换器补出的零当作真实 usage。Chat 流式请求未指定 `stream_options.include_usage` 时会补为 `true`，显式值（包括 `false`）保留；供应商不支持该选项时仍按原有规则返回错误，不额外重试。DeepSeek 的 `prompt_cache_hit_tokens` 也可用于缓存命中统计。Gemini 仅在能确定一侧、另一侧缺失时才用权威 `totalTokenCount` 推导缺失的一侧，绝不产生负数，也不覆盖已确定的字段；无法解析的用量保持未知。
 
 解析器限制单个 SSE 事件为 1 MiB、非流式响应缓冲为 16 MiB，超过限制的用量可能显示未知，但不会因此截断客户端响应。数据库无法写入期间的记录可能丢失，恢复后继续记录，不追补缺失历史。
 
 ## 页面
 
-侧栏「用量」提供今日、近 7 天、本月和自定义日期范围。日期按本机时区计算，结束日期包含当天。输入与输出按日绘制堆叠趋势图，明细可按路由、供应商或实际模型分组。菜单中的今日用量可直接打开此页。
+侧栏「用量」提供今天、近 7 天、近 30 天和自定义四个区间预设。区间按本机时区计算并包含当天；自定义是紧凑的“近 N 个自然日”输入（含今天），不使用日期选择器。选中「今天」时输入与输出按本机时区的小时绘制堆叠趋势图，其余区间按自然日绘制；明细可按路由、供应商或实际模型分组。菜单中的今日用量可直接打开此页。
 
-侧栏「性能」是独立入口，按日期区间展示同一数据源下流式请求的首输出延迟（TTFT）与吞吐（TPS），口径见下文「性能统计」。
+侧栏「性能」是独立入口，复用用量页的同一组区间预设，展示同一数据源下流式请求的首输出延迟（TTFT）与吞吐（TPS），口径见下文「性能统计」。
 
 CSV 导出保留所选时间范围内的逐次上游尝试记录。缓存和推理字段在导出中单独保留。导出不包含 API Key、请求头、提示词或回答正文。清空记录需要在界面确认，不修改路由配置。
 
@@ -50,13 +50,14 @@ ezs usage --performance --group route --json
 
 `--performance` 报告流式请求的**首输出延迟（TTFT）**与**输出速率（TPS）**，用于比较实际使用表现，不是供应商计费或模型内部解码速率的度量。
 
-- **测量范围**：原生 Responses、Chat Completions、Anthropic Messages，以及经桥接转换的路由，均按**原始上游响应**测量；协议转换补出的事件不参与统计。
-- **TTFT**：从开始准备该次上游请求到收到**首个非空正文、推理或工具参数片段**的毫秒数。心跳、仅含角色或生命周期信息的事件不计入。流式片段可能包含多个 token，无法据此还原模型内部的首 token 生成时刻。
-- **TPS**：`上游报告的输出 token 数 ÷（首个有效输出片段到上游响应体正常结束）`，单位为 tok/s。计数可能包含未对外流出的推理 token，时间窗口包含尾部与网络收尾，因此只表示代理观测到的平均速率，不代表内部解码速度或屏幕上的文字出现速度。
-- **有效样本**：TPS 需要有效 TTFT、输出 tokens ≥ 2、有效输出事件 ≥ 2 且完整生成窗口大于零。默认分位数只纳入成功完成的流式尝试；失败或取消时仍保留已观测到的原始计时，但不纳入分位数。缺少输出 token 计数时只贡献 TTFT。超限或解析丢失导致无法可靠测量时，对应指标留空。
-- **requestTTFT 与 attemptTTFT**：按 `route` 分组时展示 **requestTTFT**，从路由器收到完整请求并进入候选尝试阶段开始计时，包含自动回退等待；按 `provider`／`model` 分组时展示 **attemptTTFT**，仅包含该次上游尝试自身的首输出等待。两者都在原始上游流上测量，后续输出翻译、事件重排及客户端渲染延迟不属于该口径。
+- **测量范围**：原生 Responses、Chat Completions、Anthropic Messages、原生 Gemini SSE，以及经桥接转换的路由，均按**原始上游响应**测量；协议转换补出的事件不参与统计。
+- **TTFT**：从开始准备该次上游请求到收到**首个非空正文、推理或工具参数片段**的毫秒数。心跳、仅含角色或生命周期信息的事件不计入。Gemini 按 `candidates[].content.parts[]` 判定：非空 `text`（含 `thought: true` 的思考文本）、非空名称的 `functionCall`（零参数工具可省略 `args` 或传 `{}`）、以及有效的 `inlineData` 多模态结果都算有效输出；仅 `thoughtSignature`、空 part、`safetyRatings`／`finishReason`／`role` 或仅用量事件不计入。流式片段可能包含多个 token，无法据此还原模型内部的首 token 生成时刻。
+- **Gemini 非 SSE 流**：`streamGenerateContent` 不带 `alt=sse` 时返回 JSON 数组，需要完整响应体才能解析，**不产生任何性能样本**（不显示 TTFT／TPS），但用量仍按完整有界缓冲提取。需要性能统计时应使用 SSE 入口。
+- **TPS**：输出计数使用上游报告的输出 token，可能包含思考 token。含 TTFT 时计入首输出等待与生成时间，不含 TTFT 时只计首个有效输出片段到响应体正常结束的时间；两者均按总 token ÷ 总时间汇总。上游缓冲和网络传输会影响观测值，无法据此还原模型内部解码速度。
+- **有效样本**：平均 TTFT 使用成功完成（2xx）、对应 TTFT 有效且有限的流式尝试，不要求上报 token 数。两种 TPS 使用同一组样本，额外要求两种 TTFT 有效、完整生成时间有限且大于零、输出 tokens ≥ 2、有效输出事件 ≥ 2。失败、取消或无法可靠解析的样本不计入对应指标。
+- **requestTTFT 与 attemptTTFT**：整体汇总与按 `route` 分组时展示 **requestTTFT**，从路由器收到完整请求并进入候选尝试阶段开始计时，包含自动回退等待；按 `provider`／`model` 分组时展示 **attemptTTFT**，仅包含该次上游尝试自身的首输出等待。两者都在原始上游流上测量，后续输出翻译、事件重排及客户端渲染延迟不属于该口径。
 - **样本数**：TTFT samples 与展示口径一致——`route` 分组为 request 级样本数（JSON `requestTTFTSamples`），`provider`／`model` 分组为上游 attempt 样本数（`ttftSamples`）。两者可能不同；request 级样本缺失时按 0 显示并给出 warning，绝不用上游样本数冒充路由样本。TPS samples 独立统计。
-- **分位数**：P50／P95 使用 nearest-rank，样本不足时按已有样本计算。时间清楚标注单位（`ms` 或 `s`），TPS 单位为 `tok/s`。
+- **聚合指标**：平均 TTFT = 有效 TTFT 之和 ÷ 样本数；平均 TPS（含 TTFT）= `Σ输出 Token ÷ Σ(TTFT + 生成时间)`；平均 TPS（不含 TTFT）= `Σ输出 Token ÷ Σ生成时间`。时间以秒计，TPS 单位为 `tok/s`；两个 TPS 均不对每次请求的速率求算术平均。
 - **无样本**：没有对应样本时显示 `—`，JSON 中对应字段为 `null`，绝不显示为 0。
 - **历史**：早于本功能开始记录的历史尝试没有性能数据，与「无样本」一致；统计不持久化任何提示词或回答正文，只保留时延与 token 计数。
 
@@ -64,23 +65,24 @@ ezs usage --performance --group route --json
 
 ```text
 Performance (model)
-TTFT basis: upstream attempt
+Overall basis: request scope (includes fallback)
 
 Summary
   Attempts: 12
   Successful streaming: 9/12 attempts
   TTFT samples: 9  TPS samples: 8
-  TTFT P50: 480 ms  TTFT P95: 2.40 s
-  TPS P50: 42.3 tok/s
+  Average TTFT: 480 ms
+  Average TPS (incl TTFT): 38.1 tok/s
+  Average TPS (excl TTFT): 42.3 tok/s
 
-Groups
+Groups — basis: upstream attempt
   deepseek-v4.1-flash (command-wsz)
     Attempts 12  Successful streaming 9/12 attempts
     TTFT samples 9  TPS samples 8
-    TTFT P50 480 ms  P95 2.40 s  TPS P50 42.3 tok/s
+    Average TTFT 480 ms  Average TPS (incl TTFT) 38.1 tok/s  Average TPS (excl TTFT) 42.3 tok/s
 ```
 
-按 `route` 分组时，标题下方提示 `TTFT basis: request (includes fallback)`，展示 requestTTFT。
+按 `route` 分组时，明细标注 `Groups — basis: request (includes fallback)`，使用 requestTTFT；整体汇总始终使用请求口径。
 
 ## 存储与安装
 
