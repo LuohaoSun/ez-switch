@@ -17,13 +17,13 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZSwitch.app` 拖入 `Applications`。要求 macOS 13 或以上，Release 为 Apple Silicon（arm64）版本。
+从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZSwitch.app` 拖入 `Applications`。要求 macOS 13 或以上，Release 为 Apple Silicon（arm64）版本。注意：**Cursor 订阅连接器**自带的 sidecar 为 macOS 15+ 构建，因此该连接器只在 **macOS 15 或以上**可用（见下文），主干应用仍支持 macOS 13。
 
 > 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。首次启动如被 macOS 阻止，请前往 `系统设置 → 隐私与安全性`，在安全提示中点击 **“仍要打开”**，然后再次确认打开应用。
 
 ## 快速开始
 
-首次启动会打开设置窗口，并预置一个 `DeepSeek官方 · deepseek-flash` 供应商示例，`main` 默认指向它。已有配置不会被更新为新示例。侧栏可切换“供应商与路由”“用量”“性能”“活动”“通用”。
+首次启动会打开设置窗口，并预置一个 `DeepSeek官方 · deepseek-flash` 供应商示例，`main` 默认指向它。已有配置不会被更新为新示例。侧栏可切换“供应商与路由”“扩展”“用量”“性能”“活动”“通用”。
 
 本地服务默认地址：
 
@@ -79,7 +79,11 @@ http://127.0.0.1:8788
 
 原生 Gemini 的模型 ID 写在请求路径里：本机请求 `POST http://127.0.0.1:8788/v1beta/models/main:generateContent` 会按路径中的 `main` 选路，再替换为远端模型 ID。Gemini 的原生 Base URL 填完整版本前缀（预设为 `https://generativelanguage.googleapis.com/v1beta`），路由器追加 `/models/{model}:{操作}`。正文保持 Gemini 原生格式，上游认证使用配置中的 `x-goog-api-key`，客户端查询参数里的 `key` 不会转发。流式请求保留客户端选择的 SSE 或 JSON 数组格式；JSON 数组可提取最终用量，但不提供流式 TTFT/TPS。`countTokens` 的预估结果不计实际消耗、不改变生成请求的运行时首选。暂不提供 Vertex AI OAuth、文件／缓存资源管理、Live API 或 Gemini 跨协议翻译。
 
-供应商的 Responses 可设为“转发到 Chat”，经 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 转换器对接仅支持 Chat Completions 的上游：Codex 仍请求本机 `/v1/responses`，应用由内置转换器生成 Chat 请求并把响应转回 Responses。该模式要求 Codex 发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩，转换并非无损；未启用转换的路由保持原生 Responses 转发。
+若上游只提供 Chat Completions，可在侧栏“扩展”页开启内置的 **Chat → Responses** 转换，并按供应商勾选（顶部的扩展总开关 + 供应商名单；按供应商生效，不对单个模型单独设置）。开启且勾选后，Codex 仍请求本机 `/v1/responses`，应用用内置转换器生成 Chat 请求并把响应转回 Responses：转换复用该供应商已配置的 Chat Completions 地址与凭据，不改写原生地址、凭据或协议开关；未开启或未勾选的供应商保持原生 Responses 转发。该模式要求客户端发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩，转换并非无损。详见[扩展说明](Docs/extensions.md)。
+
+「扩展」页还提供 **Cursor 订阅连接器**：启用后登录 Cursor，将模型添加到供应商，再沿用现有路由与自动回退。应用内置 [jc01rho/CLIProxyAPIPlus](https://github.com/jc01rho/CLIProxyAPIPlus) **v8.0.28-2** 作为独立辅助进程，不需要安装 Cursor CLI；该组件要求 **macOS 15 或以上**，主应用仍支持 macOS 13。
+
+Chat Completions、Responses、Messages 及工具调用由这个第三方组件处理。关闭扩展会停止其进程，保留账号、模型与路由绑定；退出登录仅清除本扩展账号。模型目录和协议兼容范围以固定组件的实现为准，用量仅记录实际上报值。凭据隔离、工具会话限制和后端来源见[Cursor 连接器说明](Docs/cursor-connector.md)。
 
 ## 命令行入口 ezs
 
@@ -110,9 +114,11 @@ ezs usage --performance
 - 服务只监听本机，不提供远程访问和鉴权。
 - 修改端口后需要重启应用。
 - 每条路由有独立的有序候选列表，按可回退的上游失败顺序尝试；不做负载均衡。
-- 默认按原协议转发；Responses → Chat 转换需在供应商中单独启用。
+- 默认按原协议转发；**Chat → Responses** 转换在“扩展”页开启总开关并按供应商勾选，按供应商生效，不对单个模型单独设置。
+- 扩展随应用内置：**Chat → Responses** 由独立 helper 进程按请求执行；**Cursor 订阅连接器**由应用自带的固定 CLIProxyAPIPlus sidecar（打包名 `ezs-cursor-proxy`）实现，仅在启用时按需启动，只监听 `127.0.0.1` 随机端口。两者都不支持外部动态安装、热加载或第三方插件。Cursor 连接器是可选、低耦合的扩展，只集中在 `Sources/EZSwitch/Extensions/Cursor`，主干仅由组合点 `BuiltinExtensions.swift` 指名，可用 `EZSWITCH_DISABLE_CURSOR=1` 在构建时整体排除；这不是独立模块或二进制隔离，详见[扩展架构与移除说明](Docs/extension-architecture.md)。
+- Cursor 订阅连接器默认关闭；关闭会停止本扩展自有的 sidecar，但保留凭据、供应商、模型与路由 ID，只让 Cursor 候选不可用，重新启用即恢复。该 sidecar 为 macOS 15+ 构建，连接器只在 **macOS 15 或以上**可用，主干应用最低系统仍为 macOS 13。凭据由 sidecar 写在应用配置目录的 `extensions/cursor/auth` 下，EZSwitch 不把它写进 `config.json`；退出登录只清除本扩展账户，不影响系统上其它工具。用量沿用通用 HTTP 统计、按上游真实上报记录，不估算、不代表供应商账单，也不声称“免费 API”。工具会话在 sidecar 进程内有状态（live 会话约 5 分钟、checkpoint 约 30 分钟；续接需匹配的会话 ID 与完整历史），sidecar 重启、禁用或退出登录会中断未完成的工具回合。
 - 客户端请求头按端到端语义透传（含会话头、SDK 头与自定义头）；hop-by-hop 字段（含 `Connection` 声明的字段）、`Host`、`Content-Length`、`Accept-Encoding` 由本机或 URLSession 重新生成，供应商鉴权头按端点替换为配置的 API Key。供应商 `extraHeaders` 最后应用，可覆盖以上任何值。
 
 ## 许可证
 
-[MIT License](LICENSE)。Responses → Chat 转换使用 CLIProxyAPI；该项目及其他第三方依赖的来源、版本与许可声明见 [ThirdParty/README.md](ThirdParty/README.md)。
+[MIT License](LICENSE)。Responses → Chat 转换使用 CLIProxyAPI；Cursor 订阅连接器使用 jc01rho/CLIProxyAPIPlus（固定 v8.0.28-2）。这两个项目及其它第三方依赖的来源、版本与许可声明见 [ThirdParty/README.md](ThirdParty/README.md)，Cursor 连接器的固定版本、校验值与许可原文见 [ThirdParty/cursor-proxy/manifest.json](ThirdParty/cursor-proxy/manifest.json)。

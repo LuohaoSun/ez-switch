@@ -12,6 +12,7 @@ final class RouterServer {
     private let recordUsage: UsageRecorder?
     private let onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)?
     private let session: URLSession
+    private let extensionRegistry: ExtensionRegistry
     private let maxPendingRequests: Int
     private let group: MultiThreadedEventLoopGroup
     private var channel: Channel?
@@ -19,8 +20,10 @@ final class RouterServer {
     /// 生产入口：注入可选 store（nil = 不统计）与上游 URLSession（默认生产单例）。
     /// 测试可改为传 `recordUsage:` + `session:` 的 mock，不触碰全局状态。
     /// `onAutoFallback` 在每次真正开始下一个候选之前回调一次（默认 nil = 不通知）。
+    /// `extensionRegistry` 提供已注册的连接器定义（默认为内置扩展），连接器来源经它转发。
     init(router: Router, usageStore: UsageStore? = nil, recordUsage: UsageRecorder? = nil,
          session: URLSession = Forwarder.session,
+         extensionRegistry: ExtensionRegistry = .builtIn,
          maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests,
          onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) {
         self.router = router
@@ -33,6 +36,7 @@ final class RouterServer {
         }
         self.onAutoFallback = onAutoFallback
         self.session = session
+        self.extensionRegistry = extensionRegistry
         self.maxPendingRequests = maxPendingRequests
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     }
@@ -42,6 +46,7 @@ final class RouterServer {
         let recordUsage = self.recordUsage
         let onAutoFallback = self.onAutoFallback
         let session = self.session
+        let extensionRegistry = self.extensionRegistry
         let maxPendingRequests = self.maxPendingRequests
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
@@ -54,6 +59,7 @@ final class RouterServer {
                 ch.pipeline.configureHTTPServerPipeline(withPipeliningAssistance: false).flatMap {
                     ch.pipeline.addHandler(ProxyHandler(router: router, recordUsage: recordUsage,
                                                         session: session,
+                                                        extensionRegistry: extensionRegistry,
                                                         maxPendingRequests: maxPendingRequests,
                                                         onAutoFallback: onAutoFallback))
                 }
@@ -88,6 +94,7 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
     private let recordUsage: UsageRecorder?
     private let onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)?
     private let session: URLSession
+    private let extensionRegistry: ExtensionRegistry
     private let maxPendingRequests: Int
 
     private var head: HTTPRequestHead?
@@ -98,12 +105,14 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
     private var disconnected = false
 
     init(router: Router, recordUsage: UsageRecorder?, session: URLSession,
+         extensionRegistry: ExtensionRegistry = .builtIn,
          maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests,
          onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) {
         self.router = router
         self.recordUsage = recordUsage
         self.onAutoFallback = onAutoFallback
         self.session = session
+        self.extensionRegistry = extensionRegistry
         self.maxPendingRequests = max(1, maxPendingRequests)
     }
 
@@ -154,6 +163,7 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
         task = Task {
             await RequestProcessor.process(channel: channel, head: next.head, body: next.body,
                                            router: router, recordUsage: recordUsage, session: session,
+                                           extensionRegistry: extensionRegistry,
                                            onAutoFallback: onAutoFallback)
             // 回到 event loop 串行化下一个请求（连接已关闭则不再调度）。
             guard channel.isActive else { return }
@@ -189,6 +199,7 @@ enum RequestProcessor {
     static func process(channel: Channel, head: HTTPRequestHead, body: ByteBuffer,
                         router: Router, recordUsage: UsageRecorder? = nil,
                         session: URLSession = Forwarder.session,
+                        extensionRegistry: ExtensionRegistry = .builtIn,
                         onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) async {
         let rawURI = head.uri
         let split = rawURI.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
@@ -262,7 +273,7 @@ enum RequestProcessor {
         // 迟到的完成不得覆盖新的首选。
         let selectionEpoch = requested.map { router.requestEpoch(fakeModelID: $0) }
 
-        guard let route = router.candidates(fakeModelID: requested), !route.remotes.isEmpty else {
+        guard let route = router.routedCandidates(fakeModelID: requested, endpoint: endpoint) else {
             // 无兜底：id 不存在 → 404（附 known_models）；存在但未绑可用远端 → 502
             if let req = requested, router.hasFake(fakeModelID: req) {
                 Log.shared.log("502 [\(endpoint.rawValue)] model=\(req) 未绑定可用远端")
@@ -292,10 +303,14 @@ enum RequestProcessor {
         }
 
         let fake = route.fake
-        let compatible = router.candidates(fakeModelID: requested, endpoint: endpoint)?.remotes ?? []
+        let compatible = route.candidates
         guard !compatible.isEmpty else {
-            let message = "model '\(fake.fakeModelID)' 的候选模型均未启用 \(endpoint.displayName)"
-            Log.shared.log("502 [\(endpoint.rawValue)] model=\(fake.fakeModelID) 无兼容上游")
+            // 未绑定任何远端，或候选都不支持该入站协议（含选中转换但 Chat 不可用 → 直接无效）。
+            let unbound = fake.orderedRemoteIDs.isEmpty
+            let message = unbound
+                ? "model '\(fake.fakeModelID)' has no usable remote (bind one via menu bar)"
+                : "model '\(fake.fakeModelID)' 的候选模型均未启用 \(endpoint.displayName)"
+            Log.shared.log("502 [\(endpoint.rawValue)] model=\(fake.fakeModelID) 无可用上游")
             if isGemini {
                 await writeGeminiError(channel: channel, status: 502, message: message)
             } else {
@@ -317,12 +332,15 @@ enum RequestProcessor {
         let requestStartMonotonic = DispatchTime.now()
         var headWritten = false
         var selected: (remote: RemoteModel, upstream: UpstreamResponse)?
+        var selectedAdapter: ProtocolAdapter = .passthrough
         var selectedAttempt = 0
         var selectedStarted = requestStarted
         var lastError: Error?
         // 上一次 attempt 失败留下的回退：正式开始下一个候选前发事件，避免取消/候选耗尽误报。
         var pendingFallback: (from: String, reason: AutoFallbackEvent.Reason)?
-        for (index, remote) in compatible.enumerated() {
+        for (index, candidate) in compatible.enumerated() {
+            let remote = candidate.remote
+            let adapter = candidate.adapter
             if let pending = pendingFallback {
                 pendingFallback = nil
                 // 连接已取消/断开就不再启动下一个候选，也不通知。
@@ -337,19 +355,21 @@ enum RequestProcessor {
             // 单调起点在建请求之前捕获：TTFT 覆盖连接/建包/桥接准备，且不会
             // 因上游 body 被 URLSession 后台预读而失真。
             let attemptStartMonotonic = DispatchTime.now()
-            let endpointBaseURL = remote.endpointSetting(for: endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint).baseURL
+            let endpointBaseURL = remote.endpointSetting(for: adapter == .chatToResponses ? .chat : endpoint).baseURL
             Log.shared.log("[\(endpoint.rawValue)] \(head.method) \(path) model=\(fake.fakeModelID) → \(remote.name) \(hostOf(endpointBaseURL))/\(remote.model)")
             do {
                 let upstream = try await Forwarder.makeRequest(clientHead: head, body: bodyData,
-                                                               endpoint: endpoint, remote: remote, query: query,
+                                                               endpoint: endpoint, remote: remote,
+                                                               adapter: adapter, query: query,
                                                                session: session,
                                                                requestStart: requestStartMonotonic,
-                                                               attemptStart: attemptStartMonotonic)
+                                                               attemptStart: attemptStartMonotonic,
+                                                               extensionRegistry: extensionRegistry)
                 let status = upstream.response.statusCode
                 if index < compatible.count - 1 && (status == 429 || [500, 502, 503, 504].contains(status)) {
                     let body = await FallbackDiagnostics.readErrorBody(upstream)
                     let reason = FallbackDiagnostics.summary(response: upstream.response, body: body, remote: remote)
-                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → next=\(compatible[index + 1].name)")
+                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → next=\(compatible[index + 1].remote.name)")
                     // countTokens：复用回退但绝不记账 / 冷却，也不发通知。
                     if account {
                         router.recordFailure(remoteID: remote.id)
@@ -368,13 +388,15 @@ enum RequestProcessor {
                     continue
                 }
                 selected = (remote, upstream)
+                selectedAdapter = adapter
                 selectedAttempt = attempt
                 selectedStarted = attemptStarted
                 break
             } catch {
                 lastError = error
-                // 翻译器在发往上游前就拒绝：没有 HTTP attempt，不算可计费，直接返回客户端错误
-                if (error as? ResponseTranslationError)?.clientError == true { break }
+                // 请求本身在发往上游前就被拒绝（Responses 转换 / 连接器适配）：没有
+                // HTTP attempt，不算可计费，直接返回客户端错误，不回退。
+                if isClientError(error) { break }
                 if Task.isCancelled || error is CancellationError {
                     // 取消不再 fallback 到下一个供应商，只记录这一次尝试
                     if account {
@@ -387,7 +409,7 @@ enum RequestProcessor {
                 }
                 let nsError = error as NSError
                 let reason = FallbackDiagnostics.clean("\(nsError.domain)(\(nsError.code)): \(error)", remote: remote)
-                let next = index + 1 < compatible.count ? "next=\(compatible[index + 1].name)" : "候选耗尽"
+                let next = index + 1 < compatible.count ? "next=\(compatible[index + 1].remote.name)" : "候选耗尽"
                 Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → \(next)")
                 // countTokens：继续尝试下一个候选，但不冷却 / 不记账 / 不通知。
                 if account {
@@ -406,7 +428,7 @@ enum RequestProcessor {
             }
         }
         guard let (remote, upstream) = selected else {
-            let status = (lastError as? ResponseTranslationError)?.clientError == true ? 400 : 502
+            let status = isClientError(lastError) ? 400 : 502
             let message = "upstream: \(lastError.map(String.init(describing:)) ?? "no usable remote")"
             if isGemini {
                 await writeGeminiError(channel: channel, status: status, message: message)
@@ -427,7 +449,7 @@ enum RequestProcessor {
         let isSSE = (upstream.response.value(forHTTPHeaderField: "content-type") ?? "")
             .lowercased().contains("text/event-stream")
         let isSuccess = (200..<300).contains(upstream.response.statusCode)
-        let converting = endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions
+        let converting = selectedAdapter == .chatToResponses
         let reorderer: SSEReorderer? = (endpoint == .responses && isSuccess && isSSE && !converting) ? SSEReorderer() : nil
 
         func write(_ chunk: ByteBuffer) async throws -> Int {
@@ -526,6 +548,16 @@ enum RequestProcessor {
                           started: selectedStarted, tokens: upstream.usage?.tokens,
                           performance: upstream.performance?.performance)
         }
+    }
+
+    /// 请求级客户端错误：请求体本身不被适配器接受，应在发往上游前返回 400 且不回退。
+    /// 连接器适配器以 `ClientRequestFailure.clientError` 标记这一语义；Responses 转换器
+    /// 的 `ResponseTranslationError` 同样以 `clientError` 标记（它不是本类型族成员，
+    /// 故专门判断）。
+    private static func isClientError(_ error: Error?) -> Bool {
+        if let failure = error as? any ClientRequestFailure { return failure.clientError }
+        if let error = error as? ResponseTranslationError { return error.clientError }
+        return false
     }
 
     /// 记录一次上游尝试。record 非阻塞、不抛错；null-ish 计数字段保持 nil（不猜）。

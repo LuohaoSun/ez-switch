@@ -21,9 +21,20 @@ SWIFT_RESOURCE_BUNDLE="${APP_NAME}_${APP_NAME}.bundle"
 BUNDLE_ID=local.sunluohao.ezswitch
 INSTALL_DIR=/Applications
 DIST=dist/$APP_NAME.app
+# 内置 Cursor 订阅连接器依赖固定的 CLIProxyAPI Plus helper。EZSWITCH_DISABLE_CURSOR=1
+# 时不下载、不打包，与 Package.swift 对 Extensions/Cursor 源码的排除保持一致。
+CURSOR_ENABLED=1
+if [[ "${EZSWITCH_DISABLE_CURSOR:-}" == "1" || ! -d "Sources/EZSwitch/Extensions/Cursor" ]]; then
+    CURSOR_ENABLED=0
+fi
 
 echo "==> Responses translator"
 "$SCRIPT_DIR/build-translator.sh"
+
+if [[ "$CURSOR_ENABLED" == "1" ]]; then
+    echo "==> Cursor helper（CLIProxyAPI Plus，固定版本）"
+    "$SCRIPT_DIR/build-cursor-proxy.sh"
+fi
 
 echo "==> swift build -c release"
 swift build -c release
@@ -37,6 +48,9 @@ mkdir -p "$DIST/Contents/MacOS" "$DIST/Contents/Resources"
 cp .build/release/$APP_NAME "$DIST/Contents/MacOS/$APP_NAME"
 cp .build/release/ezs "$DIST/Contents/MacOS/ezs"
 cp .build/ezs-responses-bridge "$DIST/Contents/MacOS/ezs-responses-bridge"
+if [[ "$CURSOR_ENABLED" == "1" ]]; then
+    cp .build/ezs-cursor-proxy "$DIST/Contents/MacOS/ezs-cursor-proxy"
+fi
 cp -R .build/bridge-licenses "$DIST/Contents/Resources/ThirdPartyLicenses"
 cp -R .build/swift-licenses "$DIST/Contents/Resources/ThirdPartyLicenses/swift"
 cp ThirdParty/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/README.md"
@@ -44,10 +58,20 @@ cp ThirdParty/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/README.md"
 mkdir -p "$DIST/Contents/Resources/ThirdPartyLicenses/provider-icons"
 cp ThirdParty/provider-icons/lobe-icons/LICENSE "$DIST/Contents/Resources/ThirdPartyLicenses/provider-icons/LICENSE"
 cp ThirdParty/provider-icons/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/provider-icons/README.md"
+# Cursor helper（CLIProxyAPI Plus，MIT）的固定版本 pin 与许可，原文随包分发。
+if [[ "$CURSOR_ENABLED" == "1" ]]; then
+    mkdir -p "$DIST/Contents/Resources/ThirdPartyLicenses/cursor-proxy"
+    cp ThirdParty/cursor-proxy/LICENSE "$DIST/Contents/Resources/ThirdPartyLicenses/cursor-proxy/LICENSE"
+    cp ThirdParty/cursor-proxy/README.md "$DIST/Contents/Resources/ThirdPartyLicenses/cursor-proxy/README.md"
+    cp ThirdParty/cursor-proxy/manifest.json "$DIST/Contents/Resources/ThirdPartyLicenses/cursor-proxy/manifest.json"
+fi
 cp LICENSE "$DIST/Contents/Resources/LICENSE.txt"
 echo "==> 复制 SwiftPM 资源 bundle：$SWIFT_RESOURCE_BUNDLE"
 cp -R ".build/release/$SWIFT_RESOURCE_BUNDLE" "$DIST/Contents/Resources/$SWIFT_RESOURCE_BUNDLE"
 codesign --force -s - "$DIST/Contents/MacOS/ezs-responses-bridge"
+if [[ "$CURSOR_ENABLED" == "1" ]]; then
+    codesign --force -s - "$DIST/Contents/MacOS/ezs-cursor-proxy"
+fi
 cp Resources/Info.plist "$DIST/Contents/Info.plist"
 cp Resources/AppIcon.icns "$DIST/Contents/Resources/AppIcon.icns"
 

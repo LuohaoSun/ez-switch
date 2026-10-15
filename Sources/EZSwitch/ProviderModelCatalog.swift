@@ -2,12 +2,17 @@ import Foundation
 
 /// 供应商模型列表查询。启用原生 Gemini 时优先 `{base}/models`（base 已含版本前缀，如 `/v1beta`），
 /// 否则沿用 Chat / Responses / Messages 的 `/models`（Messages 补 `/v1`）。
+///
+/// 非 `.api` 记录的模型由扩展连接提供：既无用户可填的接口地址，也不在此层感知具体连接，
+/// 统一经 `ExtensionRegistry.fetchModels(source:)` 取得。
 struct ProviderModelCatalog {
     enum CatalogError: LocalizedError {
         case noEndpoint
         case invalidURL
         case badResponse(Int)
         case invalidPayload
+        /// 连接器记录的模型由扩展连接提供，无法通过接口地址查询。
+        case connectorManaged
 
         var errorDescription: String? {
             switch self {
@@ -15,6 +20,7 @@ struct ProviderModelCatalog {
             case .invalidURL: return "模型列表地址无效"
             case .badResponse(let status): return "获取模型列表失败（HTTP \(status)）"
             case .invalidPayload: return "接口未返回可识别的模型列表"
+            case .connectorManaged: return "该供应商的连接由扩展提供，无法通过接口地址查询模型"
             }
         }
     }
@@ -30,6 +36,8 @@ struct ProviderModelCatalog {
     }
 
     static func request(for remote: RemoteModel) throws -> URLRequest {
+        // 连接器记录没有用户可填的 Base URL，绝不拼造地址；取模型走通用扩展 seam。
+        guard remote.source == .api else { throw CatalogError.connectorManaged }
         let kind = catalogKind(for: remote)
         let base = remote.apiEndpoints[kind].baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard remote.apiEndpoints[kind].enabled, !base.isEmpty else { throw CatalogError.noEndpoint }
@@ -56,8 +64,14 @@ struct ProviderModelCatalog {
         return request
     }
 
-    /// `session` 可注入（测试用 mock），默认走生产单例 `Forwarder.session`。
-    static func fetch(for remote: RemoteModel, session: URLSession = Forwarder.session) async throws -> [String] {
+    /// `registry` / `session` 可注入（测试用）。连接器记录经 `registry.fetchModels(source:)`
+    /// 取模型；普通 `.api` 记录只在此解析接口地址并发起 HTTP。
+    static func fetch(for remote: RemoteModel,
+                      registry: ExtensionRegistry = .builtIn,
+                      session: URLSession = Forwarder.session) async throws -> [String] {
+        if remote.source != .api {
+            return normalized(try await registry.fetchModels(source: remote.source))
+        }
         if catalogKind(for: remote) == .gemini {
             return try await fetchGemini(for: remote, session: session)
         }

@@ -14,33 +14,9 @@ extension RemoteModel {
 /// View-free transition logic behind `EndpointSettingsEditor`. Declared next to the
 /// view so tests exercise the exact production behavior instead of a UI mirror.
 enum EndpointSettingsEditorLogic {
-    /// Top-level Responses switch, keyed on `APIEndpointSettings.supportsResponses`.
-    /// Turning on always starts native; turning off also resets the transport to
-    /// native so an off switch can never carry a bridge transport.
-    static func setResponsesEnabled(_ enabled: Bool, _ settings: inout APIEndpointSettings) {
-        settings.setResponsesMode(enabled ? .native : .disabled)
-    }
-
-    /// Chat Completions switch. A bridged Responses config only counts as supported
-    /// while Chat Completions is enabled, so disabling Chat also closes Responses
-    /// instead of leaving the switch showing off on a saved bridge.
-    static func setChatEnabled(_ enabled: Bool, _ settings: inout APIEndpointSettings) {
-        settings.chat.enabled = enabled
-        if !enabled, settings.responsesTransport == .chatCompletions {
-            settings.setResponsesMode(.disabled)
-        }
-    }
-
-    /// "接入方式" menu (native / bridge only). Bridging reuses the Chat Completions
-    /// URL, so it enables Chat Completions to keep the switch genuinely usable.
-    static func setResponsesTransport(_ transport: ResponsesTransport, _ settings: inout APIEndpointSettings) {
-        switch transport {
-        case .native:
-            settings.setResponsesMode(.native)
-        case .chatCompletions:
-            settings.chat.enabled = true
-            settings.setResponsesMode(.chatCompletions)
-        }
+    /// Native protocol switch. Only touches the targeted protocol.
+    static func setEndpointEnabled(_ enabled: Bool, _ kind: EndpointKind, _ settings: inout APIEndpointSettings) {
+        settings[kind].enabled = enabled
     }
 
     /// Base URL placeholder per protocol. Gemini native stops at `/v1beta`; the
@@ -60,63 +36,19 @@ struct EndpointSettingsEditor: View {
     var body: some View {
         ForEach(EndpointKind.allCases, id: \.self) { kind in
             VStack(alignment: .leading, spacing: 6) {
-                if kind == .responses {
-                    // Same native switch layout as Chat / Messages; mode and URL
-                    // only appear once Responses is actually supported.
-                    Toggle(kind.displayName, isOn: enabledBinding(kind))
-                        .toggleStyle(.switch)
-                        .help("开启 Responses 接入；关闭时禁用 Responses 并恢复原生传输。")
-                    if settings.supportsResponses {
-                        Picker("接入方式", selection: responsesTransportBinding) {
-                            Text("原生 Responses").tag(ResponsesTransport.native)
-                            Text("转发到 Chat").tag(ResponsesTransport.chatCompletions)
-                        }
-                        .pickerStyle(.menu)
-                        .help("转发到 Chat 复用 Chat Completions 地址并转换协议；需要完整会话历史，不支持远程上下文压缩。")
-                        if settings.responsesTransport == .native {
-                            TextField("Responses Base URL", text: baseURLBinding(.responses),
-                                      prompt: Text(verbatim: EndpointSettingsEditorLogic.exampleBaseURL(for: .responses)))
-                                .font(.system(.body, design: .monospaced))
-                        }
-                    }
-                } else if kind == .gemini {
-                    // 原生 Gemini 与 Chat / Messages 同样是单个 native 开关 + Base URL。
-                    Toggle(kind.displayName, isOn: enabledBinding(kind))
-                        .toggleStyle(.switch)
-                        .help("开启原生 Gemini 转发；Base URL 到 /v1beta，路由器追加 /models/{model}:generateContent。")
-                    nativeURLField(kind)
-                } else {
-                    Toggle(kind.displayName, isOn: enabledBinding(kind))
-                        .toggleStyle(.switch)
-                    nativeURLField(kind)
-                }
+                Toggle(kind.displayName, isOn: enabledBinding(kind))
+                    .toggleStyle(.switch)
+                    .help(helpText(for: kind))
+                nativeURLField(kind)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
-    private var responsesTransportBinding: Binding<ResponsesTransport> {
-        Binding(
-            get: { settings.responsesTransport },
-            set: { EndpointSettingsEditorLogic.setResponsesTransport($0, &settings) }
-        )
-    }
-
     private func enabledBinding(_ kind: EndpointKind) -> Binding<Bool> {
         Binding(
-            get: {
-                kind == .responses ? settings.supportsResponses : settings[kind].enabled
-            },
-            set: { value in
-                switch kind {
-                case .responses:
-                    EndpointSettingsEditorLogic.setResponsesEnabled(value, &settings)
-                case .chat:
-                    EndpointSettingsEditorLogic.setChatEnabled(value, &settings)
-                case .messages, .gemini:
-                    settings[kind].enabled = value
-                }
-            }
+            get: { settings[kind].enabled },
+            set: { EndpointSettingsEditorLogic.setEndpointEnabled($0, kind, &settings) }
         )
     }
 
@@ -127,12 +59,23 @@ struct EndpointSettingsEditor: View {
         )
     }
 
-    /// Chat / Messages / Gemini 共用的 Base URL 输入框：禁用时只读，提示用协议示例。
+    /// Base URL 输入框：禁用时只读，提示用协议示例。
     private func nativeURLField(_ kind: EndpointKind) -> some View {
         TextField("Base URL", text: baseURLBinding(kind),
                   prompt: Text(verbatim: EndpointSettingsEditorLogic.exampleBaseURL(for: kind)))
             .font(.system(.body, design: .monospaced))
             .disabled(!settings[kind].enabled)
+    }
+
+    private func helpText(for kind: EndpointKind) -> String {
+        switch kind {
+        case .gemini:
+            return "开启原生 Gemini 转发；Base URL 到 /v1beta，路由器追加 /models/{model}:generateContent。"
+        case .responses:
+            return "开启原生 Responses 转发；Base URL 到 /v1，路由器追加 /responses。"
+        default:
+            return "开启 \(kind.displayName) 转发；Base URL 填完整前缀，路由器只追加协议相对路径。"
+        }
     }
 }
 

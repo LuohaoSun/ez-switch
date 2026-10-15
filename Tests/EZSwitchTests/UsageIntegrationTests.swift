@@ -235,12 +235,9 @@ private final class RawSocketClient {
 
 @Suite("Usage integration", .serialized)
 struct UsageIntegrationTests {
-    private func remote(_ provider: String, _ model: String, baseURL: String,
-                        transport: ResponsesTransport = .native) -> RemoteModel {
-        var settings = APIEndpointSettings.all(baseURL: baseURL)
-        settings.responsesTransport = transport
-        return RemoteModel(id: UUID(), name: "\(provider) · \(model)", apiKey: "test-key", model: model,
-                           extraHeaders: [:], apiEndpoints: settings)
+    private func remote(_ provider: String, _ model: String, baseURL: String) -> RemoteModel {
+        RemoteModel(id: UUID(), name: "\(provider) · \(model)", apiKey: "test-key", model: model,
+                    extraHeaders: [:], apiEndpoints: .all(baseURL: baseURL))
     }
 
     /// Session scoped to one test, carrying the mock URLProtocol. No global swap.
@@ -528,10 +525,13 @@ struct UsageIntegrationTests {
         }
         defer { UsageMockURLProtocol.handler = nil }
 
-        let bridged = remote("Bridge", "real", baseURL: "https://bridge.test/v1", transport: .chatCompletions)
+        let bridged = remote("Bridge", "real", baseURL: "https://bridge.test/v1")
         let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main", remoteID: bridged.id)
         let router = Router()
-        router.update(AppConfig(port: 0, remotes: [bridged], fakes: [fake]))
+        var config = AppConfig(port: 0, remotes: [bridged], fakes: [fake])
+        config.extensions.chatToResponses.enabled = true
+        config.extensions.chatToResponses.providerNames = ["Bridge"]
+        router.update(config)
 
         let spy = UsageRecordSpy()
         let server = RouterServer(router: router, recordUsage: { spy.record($0) }, session: upstream)
