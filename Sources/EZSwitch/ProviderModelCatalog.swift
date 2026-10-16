@@ -4,7 +4,7 @@ import Foundation
 /// 否则沿用 Chat / Responses / Messages 的 `/models`（Messages 补 `/v1`）。
 ///
 /// 非 `.api` 记录的模型由扩展连接提供：既无用户可填的接口地址，也不在此层感知具体连接，
-/// 统一经 `ExtensionRegistry.fetchModels(source:)` 取得。
+/// 统一经 `ExtensionRegistry.fetchModels(source:outboundPolicy:)` 取得（出站由连接器自理）。
 struct ProviderModelCatalog {
     enum CatalogError: LocalizedError {
         case noEndpoint
@@ -64,23 +64,29 @@ struct ProviderModelCatalog {
         return request
     }
 
-    /// `registry` / `session` 可注入（测试用）。连接器记录经 `registry.fetchModels(source:)`
-    /// 取模型；普通 `.api` 记录只在此解析接口地址并发起 HTTP。
+    /// `settings` 为调用方持有的配置快照，决定原生记录的出站策略；`registry` / `session`
+    /// 可注入（测试用）。连接器记录经 `registry.fetchModels(source:outboundPolicy:)` 取模型，
+    /// 其出口由连接器自理；普通 `.api` 记录按策略选会话发 HTTP。
     static func fetch(for remote: RemoteModel,
+                      settings: ExtensionSettings = ExtensionSettings(),
                       registry: ExtensionRegistry = .builtIn,
                       session: URLSession = Forwarder.session) async throws -> [String] {
+        let policy = BuiltinExtensions.outboundPolicy(remote: remote, settings: settings)
         if remote.source != .api {
-            return normalized(try await registry.fetchModels(source: remote.source))
+            return normalized(try await registry.fetchModels(source: remote.source,
+                                                             outboundPolicy: policy))
         }
+        let session = try Forwarder.resolvedSession(for: policy, injected: session)
         if catalogKind(for: remote) == .gemini {
-            return try await fetchGemini(for: remote, session: session)
+            return try await fetchGemini(for: remote, session: session, policy: policy)
         }
-        let json = try await perform(try request(for: remote), session: session)
+        let json = try await perform(try request(for: remote), session: session, policy: policy)
         guard let entries = json["data"] as? [[String: Any]] else { throw CatalogError.invalidPayload }
         return normalized(entries.compactMap { $0["id"] as? String })
     }
 
-    private static func fetchGemini(for remote: RemoteModel, session: URLSession) async throws -> [String] {
+    private static func fetchGemini(for remote: RemoteModel, session: URLSession,
+                                    policy: OutboundPolicy) async throws -> [String] {
         let base = try request(for: remote)
         var names: [String] = []
         var pageToken: String?
@@ -88,7 +94,7 @@ struct ProviderModelCatalog {
         var pages = 0
         repeat {
             if let token = pageToken, !requestedTokens.insert(token).inserted { break }
-            let json = try await perform(paged(base, pageToken: pageToken), session: session)
+            let json = try await perform(paged(base, pageToken: pageToken), session: session, policy: policy)
             guard let models = json["models"] as? [[String: Any]] else { throw CatalogError.invalidPayload }
             for entry in models {
                 guard let name = geminiModelName(entry["name"] as? String),
@@ -127,7 +133,10 @@ struct ProviderModelCatalog {
         Array(Set(names.filter { !$0.isEmpty })).sorted()
     }
 
-    private static func perform(_ request: URLRequest, session: URLSession) async throws -> [String: Any] {
+    private static func perform(_ request: URLRequest, session: URLSession,
+                                policy: OutboundPolicy) async throws -> [String: Any] {
+        // CFNetwork 会对 loopback 目标绕过显式代理：proxy 指向回环记录一律后端拒绝。
+        if let url = request.url { try OutboundTransport.validateDestination(url, policy: policy) }
         let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw CatalogError.invalidPayload }
         guard (200..<300).contains(response.statusCode) else { throw CatalogError.badResponse(response.statusCode) }

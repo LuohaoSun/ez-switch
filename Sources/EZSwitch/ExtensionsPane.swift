@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Chat → Responses 扩展页的可变 UI 状态（名单勾选错误）。
 @MainActor
@@ -6,8 +7,8 @@ final class ExtensionsDraft: ObservableObject {
     @Published var error: String?
 }
 
-/// 侧栏「扩展」页：内置 Chat → Responses 转区块，以及由 `BuiltinExtensions.panes`
-/// 动态挂载的各连接器区块。本页不引用任何具体连接器类型或字面量。
+/// 侧栏「扩展」页：居中的原生卡片纵列。主区块是内置 Chat → Responses 转换，
+/// 其余扩展卡片由 `BuiltinExtensions.panes` 动态挂载；本页不引用任何具体连接器类型或字面量。
 struct ExtensionsPane: View {
     @ObservedObject var store: ConfigStore
     /// 连接器区块添加供应商成功后跳到“供应商与路由”页；容器（SettingsView）负责切换侧栏。
@@ -25,51 +26,61 @@ struct ExtensionsPane: View {
     }
 
     var body: some View {
-        Form {
-            chatToResponsesSection
-            ForEach(BuiltinExtensions.panes) { entry in
-                entry.makeView(store) { onOpenSuppliers?() }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                chatToResponsesCard
+                ForEach(BuiltinExtensions.panes) { entry in
+                    entry.makeView(store) { onOpenSuppliers?() }
+                }
             }
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
         }
-        .formStyle(.grouped)
+        .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle("扩展")
     }
 
     // MARK: Chat → Responses
 
-    @ViewBuilder
-    private var chatToResponsesSection: some View {
-        Section {
-            Toggle("启用", isOn: Binding(
+    /// 主开关在卡片标题；供应商名单与兼容范围说明同处一张卡片。
+    private var chatToResponsesCard: some View {
+        ExtensionCard(
+            title: "Chat → Responses",
+            systemImage: "arrow.left.arrow.right",
+            summary: "将所选供应商的 Responses 请求转到其 Chat 接口。",
+            isEnabled: Binding(
                 get: { isEnabled },
                 set: { store.setChatToResponsesEnabled($0) }
-            ))
-            .toggleStyle(.switch)
-
-            Text("将所选供应商的 Responses 请求转到其 Chat 接口。")
-                .font(.caption).foregroundStyle(.secondary)
-
-            chatCompatibilityDisclosure
-        } header: {
-            Text("Chat → Responses")
-        } footer: {
-            Text("关闭总开关不会清除下面的选择。")
+            )
+        ) {
+            VStack(alignment: .leading, spacing: 14) {
+                providerList
+                if let error = draft.error {
+                    Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                }
+                chatCompatibilityDisclosure
+            }
         }
+    }
 
-        Section("应用到供应商") {
-            if groups.isEmpty {
-                Text("暂无供应商，请先在“供应商与路由”中添加。")
+    @ViewBuilder
+    private var providerList: some View {
+        if groups.isEmpty {
+            Text("暂无供应商，请先在“供应商与路由”中添加。")
+                .foregroundStyle(.secondary)
+        } else if chatEligibleGroups.isEmpty {
+            Text("当前只有连接器供应商；其 Chat / Responses 由连接器处理，无需在此转换。")
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("应用到供应商")
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-            } else if chatEligibleGroups.isEmpty {
-                Text("当前只有连接器供应商；其 Chat / Responses 由连接器处理，无需在此转换。")
-                    .foregroundStyle(.secondary)
-            } else {
                 ForEach(chatEligibleGroups) { group in
                     providerRow(group)
                 }
-            }
-            if let error = draft.error {
-                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
             }
         }
     }

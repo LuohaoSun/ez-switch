@@ -550,7 +550,9 @@ final class Router {
         guard let resolved = resolvedLocked(fakeModelID: fakeModelID, endpoint: endpoint) else { return nil }
         let settings = extensions
         return (resolved.fake, resolved.remotes.map {
-            RoutedCandidate(remote: $0, adapter: settings.adapter(for: $0, endpoint: endpoint))
+            RoutedCandidate(remote: $0,
+                            adapter: settings.adapter(for: $0, endpoint: endpoint),
+                            outboundPolicy: BuiltinExtensions.outboundPolicy(remote: $0, settings: settings))
         })
     }
 
@@ -717,6 +719,33 @@ final class Router {
 
 // MARK: - ConfigStore
 
+/// 配置写盘结果。
+enum ConfigSaveOutcome: Equatable, Sendable {
+    /// 已成功原子写盘。
+    case saved
+    /// 磁盘配置此前解析失败（`writeBlocked`），主动跳过写盘以保护原文件不被覆盖。
+    case blocked
+    /// 编码或 I/O 失败；关联值为可展示的原因。
+    case failed(String)
+
+    /// 是否真正写入磁盘。
+    var succeeded: Bool { self == .saved }
+
+    /// 失败时给 CLI/日志的一句话说明；成功为 nil。
+    var failureMessage: String? {
+        switch self {
+        case .saved:
+            return nil
+        case .blocked:
+            return "route changed in memory but not saved: the on-disk config cannot be parsed, "
+                + "so the file was left untouched to protect it; the change may not survive a restart"
+        case .failed(let reason):
+            return "route changed in memory but not saved: \(reason); "
+                + "the change may not survive a restart"
+        }
+    }
+}
+
 @MainActor
 final class ConfigStore: ObservableObject {
     static let shared = ConfigStore()
@@ -802,10 +831,14 @@ final class ConfigStore: ObservableObject {
         let providers = Set(config.remotes.map { splitProviderModel($0.name).provider })
         let selected = config.extensions.chatToResponses.providerNames
         let pruned = selected.intersection(providers)
-        guard pruned != selected else { return (config, false) }
         var out = config
-        out.extensions.chatToResponses.providerNames = pruned
-        return (out, true)
+        var changed = false
+        if pruned != selected {
+            out.extensions.chatToResponses.providerNames = pruned
+            changed = true
+        }
+        if BuiltinExtensions.pruneSelections(&out) { changed = true }
+        return (out, changed)
     }
 
     /// 只对「能验证的注册连接器来源」清理悬空绑定：绑定的供应商名不再是该来源的现存
@@ -1009,15 +1042,16 @@ final class ConfigStore: ObservableObject {
 
     // MARK: 操作
 
-    /// 给指定路由换绑远端；绑定对全部入站 API 格式生效。
-    func setRoute(fakeID: UUID, remoteID: UUID?) {
-        guard let idx = config.fakes.firstIndex(where: { $0.id == fakeID }) else { return }
+    /// 给指定路由换绑远端；返回写盘结果，nil = 未应用（fake 或 remote 不存在）。
+    @discardableResult
+    func setRoute(fakeID: UUID, remoteID: UUID?) -> ConfigSaveOutcome? {
+        guard let idx = config.fakes.firstIndex(where: { $0.id == fakeID }) else { return nil }
         let fake = config.fakes[idx]
         var name = "未配置"
         if let rid = remoteID {
             guard let remote = config.remotes.first(where: { $0.id == rid }) else {
                 Log.shared.log("route: 拒绝 — remote \(rid) 不存在")
-                return
+                return nil
             }
             name = remote.name
         }
@@ -1026,8 +1060,9 @@ final class ConfigStore: ObservableObject {
         if remoteID == nil { config.fakes[idx].fallbackRemoteIDs = [] }
         else { config.fakes[idx].fallbackRemoteIDs.removeAll { $0 == remoteID } }
         router.update(config)
-        save()
+        let outcome = save()
         Log.shared.log("route switch: \(fake.fakeModelID) -> \(name)")
+        return outcome
     }
 
     @discardableResult
@@ -1047,16 +1082,27 @@ final class ConfigStore: ObservableObject {
         return true
     }
 
+    /// 选中候选远端作为运行期首选并落盘；返回是否命中该候选。写盘失败仅记日志。
     @discardableResult
     func selectRouteModel(fakeID: UUID, remoteID: UUID) -> Bool {
+        applyRouteSelection(fakeID: fakeID, remoteID: remoteID) != nil
+    }
+
+    /// 同 `selectRouteModel`，但把写盘结果回传；nil = 未命中候选。
+    @discardableResult
+    func selectRouteModelOutcome(fakeID: UUID, remoteID: UUID) -> ConfigSaveOutcome? {
+        applyRouteSelection(fakeID: fakeID, remoteID: remoteID)
+    }
+
+    private func applyRouteSelection(fakeID: UUID, remoteID: UUID) -> ConfigSaveOutcome? {
         guard let index = config.fakes.firstIndex(where: { $0.id == fakeID }),
-              config.fakes[index].orderedRemoteIDs.contains(remoteID) else { return false }
+              config.fakes[index].orderedRemoteIDs.contains(remoteID) else { return nil }
         config.fakes[index].selectedRemoteID = remoteID == config.fakes[index].remoteID ? nil : remoteID
         router.update(config)
         router.selectRemote(fakeID: fakeID, remoteID: remoteID)
-        save()
+        let outcome = save()
         Log.shared.log("route select: \(config.fakes[index].fakeModelID) -> \(remoteID)")
-        return true
+        return outcome
     }
 
     /// 新增一个路由；fakeModelID 全局唯一，为空或重复则拒绝。
@@ -1355,10 +1401,49 @@ final class ConfigStore: ObservableObject {
         if name != provider {
             migrateProviderSelection(from: provider, to: name)
             migrateConnectorProviderName(from: provider, to: name, sources: sources)
+            BuiltinExtensions.providerRenamed(from: provider, to: name, in: &config)
         }
         router.update(config)
         save()
         Log.shared.log("provider: 更新 \(name)（\(indices.count) 个模型）")
+        return nil
+    }
+
+    /// 改名和协议选择通过校验后统一保存，内部 HTTP 配置保持不变。
+    @discardableResult
+    func updateConnectorProvider(_ provider: String, name: String,
+                                 enabledEndpoints: Set<EndpointKind>) -> String? {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !name.contains(" · ") else { return "供应商名称不能为空或包含 · 分隔符" }
+        guard name == provider || !config.remotes.contains(where: { splitProviderModel($0.name).provider == name })
+        else { return "该供应商名称已存在" }
+        let indices = config.remotes.indices.filter { splitProviderModel(config.remotes[$0].name).provider == provider }
+        guard !indices.isEmpty else { return "供应商已不存在，请重新打开设置" }
+        let sources = Set(indices.map { config.remotes[$0].source })
+        guard sources.count == 1, let source = sources.first, !source.isAPI else {
+            return "该供应商不是连接器供应商，不支持协议开关"
+        }
+        guard let definition = registry.connector(for: source) else {
+            return "该连接器来源未注册，只支持改名"
+        }
+        guard enabledEndpoints.isSubset(of: definition.endpoints) else { return "所选协议不被该连接器支持" }
+        let settingsKey = definition.settingsKey
+        var binding = config.extensions.connectorSettings(for: settingsKey)
+        guard binding.providerName == provider else { return "该连接器供应商未绑定，请先在扩展页重新连接" }
+
+        for i in indices {
+            config.remotes[i].name = "\(name) · \(config.remotes[i].model)"
+        }
+        binding.enabledEndpoints = enabledEndpoints
+        if name != provider {
+            migrateProviderSelection(from: provider, to: name)
+            binding.providerName = name
+            BuiltinExtensions.providerRenamed(from: provider, to: name, in: &config)
+        }
+        config.extensions.setConnectorSettings(binding, for: settingsKey)
+        router.update(config)
+        save()
+        Log.shared.log("provider: 更新连接器 \(name)（\(indices.count) 个模型，端点 \(enabledEndpoints.map(\.rawValue).sorted().joined(separator: ","))）")
         return nil
     }
 
@@ -1404,6 +1489,7 @@ final class ConfigStore: ObservableObject {
         if !config.remotes.contains(where: { splitProviderModel($0.name).provider == provider }) {
             config.extensions.chatToResponses.providerNames.remove(provider)
             clearConnectorBinding(ifProvider: provider, source: remote.source)
+            BuiltinExtensions.providerRemoved(provider, in: &config)
         }
         var unbound: [String] = []
         for i in config.fakes.indices where config.fakes[i].orderedRemoteIDs.contains(id) {
@@ -1435,6 +1521,7 @@ final class ConfigStore: ObservableObject {
         for source in Set(removed.map(\.source)) {
             clearConnectorBinding(ifProvider: provider, source: source)
         }
+        BuiltinExtensions.providerRemoved(provider, in: &config)
 
         var unbound: [String] = []
         for i in config.fakes.indices {
@@ -1564,18 +1651,22 @@ final class ConfigStore: ObservableObject {
         return enabled == 0 ? "至少启用一种接口协议" : nil
     }
 
-    func save() {
+    /// 写入磁盘；返回可检查的写盘结果。
+    @discardableResult
+    func save() -> ConfigSaveOutcome {
         guard !writeBlocked else {
             Log.shared.log("config: 跳过写盘 — 磁盘配置文件解析失败，保护原文件不被覆盖")
-            return
+            return .blocked
         }
         do {
             let data = try ConfigStore.encoder.encode(config)
             try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
             try data.write(to: configURL, options: .atomic)
+            return .saved
         } catch {
             Log.shared.log("config: save failed: \(error)")
+            return .failed(String(describing: error))
         }
     }
 
@@ -1776,6 +1867,17 @@ final class ConfigStore: ObservableObject {
     }
 
     // MARK: 连接器扩展（通用）
+
+    /// 通用扩展配置变更入口：具体扩展只提供变更闭包，更新 router 快照与落盘在此统一处理。
+    /// 无实际变化时不做任何写入。
+    func updateExtensions(_ mutate: (inout ExtensionSettings) -> Void) {
+        var extensions = config.extensions
+        mutate(&extensions)
+        guard extensions != config.extensions else { return }
+        config.extensions = extensions
+        router.update(config)
+        save()
+    }
 
     /// 只切换某连接器总开关，保留绑定与供应商记录；关闭只让该来源候选不可用。
     func setConnectorEnabled(settingsKey: String, enabled: Bool) {

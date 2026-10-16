@@ -462,7 +462,8 @@ private struct ModelCatalogSheet: View {
         draft.error = nil
         draft.applyError = nil
         do {
-            let fetched = try await ProviderModelCatalog.fetch(for: remote, registry: store.registry)
+            let fetched = try await ProviderModelCatalog.fetch(
+                for: remote, settings: store.config.extensions, registry: store.registry)
             draft.models = fetched
             draft.selected = previouslyDisplayed.isEmpty
                 ? ModelCatalogSelection.initialSelection(models: fetched, existing: existingModelIDs)

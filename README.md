@@ -17,7 +17,7 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZSwitch.app` 拖入 `Applications`。要求 macOS 13 或以上，Release 为 Apple Silicon（arm64）版本。注意：**Cursor 订阅连接器**自带的 sidecar 为 macOS 15+ 构建，因此该连接器只在 **macOS 15 或以上**可用（见下文），主干应用仍支持 macOS 13。
+从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZSwitch.app` 拖入 `Applications`。要求 macOS 13 或以上，Release 为 Apple Silicon（arm64）版本。注意：**出站代理**的 `https://` 代理需要 macOS 14 或以上（`http` / `socks5` 自 macOS 13 起可用）。
 
 > 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。首次启动如被 macOS 阻止，请前往 `系统设置 → 隐私与安全性`，在安全提示中点击 **“仍要打开”**，然后再次确认打开应用。
 
@@ -81,9 +81,7 @@ http://127.0.0.1:8788
 
 若上游只提供 Chat Completions，可在侧栏“扩展”页开启内置的 **Chat → Responses** 转换，并按供应商勾选（顶部的扩展总开关 + 供应商名单；按供应商生效，不对单个模型单独设置）。开启且勾选后，Codex 仍请求本机 `/v1/responses`，应用用内置转换器生成 Chat 请求并把响应转回 Responses：转换复用该供应商已配置的 Chat Completions 地址与凭据，不改写原生地址、凭据或协议开关；未开启或未勾选的供应商保持原生 Responses 转发。该模式要求客户端发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩，转换并非无损。详见[扩展说明](Docs/extensions.md)。
 
-「扩展」页还提供 **Cursor 订阅连接器**：启用后登录 Cursor，将模型添加到供应商，再沿用现有路由与自动回退。应用内置 [jc01rho/CLIProxyAPIPlus](https://github.com/jc01rho/CLIProxyAPIPlus) **v8.0.28-2** 作为独立辅助进程，不需要安装 Cursor CLI；该组件要求 **macOS 15 或以上**，主应用仍支持 macOS 13。
-
-Chat Completions、Responses、Messages 及工具调用由这个第三方组件处理。关闭扩展会停止其进程，保留账号、模型与路由绑定；退出登录仅清除本扩展账号。模型目录和协议兼容范围以固定组件的实现为准，用量仅记录实际上报值。凭据隔离、工具会话限制和后端来源见[Cursor 连接器说明](Docs/cursor-connector.md)。
+「扩展」页还提供 **出站代理**：一条地址（支持 `http` / `https` / `socks5`，须带端口，首版无认证、无 PAC），以及两份勾选名单——**原生供应商**（按名）与**已注册连接器**（按来源）。总开关关闭或来源未勾选即**严格直连**（不隐式使用系统或环境代理）；代理失败只让当前候选失败并走现有自动回退，**不偷偷直连**。该策略对推理、模型目录与 Chat → Responses 一致；连接器自带的上游出站（含 OAuth 与令牌刷新，若有）同样按其出站。连接器自带的本地通道恒为直连；但被勾选走代理的原生供应商若上游本身是本机回环（`127.0.0.1`），CFNetwork 对回环目标在 `https`/`socks5` 代理下会绕过代理，此时明确报错并要求取消勾选，不静默直连。修改代理会重启受影响的连接器组件、可能中断进行中的工具会话；`https://` 代理需 macOS 14+。目前没有内置连接器，名单里实际列出的只有原生供应商；连接器来源选择能力保留给将来注册的扩展。详见[扩展说明](Docs/extensions.md)。
 
 ## 命令行入口 ezs
 
@@ -115,10 +113,10 @@ ezs usage --performance
 - 修改端口后需要重启应用。
 - 每条路由有独立的有序候选列表，按可回退的上游失败顺序尝试；不做负载均衡。
 - 默认按原协议转发；**Chat → Responses** 转换在“扩展”页开启总开关并按供应商勾选，按供应商生效，不对单个模型单独设置。
-- 扩展随应用内置：**Chat → Responses** 由独立 helper 进程按请求执行；**Cursor 订阅连接器**由应用自带的固定 CLIProxyAPIPlus sidecar（打包名 `ezs-cursor-proxy`）实现，仅在启用时按需启动，只监听 `127.0.0.1` 随机端口。两者都不支持外部动态安装、热加载或第三方插件。Cursor 连接器是可选、低耦合的扩展，只集中在 `Sources/EZSwitch/Extensions/Cursor`，主干仅由组合点 `BuiltinExtensions.swift` 指名，可用 `EZSWITCH_DISABLE_CURSOR=1` 在构建时整体排除；这不是独立模块或二进制隔离，详见[扩展架构与移除说明](Docs/extension-architecture.md)。
-- Cursor 订阅连接器默认关闭；关闭会停止本扩展自有的 sidecar，但保留凭据、供应商、模型与路由 ID，只让 Cursor 候选不可用，重新启用即恢复。该 sidecar 为 macOS 15+ 构建，连接器只在 **macOS 15 或以上**可用，主干应用最低系统仍为 macOS 13。凭据由 sidecar 写在应用配置目录的 `extensions/cursor/auth` 下，EZSwitch 不把它写进 `config.json`；退出登录只清除本扩展账户，不影响系统上其它工具。用量沿用通用 HTTP 统计、按上游真实上报记录，不估算、不代表供应商账单，也不声称“免费 API”。工具会话在 sidecar 进程内有状态（live 会话约 5 分钟、checkpoint 约 30 分钟；续接需匹配的会话 ID 与完整历史），sidecar 重启、禁用或退出登录会中断未完成的工具回合。
+- 扩展随应用内置：**Chat → Responses** 由独立 helper 进程按请求执行；**出站代理**由通用 `OutboundPolicy` 接口与 `Extensions/Proxy` 面板实现，不常驻运行。两者都不支持外部动态安装、热加载或第三方插件。出站代理是可选、低耦合的扩展，主干仅由组合点 `BuiltinExtensions.swift` 指名，可用 `EZSWITCH_DISABLE_PROXY=1` 在构建时整体排除。连接器框架（`ExtensionRegistry` / `ExtensionRuntime`）仍在主干保留，但当前没有内置连接器。这不是独立模块或二进制隔离，详见[扩展架构与移除说明](Docs/extension-architecture.md)。
+- 出站代理：`http` / `socks5` 代理自 macOS 13 起可用，`https://`（TLS 到代理）需 **macOS 14 或以上**，低系统上明确报错、不降级直连。来源未勾选或总开关关闭即严格直连（不使用系统/环境代理）；代理失败只让当前候选失败并走现有自动回退，不偷偷直连。连接器本地通道恒直连；被勾选走代理的原生供应商若上游本身是 `127.0.0.1`，在 `https`/`socks5` 下会明确报错并要求取消勾选。修改代理会重启受影响的连接器组件，可能中断进行中的工具会话。
 - 客户端请求头按端到端语义透传（含会话头、SDK 头与自定义头）；hop-by-hop 字段（含 `Connection` 声明的字段）、`Host`、`Content-Length`、`Accept-Encoding` 由本机或 URLSession 重新生成，供应商鉴权头按端点替换为配置的 API Key。供应商 `extraHeaders` 最后应用，可覆盖以上任何值。
 
 ## 许可证
 
-[MIT License](LICENSE)。Responses → Chat 转换使用 CLIProxyAPI；Cursor 订阅连接器使用 jc01rho/CLIProxyAPIPlus（固定 v8.0.28-2）。这两个项目及其它第三方依赖的来源、版本与许可声明见 [ThirdParty/README.md](ThirdParty/README.md)，Cursor 连接器的固定版本、校验值与许可原文见 [ThirdParty/cursor-proxy/manifest.json](ThirdParty/cursor-proxy/manifest.json)。
+[MIT License](LICENSE)。Responses → Chat 转换使用 CLIProxyAPI；该组件及其它第三方依赖的来源、版本与许可声明见 [ThirdParty/README.md](ThirdParty/README.md)。

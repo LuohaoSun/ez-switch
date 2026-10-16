@@ -34,6 +34,57 @@ struct CollapsibleTableInteractionTests {
         return result
     }
 
+    /// 记录转交到外层的滚轮事件。
+    private final class RecordingOuterScrollView: NSScrollView {
+        private(set) var wheelEvents: [NSEvent] = []
+        override func scrollWheel(with event: NSEvent) {
+            wheelEvents.append(event)
+            super.scrollWheel(with: event)
+        }
+    }
+
+    /// 翻转坐标的文档视图。
+    private final class FlippedDocumentView: NSView {
+        override var isFlipped: Bool { true }
+    }
+
+    /// 真实 `NSEvent` 滚轮事件（像素精度）。
+    private func wheelEvent(deltaY: CGFloat, deltaX: CGFloat = 0) -> NSEvent {
+        let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+                         wheel1: Int32(deltaY), wheel2: Int32(deltaX), wheel3: 0)!
+        return NSEvent(cgEvent: cg)!
+    }
+
+    /// 持有容器与协调器/store/directory：协调器是 tableView 的 delegate，须贯穿测试存活。
+    private struct SupplierTableFixture {
+        let container: SupplierModelTableContainer
+        let coordinator: NativeSupplierModelList.Coordinator
+        let store: ConfigStore
+        let directory: TempConfigDirectory
+    }
+
+    /// 与应用一致：容器高度取行区净高，内层只剩 `topInset` 的可滚区间。
+    private func makeSupplierFixture(_ models: [RemoteModel], directoryName: String) throws -> SupplierTableFixture {
+        let directory = try TempConfigDirectory(name: directoryName)
+        try JSONEncoder().encode(AppConfig(port: 8788, remotes: models, fakes: []))
+            .write(to: directory.url)
+        let store = ConfigStore(configURL: directory.url) // startsWatching 默认 false，不启动监听。
+        let items = models.map { SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: false) }
+        let list = NativeSupplierModelList(items: items, provider: "Alpha", sortEnabled: true,
+                                           store: store, onRename: { _, _ in nil })
+        let coordinator = list.makeCoordinator()
+        let container = SupplierModelTableContainer(rowHeight: 24)
+        list.wire(container.tableView, coordinator: coordinator)
+        coordinator.apply(items: items)
+        // 先给足高度让表格实测行矩形，再收缩到行区净高。
+        container.frame = NSRect(x: 0, y: 0, width: 240, height: 400)
+        container.layoutSubtreeIfNeeded()
+        container.frame = NSRect(x: 0, y: 0, width: 240, height: container.tightContentHeight)
+        container.layoutSubtreeIfNeeded()
+        return SupplierTableFixture(container: container, coordinator: coordinator,
+                                    store: store, directory: directory)
+    }
+
     @Test func routeTableRefusesInputWhenCollapsedAndRestoresAfterwards() throws {
         let remotes = [remote("m0"), remote("m1")]
         let route = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
@@ -136,5 +187,57 @@ struct CollapsibleTableInteractionTests {
         #expect(children.allSatisfy { $0.isEnabled })
         #expect(coordinator.contextMenu(row: 0) != nil)
         #expect(container.window === window)
+    }
+
+    /// 回归：`.inset` 的可滚区间曾让内层吞掉滚轮事件，外层收不到、指针在卡片上时页面无法滚动。
+    /// 断言事件被原样转交外层（内层偏移始终钉在 `topInset`）；离屏环境不驱动外层真实滚动，故不验证滚动结果。
+    @Test func supplierContainerForwardsWheelToOuterScrollViewKeepingInnerOffsetPinned() throws {
+        let fixture = try makeSupplierFixture([remote("one"), remote("two"), remote("three")],
+                                              directoryName: "wheel-forward")
+        let container = fixture.container
+
+        let document = FlippedDocumentView(frame: NSRect(x: 0, y: 0, width: 240, height: 600))
+        document.addSubview(container)
+        container.frame.origin = NSPoint(x: 0, y: 100)
+        let outer = RecordingOuterScrollView(frame: NSRect(x: 0, y: 0, width: 240, height: 120))
+        outer.hasVerticalScroller = true
+        outer.documentView = document
+        let window = offscreenWindow(outer, height: 120)
+        outer.layoutSubtreeIfNeeded()
+        #expect(container.window === window)
+
+        let innerPinned = container.contentView.bounds.origin.y
+        #expect(innerPinned == container.topInset)
+
+        // 两个方向（含表格原点路径）都把原事件原样转交外层；内层偏移不变。
+        let down = wheelEvent(deltaY: 24)
+        let up = wheelEvent(deltaY: -24)
+        container.tableView.scrollWheel(with: down)
+        container.scrollWheel(with: up)
+        #expect(outer.wheelEvents.count == 2)
+        #expect(outer.wheelEvents.first === down)
+        #expect(outer.wheelEvents.last === up)
+        #expect(outer.wheelEvents.map(\.scrollingDeltaY) == [24, -24])
+        #expect(container.contentView.bounds.origin.y == innerPinned)
+
+        // 横向同样整体转交，未在内层被消费。
+        let sideways = wheelEvent(deltaY: 0, deltaX: 12)
+        container.scrollWheel(with: sideways)
+        #expect(outer.wheelEvents.count == 3)
+        #expect(outer.wheelEvents.last === sideways)
+        #expect(outer.wheelEvents.last?.scrollingDeltaX == 12)
+        #expect(container.contentView.bounds.origin.y == innerPinned)
+    }
+
+    /// 无外层滚动视图：不崩溃、不退化为内层滚动，偏移仍钉住。
+    @Test func supplierContainerWithoutOuterScrollViewStaysPinnedOnWheel() throws {
+        let fixture = try makeSupplierFixture([remote("one"), remote("two")], directoryName: "wheel-no-outer")
+        let container = fixture.container
+        let innerPinned = container.contentView.bounds.origin.y
+        #expect(innerPinned == container.topInset)
+
+        container.scrollWheel(with: wheelEvent(deltaY: 24))
+        container.scrollWheel(with: wheelEvent(deltaY: -24))
+        #expect(container.contentView.bounds.origin.y == innerPinned)
     }
 }

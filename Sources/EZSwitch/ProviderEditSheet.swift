@@ -8,11 +8,13 @@ final class ProviderDraft: ObservableObject {
     @Published var headers: String
     @Published var changeHeaders = false
     @Published var error: String?
+    /// 连接器供应商的可用协议选择；未配置时视图已回退为 registry 全集。
+    @Published var enabledEndpoints: Set<EndpointKind>
     let mixedEndpoints: Bool
     let mixedKey: Bool
     let mixedHeaders: Bool
 
-    init(group: RemoteGroup) {
+    init(group: RemoteGroup, enabledEndpoints: Set<EndpointKind> = []) {
         name = group.provider
         let first = group.remotes.first
         mixedEndpoints = group.remotes.contains { $0.apiEndpoints != first?.apiEndpoints }
@@ -21,6 +23,7 @@ final class ProviderDraft: ObservableObject {
         endpoints = first?.apiEndpoints ?? APIEndpointSettings(
             chat: .disabled, responses: .disabled, messages: .disabled)
         apiKey = first?.apiKey ?? ""
+        self.enabledEndpoints = enabledEndpoints
         let data = try? JSONSerialization.data(withJSONObject: mixedHeaders ? [:] : first?.extraHeaders ?? [:], options: [.prettyPrinted, .sortedKeys])
         headers = data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
     }
@@ -37,7 +40,24 @@ struct ProviderEditSheet: View {
         self.store = store
         self.group = group
         self.onSaved = onSaved
-        _draft = StateObject(wrappedValue: ProviderDraft(group: group))
+        _draft = StateObject(wrappedValue: ProviderDraft(
+            group: group, enabledEndpoints: Self.initialEndpoints(store: store, group: group)))
+    }
+
+    /// 未配置时回退为该连接器支持的全部协议。
+    private static func initialEndpoints(store: ConfigStore, group: RemoteGroup)
+        -> Set<EndpointKind> {
+        guard let definition = registeredDefinition(store: store, group: group) else { return [] }
+        let stored = store.config.extensions
+            .connectorSettings(for: definition.settingsKey).enabledEndpoints
+        return (stored ?? definition.endpoints).intersection(definition.endpoints)
+    }
+
+    /// 该供应商来源在注册表中的连接器定义；`.api` 或未注册来源为 nil。
+    private static func registeredDefinition(store: ConfigStore, group: RemoteGroup)
+        -> ConnectorDefinition? {
+        guard let source = group.remotes.first?.source, !source.isAPI else { return nil }
+        return store.registry.connector(for: source)
     }
 
     private var headersValue: [String: String]? {
@@ -45,17 +65,15 @@ struct ProviderEditSheet: View {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
     }
 
-    /// 非 `.api` 记录的连接由扩展提供：无用户可填的 Base URL / API Key / 请求头。
-    /// source 未在注册表中也按此处理（缺失扩展时仍是仅名称编辑器）。
+    /// 非 `.api` 记录由扩展提供：无用户可填的 Base URL / API Key / 请求头。
     private var connectorSource: RemoteSource? {
         guard let source = group.remotes.first?.source, source != .api else { return nil }
         return source
     }
     private var isConnectorManaged: Bool { connectorSource != nil }
-    /// 展示名优先取扩展注册；缺失注册时退回 `source.rawValue`，绝不暴露配置键或地址。
-    private var connectorName: String {
-        connectorSource.flatMap { store.registry.connector(for: $0)?.displayName }
-            ?? connectorSource?.rawValue ?? ""
+    /// 缺失扩展时为 nil：协议不可编辑，且不改写其不透明配置。
+    private var connectorDefinition: ConnectorDefinition? {
+        Self.registeredDefinition(store: store, group: group)
     }
 
     private var validation: String? {
@@ -77,16 +95,12 @@ struct ProviderEditSheet: View {
                 Section("供应商") {
                     TextField("名称", text: $draft.name)
                 }
-                if isConnectorManaged {
-                    connectorConnectionSection
-                } else {
+                if let definition = connectorDefinition {
+                    connectorEndpointsSection(definition)
+                } else if !isConnectorManaged {
                     endpointsSection
                     credentialsSection
                     headersSection
-                }
-                Section("应用范围") {
-                    Text(group.remotes.map(\.model).joined(separator: "、"))
-                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
             }.formStyle(.grouped)
             if let error = validation ?? draft.error {
@@ -101,16 +115,25 @@ struct ProviderEditSheet: View {
         }.frame(width: 600, height: isConnectorManaged ? 420 : 760)
     }
 
-    /// 连接器供应商：native 接口编辑器整块替换为一行说明，登录/连接在“扩展”页管理。
+    /// 连接器供应商：按定义列出该来源可用的协议开关，不含 Base URL / API Key / 请求头。
     @ViewBuilder
-    private var connectorConnectionSection: some View {
-        Section("连接") {
-            Text("连接由扩展管理")
-            Text("\(connectorName) 供应商通过其扩展连接，凭据由扩展持有，无需填写 Base URL 或 API Key；请在“扩展”页管理登录、连接与模型同步。")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("该供应商的模型由扩展提供，本页只修改供应商名称。")
-                .font(.caption).foregroundStyle(.secondary)
+    private func connectorEndpointsSection(_ definition: ConnectorDefinition) -> some View {
+        Section("接口协议") {
+            ForEach(EndpointKind.allCases.filter { definition.endpoints.contains($0) }, id: \.self) { kind in
+                Toggle(kind.displayName, isOn: connectorEndpointBinding(kind))
+                    .toggleStyle(.switch)
+            }
         }
+    }
+
+    private func connectorEndpointBinding(_ kind: EndpointKind) -> Binding<Bool> {
+        Binding(
+            get: { draft.enabledEndpoints.contains(kind) },
+            set: { enabled in
+                if enabled { draft.enabledEndpoints.insert(kind) }
+                else { draft.enabledEndpoints.remove(kind) }
+            }
+        )
     }
 
     @ViewBuilder
@@ -152,11 +175,15 @@ struct ProviderEditSheet: View {
     }
 
     private func save() {
-        // 连接器供应商只改名称，native 端点/凭据/请求头保持原样（传 nil 不覆盖）。
-        draft.error = store.updateProvider(group.provider, name: draft.name,
-            apiEndpoints: isConnectorManaged ? nil : ConfigStore.normalizedEndpoints(draft.endpoints),
-            apiKey: isConnectorManaged ? nil : draft.apiKey,
-            extraHeaders: isConnectorManaged ? nil : (draft.changeHeaders ? headersValue : nil))
+        if connectorDefinition != nil {
+            draft.error = store.updateConnectorProvider(
+                group.provider, name: draft.name, enabledEndpoints: draft.enabledEndpoints)
+        } else {
+            draft.error = store.updateProvider(group.provider, name: draft.name,
+                apiEndpoints: isConnectorManaged ? nil : ConfigStore.normalizedEndpoints(draft.endpoints),
+                apiKey: isConnectorManaged ? nil : draft.apiKey,
+                extraHeaders: isConnectorManaged ? nil : (draft.changeHeaders ? headersValue : nil))
+        }
         if draft.error == nil {
             onSaved(draft.name.trimmingCharacters(in: .whitespacesAndNewlines))
             dismiss()

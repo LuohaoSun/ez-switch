@@ -40,22 +40,25 @@ private struct HarnessBackupRecord: Codable {
 struct HarnessConfigManager {
     let home: URL
     let backupRoot: URL
+    let environment: [String: String]
 
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser,
-         backupRoot: URL? = nil) {
+         backupRoot: URL? = nil,
+         environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.home = home
         self.backupRoot = backupRoot ?? home.appendingPathComponent("Library/Application Support/EZSwitch/HarnessBackups")
+        self.environment = environment
     }
 
     func fileURL(for target: HarnessTarget) -> URL? {
         switch target {
         case .codex:
-            let root = ProcessInfo.processInfo.environment["CODEX_HOME"]
+            let root = environment["CODEX_HOME"]
                 .flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : nil }
                 ?? home.appendingPathComponent(".codex")
             return root.appendingPathComponent("config.toml")
         case .claudeCode:
-            let root = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
+            let root = environment["CLAUDE_CONFIG_DIR"]
                 .flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : nil }
                 ?? home.appendingPathComponent(".claude")
             return root.appendingPathComponent("settings.json")

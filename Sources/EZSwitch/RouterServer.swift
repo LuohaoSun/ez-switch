@@ -362,6 +362,7 @@ enum RequestProcessor {
                                                                endpoint: endpoint, remote: remote,
                                                                adapter: adapter, query: query,
                                                                session: session,
+                                                               outboundPolicy: candidate.outboundPolicy,
                                                                requestStart: requestStartMonotonic,
                                                                attemptStart: attemptStartMonotonic,
                                                                extensionRegistry: extensionRegistry)

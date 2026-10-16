@@ -127,17 +127,41 @@ struct ConnectorSettings: Codable, Equatable {
     var providerName: String?
     /// 是否已加入供应商名单（由扩展页维护）。
     var providerAdded: Bool = false
+    /// 显式协议选择原始串（持久化字段 `enabledEndpoints`）：nil = 继承来源全集，
+    /// 空集 = 全关，未知协议串原样保留。
+    private var enabledEndpointRaw: Set<String>?
     /// 未识别字段，原样保留。
     var extra: [String: ExtensionJSONValue] = [:]
 
-    init(enabled: Bool = false, providerName: String? = nil, providerAdded: Bool = false) {
+    init(enabled: Bool = false, providerName: String? = nil, providerAdded: Bool = false,
+         enabledEndpoints: Set<EndpointKind>? = nil) {
         self.enabled = enabled
         self.providerName = providerName
         self.providerAdded = providerAdded
+        self.enabledEndpointRaw = enabledEndpoints.map { Set($0.map(\.rawValue)) }
+    }
+
+    /// UI/判定用：已解析的协议选择。nil = 继承，空集 = 全关；写入保留既有未知原串。
+    var enabledEndpoints: Set<EndpointKind>? {
+        get { enabledEndpointRaw.map { Set($0.compactMap(EndpointKind.init(rawValue:))) } }
+        set {
+            guard let newValue else {
+                enabledEndpointRaw = nil
+                return
+            }
+            let unknown = (enabledEndpointRaw ?? []).filter { EndpointKind(rawValue: $0) == nil }
+            enabledEndpointRaw = Set(newValue.map(\.rawValue)).union(unknown)
+        }
+    }
+
+    /// 未配置（nil）继承全集；已配置则只在显式集合内。
+    func allows(_ endpoint: EndpointKind) -> Bool {
+        guard let enabledEndpointRaw else { return true }
+        return enabledEndpointRaw.contains(endpoint.rawValue)
     }
 
     private enum KnownKeys: String, CodingKey, CaseIterable {
-        case enabled, providerName, providerAdded
+        case enabled, providerName, providerAdded, enabledEndpoints
     }
 
     private struct DynamicKey: CodingKey {
@@ -152,6 +176,8 @@ struct ConnectorSettings: Codable, Equatable {
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
         providerName = try c.decodeIfPresent(String.self, forKey: .providerName)
         providerAdded = try c.decodeIfPresent(Bool.self, forKey: .providerAdded) ?? false
+        // 字符串集合读取，未知协议值原样保留；结构非法则整体解码失败按 disabled 回退。
+        enabledEndpointRaw = try c.decodeIfPresent(Set<String>.self, forKey: .enabledEndpoints)
         let dynamic = try decoder.container(keyedBy: DynamicKey.self)
         let known = Set(KnownKeys.allCases.map(\.stringValue))
         var extra: [String: ExtensionJSONValue] = [:]
@@ -166,6 +192,9 @@ struct ConnectorSettings: Codable, Equatable {
         try c.encode(enabled, forKey: .enabled)
         try c.encodeIfPresent(providerName, forKey: .providerName)
         try c.encode(providerAdded, forKey: .providerAdded)
+        if let enabledEndpointRaw {
+            try c.encode(enabledEndpointRaw.sorted(), forKey: .enabledEndpoints)
+        }
         guard !extra.isEmpty else { return }
         var dynamic = encoder.container(keyedBy: DynamicKey.self)
         for (key, value) in extra {
@@ -246,6 +275,15 @@ struct ExtensionSettings: Codable, Equatable {
         otherExtensions[key] = value
     }
 
+    func extensionValue(for key: String) -> ExtensionJSONValue? {
+        otherExtensions[key]
+    }
+
+    mutating func setExtensionValue(_ value: ExtensionJSONValue?, for key: String) {
+        guard key != CodingKeys.chatToResponses.rawValue else { return }
+        otherExtensions[key] = value
+    }
+
     /// 全部非 `chatToResponses` 顶层键（测试/诊断用；不暴露可变内容）。
     var extensionKeys: [String] { otherExtensions.keys.sorted() }
 }
@@ -281,4 +319,5 @@ extension ExtensionSettings {
 struct RoutedCandidate {
     let remote: RemoteModel
     let adapter: ProtocolAdapter
+    var outboundPolicy: OutboundPolicy = .direct
 }

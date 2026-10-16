@@ -25,11 +25,6 @@ Bundle layout in `EZSwitch.app/Contents/Resources/`:
 - `ThirdPartyLicenses/provider-icons/` — `LICENSE` (verbatim
   `provider-icons/lobe-icons/LICENSE`, lobehub/lobe-icons, MIT) and `README.md`
   for those icons.
-- `ThirdPartyLicenses/cursor-proxy/` — the Cursor connector helper's provenance:
-  `manifest.json` (pin, per-arch URLs and SHA-256), `LICENSE` (verbatim upstream
-  MIT) and `README.md`; see `ThirdParty/cursor-proxy/`.
-- `Contents/MacOS/ezs-cursor-proxy` — the pinned, unmodified CLIProxyAPI Plus
-  binary (v8.0.28-2) that the built-in Cursor connector runs; see below.
 
 Attribution conventions:
 
@@ -73,29 +68,6 @@ Current packaging includes the CLIProxyAPI and Go dependency notices collected
 by `Tools/ResponsesBridge/collect-licenses.py`, and the pinned Swift packages'
 licenses and notices collected by `Tools/collect-swift-licenses.py` from 0.3.2.
 The 0.3.1 DMG contains the Go notices but predates the Swift license packaging fix.
-
-## Cursor connector helper (CLIProxyAPI Plus)
-
-The built-in Cursor 订阅连接器 runs on a pinned, unmodified
-[jc01rho/CLIProxyAPIPlus](https://github.com/jc01rho/CLIProxyAPIPlus) release
-(fork of `router-for-me/CLIProxyAPI`, MIT). It is packaged as
-`Contents/MacOS/ezs-cursor-proxy` (archive name `cli-proxy-api`).
-
-Pinned release: **v8.0.28-2** (commit **67eadafb4ea36e5cf60d33fa349982da9b6dc31b**).
-Per-architecture asset URLs, archive/binary SHA-256 digests and the license are
-recorded in `ThirdParty/cursor-proxy/manifest.json`; the exact upstream `LICENSE`
-is shipped verbatim alongside it.
-
-- `Scripts/build-cursor-proxy.sh` downloads the pinned darwin asset into
-  `.build/cursor-proxy/`, verifies its SHA-256, and safely extracts only the
-  `cli-proxy-api` member to `.build/ezs-cursor-proxy`. It never falls back to a
-  different project or version, and never `curl | sh`.
-- `Scripts/build-app.sh` copies it into the bundle and ad-hoc signs it. Set
-  `EZSWITCH_DISABLE_CURSOR=1` to skip both the download and the packaging.
-- The binary is redistributed byte-for-byte; upstream source is not modified.
-- Minimum macOS is **15.0** (both architectures); the helper's only dynamic
-  dependencies are OS frameworks/libraries, so no third-party dylibs are bundled.
-  See `ThirdParty/cursor-proxy/README.md` for details.
 
 ## Provider preset brand icons
 
