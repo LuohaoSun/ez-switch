@@ -733,6 +733,24 @@ final class SupplierModelTableContainer: NSScrollView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    /// 内层位置固定，滚轮交给外层处理，避免顶部内缩产生的可滚范围吞掉事件。
+    override func scrollWheel(with event: NSEvent) {
+        if let outer = enclosingOuterScrollView() {
+            outer.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+
+    private func enclosingOuterScrollView() -> NSScrollView? {
+        var view = superview
+        while let current = view {
+            if let scrollView = current as? NSScrollView { return scrollView }
+            view = current.superview
+        }
+        return nil
+    }
+
     override func layout() {
         super.layout()
         let width = contentSize.width

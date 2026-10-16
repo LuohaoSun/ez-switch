@@ -1,5 +1,13 @@
 // swift-tools-version:5.9
 import PackageDescription
+import Foundation
+
+// Set EZSWITCH_DISABLE_PROXY=1 to compile and test the host with this extension absent.
+let proxyEnabled = ProcessInfo.processInfo.environment["EZSWITCH_DISABLE_PROXY"] != "1"
+let extensionExcludes = proxyEnabled ? [] : ["Extensions/Proxy"]
+let extensionTestExcludes = proxyEnabled ? [] : ["Extensions/Proxy"]
+let extensionSettings: [SwiftSetting] =
+    proxyEnabled ? [.define("EZSWITCH_PROXY_EXTENSION")] : []
 
 let package = Package(
     name: "EZSwitch",
@@ -20,11 +28,13 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
             ],
             path: "Sources/EZSwitch",
+            exclude: extensionExcludes,
             resources: [
                 // 预设供应商品牌图标，随 target 生成 EZSwitch_EZSwitch.bundle；
                 // build-app.sh 再把该 bundle 复制进 .app/Contents/Resources。
                 .copy("Resources/ProviderIcons")
             ],
+            swiftSettings: extensionSettings,
             linkerSettings: [
                 // SwiftPM 在 macOS 13 部署目标下会把 LC_BUILD_VERSION.sdk 写成 13.0，
                 // 导致系统按老 SDK 应用渲染。保留 minOS 13.0，同时把链接 SDK 标为 27.0。
@@ -38,7 +48,9 @@ let package = Package(
         .testTarget(
             name: "EZSwitchTests",
             dependencies: ["EZSwitch"],
-            path: "Tests/EZSwitchTests"
+            path: "Tests/EZSwitchTests",
+            exclude: extensionTestExcludes,
+            swiftSettings: extensionSettings
         ),
         .testTarget(
             name: "EZSCLITests",

@@ -12,64 +12,48 @@ enum BridgeTestExecutable {
 @MainActor
 @Suite("Responses transport")
 struct ResponsesTransportTests {
+    private func remote(provider: String, chat: EndpointSetting, responses: EndpointSetting) -> RemoteModel {
+        RemoteModel(id: UUID(), name: "\(provider) · model", apiKey: "test-secret", model: "real-model",
+                    extraHeaders: [:], apiEndpoints: APIEndpointSettings(chat: chat, responses: responses,
+                                                                        messages: .disabled))
+    }
+
+    /// 旧的 responsesTransport 字段不再参与编码；解码仍然被 AppConfig 一次性迁移读取。
     @Test
-    func legacySettingsKeepNativeTransport() throws {
-        let json = #"{"chat":{"enabled":true,"baseURL":"https://chat.test/v1"},"responses":{"enabled":false,"baseURL":""},"messages":{"enabled":false,"baseURL":""}}"#
+    func legacyTransportFieldDecodesButIsNotEncoded() throws {
+        let json = #"{"chat":{"enabled":true,"baseURL":"https://chat.test/v1"},"responses":{"enabled":false,"baseURL":""},"messages":{"enabled":false,"baseURL":""},"responsesTransport":"chatCompletions"}"#
         let settings = try JSONDecoder().decode(APIEndpointSettings.self, from: Data(json.utf8))
-        #expect(settings.responsesTransport == .native)
-        var translated = settings
-        translated.responsesTransport = .chatCompletions
-        #expect(try JSONDecoder().decode(APIEndpointSettings.self, from: JSONEncoder().encode(translated)) == translated)
+        #expect(settings.chat.enabled)
+        #expect(!settings.responses.enabled)
+        let encoded = try JSONEncoder().encode(settings)
+        #expect(String(data: encoded, encoding: .utf8)?.contains("responsesTransport") == false)
     }
 
+    /// adapter == .chatToResponses 时复用 Chat 地址与 Bearer 鉴权，忽略 native Responses URL。
     @Test
-    func responsesModesReuseChatURLAndPreserveNativeURL() throws {
-        var settings = APIEndpointSettings(
-            chat: EndpointSetting(enabled: true, baseURL: "https://chat.test/v1"),
-            responses: EndpointSetting(enabled: true, baseURL: "https://responses.test/v1"),
-            messages: .disabled)
-        #expect(settings.responsesMode == .native)
-
-        settings.setResponsesMode(.chatCompletions)
-        #expect(settings.responsesMode == .chatCompletions)
-        #expect(settings.supportsResponses)
-        #expect(settings.chat.baseURL == "https://chat.test/v1")
-        #expect(settings.responses.baseURL == "https://responses.test/v1")
-        let remote = RemoteModel(id: UUID(), name: "test · model", apiKey: "", model: "model",
-                                 extraHeaders: [:], apiEndpoints: settings)
-        #expect(remote.endpointBaseURLs == ["https://chat.test/v1"])
-        #expect(ConfigStore.validateEndpoints(settings) == nil)
-
-        settings.setResponsesMode(.native)
-        #expect(settings.responsesMode == .native)
-        #expect(settings.responses.baseURL == "https://responses.test/v1")
-
-        settings.setResponsesMode(.disabled)
-        #expect(settings.responsesMode == .disabled)
-        #expect(!settings.supportsResponses)
-        settings.setResponsesMode(.chatCompletions)
-        settings.setResponsesMode(.disabled)
-        #expect(settings.responsesMode == .disabled)
-        #expect(settings.responses.baseURL == "https://responses.test/v1")
-    }
-
-    @Test
-    func translationUsesChatURLAndAuthWithoutNativeResponseURL() throws {
-        let settings = APIEndpointSettings(
-            chat: EndpointSetting(enabled: true, baseURL: "https://chat.test/v1"),
-            responses: .disabled, messages: .disabled, responsesTransport: .chatCompletions)
-        let remote = RemoteModel(id: UUID(), name: "Alpha · model", apiKey: "test-secret", model: "real-model",
-                                 extraHeaders: [:], apiEndpoints: settings)
-        #expect(remote.supports(.responses))
-        #expect(ConfigStore.validateEndpoints(settings) == nil)
+    func chatToResponsesAdapterUsesChatURLAndAuth() throws {
+        let remote = remote(provider: "Alpha",
+                            chat: EndpointSetting(enabled: true, baseURL: "https://chat.test/v1"),
+                            responses: EndpointSetting(enabled: true, baseURL: "https://responses.test/v1"))
         let head = HTTPRequestHead(version: .http1_1, method: .POST, uri: "/v1/responses")
         let request = try Forwarder.buildRequest(clientHead: head, body: Data(#"{"model":"main","input":"Hello"}"#.utf8),
-                                                 endpoint: .responses, remote: remote, query: "x=1")
+                                                 endpoint: .responses, remote: remote,
+                                                 adapter: .chatToResponses, query: "x=1")
         #expect(request.url?.absoluteString == "https://chat.test/v1/chat/completions?x=1")
         #expect(request.value(forHTTPHeaderField: "authorization") == "Bearer test-secret")
-        var disabled = settings
-        disabled.chat.enabled = false
-        #expect(ConfigStore.validateEndpoints(disabled) != nil)
+    }
+
+    /// 默认 adapter == .passthrough 走 native Responses 地址，不被 Chat 配置影响。
+    @Test
+    func passthroughUsesNativeResponsesURL() throws {
+        let remote = remote(provider: "Alpha",
+                            chat: EndpointSetting(enabled: true, baseURL: "https://chat.test/v1"),
+                            responses: EndpointSetting(enabled: true, baseURL: "https://responses.test/v1"))
+        let head = HTTPRequestHead(version: .http1_1, method: .POST, uri: "/v1/responses")
+        let request = try Forwarder.buildRequest(clientHead: head, body: Data(#"{"model":"main","input":"Hello"}"#.utf8),
+                                                 endpoint: .responses, remote: remote, query: "")
+        #expect(request.url?.absoluteString == "https://responses.test/v1/responses")
+        #expect(request.value(forHTTPHeaderField: "authorization") == "Bearer test-secret")
     }
 }
 

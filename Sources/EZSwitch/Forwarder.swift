@@ -18,6 +18,14 @@ enum ForwarderError: Error, CustomStringConvertible {
     }
 }
 
+/// 非原生 HTTP 来源（扩展连接器或未知来源）不得走 HTTP 上游，即便配置里填了 URL。
+/// 归类为客户端错误：请求本身无法被适配，应直接返回 400 且不回退。
+struct ConnectorRoutingError: ClientRequestFailure, CustomStringConvertible {
+    let source: RemoteSource
+    var clientError: Bool { true }
+    var description: String { "source '\(source.rawValue)' has no HTTP upstream" }
+}
+
 /// 上游响应：状态行/头 + 字节流 + 主动取消入口
 struct UpstreamResponse {
     let response: HTTPURLResponse
@@ -182,13 +190,24 @@ enum Forwarder {
     }
 
     static func buildRequest(clientHead: HTTPRequestHead, body: Data,
-                             endpoint: EndpointKind, remote: RemoteModel, query: String) throws -> URLRequest {
+                             endpoint: EndpointKind, remote: RemoteModel,
+                             adapter: ProtocolAdapter = .passthrough,
+                             query: String) throws -> URLRequest {
+        // 连接器请求没有 HTTP 上游（扩展自行构造响应），绝不能进入建 URL 路径。
+        if case .connector(let source) = adapter {
+            throw ConnectorRoutingError(source: source)
+        }
+        // 兜底：非原生 HTTP 来源即便调用方按默认 .passthrough 传入，也绝不用其 URL
+        // 发起 HTTP —— 未知来源不会因“恰好有 URL”而变成 HTTP 上游。
+        guard remote.source.isAPI else {
+            throw ConnectorRoutingError(source: remote.source)
+        }
         // Native Gemini has its own path/body/auth shaping derived from the client
         // URI; the generic base+suffix flow does not apply.
         if endpoint == .gemini {
             return try buildGeminiRequest(clientHead: clientHead, body: body, remote: remote)
         }
-        let upstreamEndpoint: EndpointKind = endpoint == .responses && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
+        let upstreamEndpoint: EndpointKind = adapter == .chatToResponses ? .chat : endpoint
         guard remote.apiEndpoints[upstreamEndpoint].enabled else {
             throw ForwarderError.endpointDisabled(upstreamEndpoint)
         }
@@ -291,15 +310,46 @@ enum Forwarder {
     /// `session` 可注入（测试用 mock），默认走生产单例。
     /// `requestStart`/`attemptStart` 为路由器侧的单调起点（记录在最终 record
     /// 时换算成 ttft/requestTTFT）；nil = 不测 TTFT。
+    /// `extensionRegistry` 提供已注册的连接器定义；非原生 HTTP 来源一律经它转发。
+    /// `outboundPolicy` 只作用于真正上游：`.direct` 保留注入的 `session`，`.proxy` 取出站
+    /// 工厂的代理会话。连接器不受代理影响（不把代理会话用在本地 loopback 上）。
     static func makeRequest(clientHead: HTTPRequestHead, body: Data,
                             endpoint: EndpointKind, remote: RemoteModel,
+                            adapter: ProtocolAdapter = .passthrough,
                             query: String, session: URLSession = Forwarder.session,
+                            outboundPolicy: OutboundPolicy = .direct,
                             requestStart: DispatchTime? = nil,
-                            attemptStart: DispatchTime? = nil) async throws -> UpstreamResponse {
-        let upstreamEndpoint: EndpointKind = endpoint == .responses
-            && remote.apiEndpoints.responsesTransport == .chatCompletions ? .chat : endpoint
+                            attemptStart: DispatchTime? = nil,
+                            extensionRegistry: ExtensionRegistry = .builtIn) async throws -> UpstreamResponse {
+        if case .invalid(let reason) = outboundPolicy {
+            throw OutboundTransportError.invalidPolicy(reason)
+        }
+        // 连接器来源：无 HTTP 请求，交由 registry 中的扩展处理（校验/子进程/响应合成）。
+        // 来源以 adapter 为准，但 adapter 与 remote.source 必须一致；若调用方省略 adapter
+        // （默认 .passthrough）而远端是非 .api 来源，则按 source 委托，绝不掉进原生 HTTP。
+        let connectorSource: RemoteSource?
+        switch adapter {
+        case .connector(let source):
+            guard source == remote.source else { throw ConnectorRoutingError(source: source) }
+            connectorSource = source
+        case .passthrough, .chatToResponses:
+            connectorSource = remote.source.isAPI ? nil : remote.source
+        }
+        if let source = connectorSource {
+            return try await extensionRegistry.forward(
+                ConnectorRequest(clientHead: clientHead, body: body, endpoint: endpoint,
+                                 remote: remote, query: query,
+                                 requestStart: requestStart, attemptStart: attemptStart,
+                                 outboundPolicy: outboundPolicy),
+                source: source)
+        }
+        // 仅原生上游按策略选会话；连接器分支已 return，代理不落到本地 loopback。
+        let session = try resolvedSession(for: outboundPolicy, injected: session)
+        let upstreamEndpoint: EndpointKind = adapter == .chatToResponses ? .chat : endpoint
         var req = try buildRequest(clientHead: clientHead, body: body,
-                                   endpoint: endpoint, remote: remote, query: query)
+                                   endpoint: endpoint, remote: remote, adapter: adapter, query: query)
+        // CFNetwork 会对 loopback 目标绕过显式代理：proxy 指向回环上游一律后端拒绝，不隐式直连。
+        if let url = req.url { try OutboundTransport.validateDestination(url, policy: outboundPolicy) }
         // countTokens 不做 usage/performance 采集：直接返回原始响应，不包 accumulating，
         // 使 upstream.usage/performance 保持 nil（Router 侧也零记账）。
         if endpoint == .gemini,
@@ -307,7 +357,7 @@ enum Forwarder {
            context.isCountTokens {
             return try await perform(req, session: session)
         }
-        if endpoint == .responses, remote.apiEndpoints.responsesTransport == .chatCompletions {
+        if adapter == .chatToResponses {
             let translator = try ResponseTranslator()
             do {
                 let translated = try await translator.prepare(body, model: remote.model)
@@ -391,6 +441,18 @@ enum Forwarder {
             return body
         }
         return (try? JSONSerialization.data(withJSONObject: object)) ?? body
+    }
+
+    /// `.direct` 保留注入会话（生产单例 / 测试 mock），`.proxy` 取出站工厂的代理会话。
+    static func resolvedSession(for policy: OutboundPolicy, injected: URLSession) throws -> URLSession {
+        switch policy {
+        case .direct:
+            return injected
+        case .proxy:
+            return try OutboundTransport.session(for: policy)
+        case .invalid(let reason):
+            throw OutboundTransportError.invalidPolicy(reason)
+        }
     }
 
     private static func perform(_ req: URLRequest, session: URLSession) async throws -> UpstreamResponse {

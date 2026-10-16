@@ -103,6 +103,7 @@ struct RouterApp: App {
     init() {
         NSApplication.shared.setActivationPolicy(.accessory)
         ConfigStore.shared.startServer()                      // 幂等；菜单没点开前就开始服务
+        ExtensionRuntime.shared.start(in: ConfigStore.shared)  // 通用启动胶水，无 UI 也连
     }
 
     var body: some Scene {

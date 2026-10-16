@@ -683,7 +683,8 @@ struct RemoteEditSheet: View {
                                  model: "", extraHeaders: parsedHeaders,
                                  apiEndpoints: ConfigStore.normalizedEndpoints(draft.endpoints))
         do {
-            let models = try await ProviderModelCatalog.fetch(for: remote)
+            let models = try await ProviderModelCatalog.fetch(
+                for: remote, settings: store.config.extensions, registry: store.registry)
             if models.isEmpty {
                 draft.error = "供应商返回了空模型列表，请检查接口设置后重试"
             } else {

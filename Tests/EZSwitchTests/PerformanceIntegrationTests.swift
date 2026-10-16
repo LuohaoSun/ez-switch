@@ -145,12 +145,9 @@ private final class PerfSocketClient {
 
 @Suite("Performance integration", .serialized)
 struct PerformanceIntegrationTests {
-    private func remote(_ provider: String, _ model: String, baseURL: String,
-                        transport: ResponsesTransport = .native) -> RemoteModel {
-        var settings = APIEndpointSettings.all(baseURL: baseURL)
-        settings.responsesTransport = transport
-        return RemoteModel(id: UUID(), name: "\(provider) · \(model)", apiKey: "test-key", model: model,
-                           extraHeaders: [:], apiEndpoints: settings)
+    private func remote(_ provider: String, _ model: String, baseURL: String) -> RemoteModel {
+        RemoteModel(id: UUID(), name: "\(provider) · \(model)", apiKey: "test-key", model: model,
+                    extraHeaders: [:], apiEndpoints: .all(baseURL: baseURL))
     }
 
     private func providerRemote(_ provider: String, _ model: String, baseURL: String) -> RemoteModel {
@@ -192,9 +189,12 @@ struct PerformanceIntegrationTests {
     }
 
     private func start(_ remote: [RemoteModel], fakeModels: [FakeModel], spy: PerfRecordSpy,
-                       session: URLSession) throws -> RouterServer {
+                       session: URLSession,
+                       extensions: ExtensionSettings = ExtensionSettings()) throws -> RouterServer {
+        var config = AppConfig(port: 0, remotes: remote, fakes: fakeModels)
+        config.extensions = extensions
         let router = Router()
-        router.update(AppConfig(port: 0, remotes: remote, fakes: fakeModels))
+        router.update(config)
         let server = RouterServer(router: router, recordUsage: { spy.record($0) }, session: session)
         try server.start(port: 0)
         return server
@@ -496,10 +496,14 @@ struct PerformanceIntegrationTests {
         }
         defer { PerfMockURLProtocol.handler = nil }
 
-        let bridged = remote("Bridge", "real", baseURL: "https://bridge.test/v1", transport: .chatCompletions)
+        let bridged = remote("Bridge", "real", baseURL: "https://bridge.test/v1")
         let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main", remoteID: bridged.id)
         let spy = PerfRecordSpy()
-        let server = try start([bridged], fakeModels: [fake], spy: spy, session: upstream)
+        var extensions = ExtensionSettings()
+        extensions.chatToResponses.enabled = true
+        extensions.chatToResponses.providerNames = ["Bridge"]
+        let server = try start([bridged], fakeModels: [fake], spy: spy, session: upstream,
+                               extensions: extensions)
         defer { server.stop() }
         let port = try #require(server.boundPort)
 

@@ -17,13 +17,13 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZSwitch.app` 拖入 `Applications`。要求 macOS 13 或以上，Release 为 Apple Silicon（arm64）版本。
+从 [GitHub Releases](https://github.com/LuohaoSun/ez-switch/releases) 下载最新 `EZSwitch-*.dmg`，打开后将 `EZSwitch.app` 拖入 `Applications`。要求 macOS 13 或以上，Release 为 Apple Silicon（arm64）版本。注意：**出站代理**的 `https://` 代理需要 macOS 14 或以上（`http` / `socks5` 自 macOS 13 起可用）。
 
 > 当前 DMG 使用 ad-hoc 签名，未经过 Apple Developer ID 公证。首次启动如被 macOS 阻止，请前往 `系统设置 → 隐私与安全性`，在安全提示中点击 **“仍要打开”**，然后再次确认打开应用。
 
 ## 快速开始
 
-首次启动会打开设置窗口，并预置一个 `DeepSeek官方 · deepseek-flash` 供应商示例，`main` 默认指向它。已有配置不会被更新为新示例。侧栏可切换“供应商与路由”“用量”“性能”“活动”“通用”。
+首次启动会打开设置窗口，并预置一个 `DeepSeek官方 · deepseek-flash` 供应商示例，`main` 默认指向它。已有配置不会被更新为新示例。侧栏可切换“供应商与路由”“扩展”“用量”“性能”“活动”“通用”。
 
 本地服务默认地址：
 
@@ -79,7 +79,9 @@ http://127.0.0.1:8788
 
 原生 Gemini 的模型 ID 写在请求路径里：本机请求 `POST http://127.0.0.1:8788/v1beta/models/main:generateContent` 会按路径中的 `main` 选路，再替换为远端模型 ID。Gemini 的原生 Base URL 填完整版本前缀（预设为 `https://generativelanguage.googleapis.com/v1beta`），路由器追加 `/models/{model}:{操作}`。正文保持 Gemini 原生格式，上游认证使用配置中的 `x-goog-api-key`，客户端查询参数里的 `key` 不会转发。流式请求保留客户端选择的 SSE 或 JSON 数组格式；JSON 数组可提取最终用量，但不提供流式 TTFT/TPS。`countTokens` 的预估结果不计实际消耗、不改变生成请求的运行时首选。暂不提供 Vertex AI OAuth、文件／缓存资源管理、Live API 或 Gemini 跨协议翻译。
 
-供应商的 Responses 可设为“转发到 Chat”，经 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 转换器对接仅支持 Chat Completions 的上游：Codex 仍请求本机 `/v1/responses`，应用由内置转换器生成 Chat 请求并把响应转回 Responses。该模式要求 Codex 发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩，转换并非无损；未启用转换的路由保持原生 Responses 转发。
+若上游只提供 Chat Completions，可在侧栏“扩展”页开启内置的 **Chat → Responses** 转换，并按供应商勾选（顶部的扩展总开关 + 供应商名单；按供应商生效，不对单个模型单独设置）。开启且勾选后，Codex 仍请求本机 `/v1/responses`，应用用内置转换器生成 Chat 请求并把响应转回 Responses：转换复用该供应商已配置的 Chat Completions 地址与凭据，不改写原生地址、凭据或协议开关；未开启或未勾选的供应商保持原生 Responses 转发。该模式要求客户端发送完整历史，明确拒绝 `previous_response_id`、`conversation` 和远程压缩，转换并非无损。详见[扩展说明](Docs/extensions.md)。
+
+「扩展」页还提供 **出站代理**：一条地址（支持 `http` / `https` / `socks5`，须带端口，首版无认证、无 PAC），以及两份勾选名单——**原生供应商**（按名）与**已注册连接器**（按来源）。总开关关闭或来源未勾选即**严格直连**（不隐式使用系统或环境代理）；代理失败只让当前候选失败并走现有自动回退，**不偷偷直连**。该策略对推理、模型目录与 Chat → Responses 一致；连接器自带的上游出站（含 OAuth 与令牌刷新，若有）同样按其出站。连接器自带的本地通道恒为直连；但被勾选走代理的原生供应商若上游本身是本机回环（`127.0.0.1`），CFNetwork 对回环目标在 `https`/`socks5` 代理下会绕过代理，此时明确报错并要求取消勾选，不静默直连。修改代理会重启受影响的连接器组件、可能中断进行中的工具会话；`https://` 代理需 macOS 14+。目前没有内置连接器，名单里实际列出的只有原生供应商；连接器来源选择能力保留给将来注册的扩展。详见[扩展说明](Docs/extensions.md)。
 
 ## 命令行入口 ezs
 
@@ -110,9 +112,11 @@ ezs usage --performance
 - 服务只监听本机，不提供远程访问和鉴权。
 - 修改端口后需要重启应用。
 - 每条路由有独立的有序候选列表，按可回退的上游失败顺序尝试；不做负载均衡。
-- 默认按原协议转发；Responses → Chat 转换需在供应商中单独启用。
+- 默认按原协议转发；**Chat → Responses** 转换在“扩展”页开启总开关并按供应商勾选，按供应商生效，不对单个模型单独设置。
+- 扩展随应用内置：**Chat → Responses** 由独立 helper 进程按请求执行；**出站代理**由通用 `OutboundPolicy` 接口与 `Extensions/Proxy` 面板实现，不常驻运行。两者都不支持外部动态安装、热加载或第三方插件。出站代理是可选、低耦合的扩展，主干仅由组合点 `BuiltinExtensions.swift` 指名，可用 `EZSWITCH_DISABLE_PROXY=1` 在构建时整体排除。连接器框架（`ExtensionRegistry` / `ExtensionRuntime`）仍在主干保留，但当前没有内置连接器。这不是独立模块或二进制隔离，详见[扩展架构与移除说明](Docs/extension-architecture.md)。
+- 出站代理：`http` / `socks5` 代理自 macOS 13 起可用，`https://`（TLS 到代理）需 **macOS 14 或以上**，低系统上明确报错、不降级直连。来源未勾选或总开关关闭即严格直连（不使用系统/环境代理）；代理失败只让当前候选失败并走现有自动回退，不偷偷直连。连接器本地通道恒直连；被勾选走代理的原生供应商若上游本身是 `127.0.0.1`，在 `https`/`socks5` 下会明确报错并要求取消勾选。修改代理会重启受影响的连接器组件，可能中断进行中的工具会话。
 - 客户端请求头按端到端语义透传（含会话头、SDK 头与自定义头）；hop-by-hop 字段（含 `Connection` 声明的字段）、`Host`、`Content-Length`、`Accept-Encoding` 由本机或 URLSession 重新生成，供应商鉴权头按端点替换为配置的 API Key。供应商 `extraHeaders` 最后应用，可覆盖以上任何值。
 
 ## 许可证
 
-[MIT License](LICENSE)。Responses → Chat 转换使用 CLIProxyAPI；该项目及其他第三方依赖的来源、版本与许可声明见 [ThirdParty/README.md](ThirdParty/README.md)。
+[MIT License](LICENSE)。Responses → Chat 转换使用 CLIProxyAPI；该组件及其它第三方依赖的来源、版本与许可声明见 [ThirdParty/README.md](ThirdParty/README.md)。

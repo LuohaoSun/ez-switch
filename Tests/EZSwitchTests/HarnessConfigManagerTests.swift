@@ -7,7 +7,11 @@ struct HarnessConfigManagerTests {
     private func fixture() throws -> (URL, HarnessConfigManager) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        return (root, HarnessConfigManager(home: root, backupRoot: root.appendingPathComponent("backups")))
+        // An explicit empty environment guarantees the real CODEX_HOME / CLAUDE_CONFIG_DIR
+        // can never redirect a temporary-home test at the user's live configuration.
+        return (root, HarnessConfigManager(home: root,
+                                           backupRoot: root.appendingPathComponent("backups"),
+                                           environment: [:]))
     }
 
     @Test func installAndRestoreOriginalBytes() throws {
@@ -111,5 +115,52 @@ struct HarnessConfigManagerTests {
         try manager.restore(.claudeCode)
         #expect(!manager.hasBackup(for: .claudeCode))
         #expect(try Data(contentsOf: file) == original)
+    }
+
+    @Test func injectedEnvironmentOverridesConfigurationRoots() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let externalClaude = root.appendingPathComponent("external-claude")
+        let externalCodex = root.appendingPathComponent("external-codex")
+        let unusedHome = root.appendingPathComponent("unused-home")
+        let manager = HarnessConfigManager(
+            home: unusedHome,
+            backupRoot: root.appendingPathComponent("backups"),
+            environment: ["CLAUDE_CONFIG_DIR": externalClaude.path, "CODEX_HOME": externalCodex.path])
+
+        #expect(manager.fileURL(for: .claudeCode) == externalClaude.appendingPathComponent("settings.json"))
+        #expect(manager.fileURL(for: .codex) == externalCodex.appendingPathComponent("config.toml"))
+
+        // install/restore must operate on the injected environment roots, never on `home`.
+        let plan = try manager.preview(target: .claudeCode, endpoint: "http://127.0.0.1:8788", modelID: "main")
+        try manager.install(plan)
+        #expect(FileManager.default.fileExists(atPath: externalClaude.appendingPathComponent("settings.json").path))
+        #expect(!FileManager.default.fileExists(atPath: unusedHome.path))
+        try manager.restore(.claudeCode)
+        #expect(!FileManager.default.fileExists(atPath: externalClaude.appendingPathComponent("settings.json").path))
+        #expect(!FileManager.default.fileExists(atPath: unusedHome.path))
+    }
+
+    @Test func relativeEnvironmentPathsFallBackToHome() throws {
+        let (root, _) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = HarnessConfigManager(
+            home: root,
+            backupRoot: root.appendingPathComponent("backups"),
+            environment: ["CLAUDE_CONFIG_DIR": "relative/path", "CODEX_HOME": "relative/path"])
+
+        #expect(manager.fileURL(for: .claudeCode) == root.appendingPathComponent(".claude/settings.json"))
+        #expect(manager.fileURL(for: .codex) == root.appendingPathComponent(".codex/config.toml"))
+    }
+
+    @Test func emptyEnvironmentIsolatesFromProcessEnvironment() throws {
+        let (root, manager) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Even when the real process exports CODEX_HOME / CLAUDE_CONFIG_DIR, an empty
+        // environment must resolve strictly inside the injected temporary home.
+        #expect(manager.fileURL(for: .claudeCode) == root.appendingPathComponent(".claude/settings.json"))
+        #expect(manager.fileURL(for: .codex) == root.appendingPathComponent(".codex/config.toml"))
     }
 }

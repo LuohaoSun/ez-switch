@@ -100,7 +100,7 @@ struct WindowActivator: NSViewRepresentable {
 // MARK: - 设置窗口骨架
 
 enum SettingsSection: Hashable {
-    case models, remotes, activity, usage, performance, general
+    case models, remotes, activity, usage, performance, extensions, general
 }
 
 /// 侧栏当前页。不用 `@State`（本机只有 CommandLineTools，没有 SwiftUIMacros 插件，
@@ -147,6 +147,10 @@ struct SettingsView: View {
         }
         .background(WindowActivator().frame(width: 0, height: 0))
         .frame(minWidth: 1000, minHeight: 640)
+        .task {
+            // 兜底启动（幂等）；正式启动胶水由 RouterApp 负责，无 UI 也能连。
+            ExtensionRuntime.shared.start(in: store)
+        }
     }
 
     private var sidebar: some View {
@@ -158,6 +162,7 @@ struct SettingsView: View {
             Label("用量", systemImage: "chart.bar.xaxis").tag(SettingsSection.usage)
             Label("性能", systemImage: "speedometer").tag(SettingsSection.performance)
             Label("活动", systemImage: "waveform.path.ecg").tag(SettingsSection.activity)
+            Label("扩展", systemImage: "puzzlepiece.extension").tag(SettingsSection.extensions)
             Label("通用", systemImage: "gearshape").tag(SettingsSection.general)
         }
         .listStyle(.sidebar)
@@ -165,12 +170,40 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var detail: some View {
+        VStack(spacing: 0) {
+            if let error = store.configLoadError {
+                configLoadErrorBanner(error)
+                Divider()
+            }
+            detailContent
+        }
+    }
+
+    /// 配置读取失败时的简洁提示；修正文件后经“通用”页重新加载即可恢复保存。
+    private func configLoadErrorBanner(_ error: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("配置读取失败，正在使用默认配置").font(.callout)
+                Text(error).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                Text("请修正配置文件后，在“通用”页重新加载以恢复保存。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .background(Color.orange.opacity(0.10))
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
         switch nav.section {
         case .models, .remotes: RouteWorkspaceView(store: store)
         case .activity: LogWindowView()
         // 两个入口需独立身份，避免 StateObject 在页面之间复用。
         case .usage: UsageView(store: store.usageStore, initialSection: .usage).id(SettingsSection.usage)
         case .performance: UsageView(store: store.usageStore, initialSection: .performance).id(SettingsSection.performance)
+        case .extensions: ExtensionsPane(store: store, onOpenSuppliers: { nav.section = .models })
         case .general: GeneralPane(store: store)
         }
     }
@@ -181,6 +214,7 @@ struct SettingsView: View {
         case .activity: return "活动"
         case .usage: return "用量"
         case .performance: return "性能"
+        case .extensions: return "扩展"
         case .general: return "通用"
         }
     }

@@ -192,7 +192,7 @@ struct GeneralPane: View {
         guard let kind = draft.harness.requiredEndpoint else { return [] }
         return store.config.fakes.filter { fake in
             guard let remote = store.routeRemote(fake) else { return false }
-            return remote.supports(kind) && !remote.needsCredentials
+            return store.config.supports(kind, remote: remote) && !remote.needsCredentials
         }
     }
 

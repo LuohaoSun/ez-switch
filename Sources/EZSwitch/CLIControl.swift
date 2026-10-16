@@ -169,10 +169,16 @@ extension ConfigStore {
             guard matches.count == 1, let remote = matches.first else {
                 return ["ok": false, "message": matches.isEmpty ? "upstream model not found" : "ambiguous upstream model; use --remote-id"]
             }
-            if fake.orderedRemoteIDs.contains(remote.id) {
-                selectRouteModel(fakeID: fake.id, remoteID: remote.id)
-            } else {
-                setRoute(fakeID: fake.id, remoteID: remote.id)
+            // 每个分支内部各保存一次，不额外再 save；写盘失败必须如实回传。
+            let outcome = fake.orderedRemoteIDs.contains(remote.id)
+                ? selectRouteModelOutcome(fakeID: fake.id, remoteID: remote.id)
+                : setRoute(fakeID: fake.id, remoteID: remote.id)
+            guard let outcome else {
+                return ["ok": false, "message": "route not found"]
+            }
+            guard outcome.succeeded else {
+                return ["ok": false, "message": outcome.failureMessage
+                    ?? "route changed in memory but not saved; the change may not survive a restart"]
             }
             return ["ok": true, "message": "\(fakeID) → \(splitProviderModel(remote.name).provider) / \(remote.model)"]
         default:

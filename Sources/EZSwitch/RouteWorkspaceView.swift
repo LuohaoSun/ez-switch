@@ -33,6 +33,8 @@ private final class WorkspaceDraft: ObservableObject {
 
 struct RouteWorkspaceView: View {
     @ObservedObject var store: ConfigStore
+    /// 通用扩展状态信号：连接器连接变化时 revision 递增，据此重算供应商卡片不可用提示。
+    @ObservedObject private var runtime = ExtensionRuntime.shared
     @StateObject private var ui = WorkspaceDraft()
     private var groups: [RemoteGroup] { store.remoteGroups(matching: ui.query) }
     private var remoteByID: [UUID: RemoteModel] {
@@ -164,6 +166,16 @@ struct RouteWorkspaceView: View {
                 .help("管理 \(group.provider)")
                 .accessibilityLabel("管理 \(group.provider) 供应商")
             }
+            if let connector = unavailableConnector(group) {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle").font(.caption)
+                    Text("\(connector) 连接不可用，请在“扩展”页连接")
+                        .font(.caption)
+                }
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+            }
             CollapsibleBody(isExpanded: expanded,
                             expandedHeight: CollapsibleMetrics.supplierBodyHeight(
                                 tableHeight: ui.supplierTableHeights[group.provider] ?? 0)) {
@@ -201,10 +213,17 @@ struct RouteWorkspaceView: View {
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
     }
 
+    /// 扩展连接器供应商：连接由扩展/CLI 提供，native 端点恒关闭。返回不可用时用于提示的
+    /// 显示名（缺失扩展注册则退回 source.rawValue）；就绪状态只由通用 router 判定。
+    private func unavailableConnector(_ group: RemoteGroup) -> String? {
+        guard let source = group.remotes.first?.source, source != .api else { return nil }
+        guard !store.router.connectorAvailable(source: source) else { return nil }
+        return store.registry.connector(for: source)?.displayName ?? source.rawValue
+    }
+
     /// 标题左侧品牌图标：命中 catalog 品牌用其离线图标，否则用中性 server.rack 保持标题对齐。
     @ViewBuilder
-    private func providerBrandIcon(_ group: RemoteGroup) -> some View {
-        switch ProviderBrandResolver.resolve(group) {
+    private func providerBrandIcon(_ group: RemoteGroup) -> some View {        switch ProviderBrandResolver.resolve(group) {
         case .known(let iconName):
             ProviderPresetIcon(brandKey: iconName, label: group.provider)
         case .unknown:
@@ -443,7 +462,8 @@ private struct ModelCatalogSheet: View {
         draft.error = nil
         draft.applyError = nil
         do {
-            let fetched = try await ProviderModelCatalog.fetch(for: remote)
+            let fetched = try await ProviderModelCatalog.fetch(
+                for: remote, settings: store.config.extensions, registry: store.registry)
             draft.models = fetched
             draft.selected = previouslyDisplayed.isEmpty
                 ? ModelCatalogSelection.initialSelection(models: fetched, existing: existingModelIDs)

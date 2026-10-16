@@ -65,6 +65,10 @@ struct ProviderPreset: Identifiable {
 
 “—”：该协议未启用，原因见“未启用协议”。
 
+> 表中 Responses 指供应商**原生** Responses 地址。若某供应商只启用 Chat Completions，仍可在
+> 侧栏“扩展”页开启内置 Chat → Responses 转换并按供应商勾选，让 Codex 的 `/v1/responses`
+> 由 Chat 转换提供服务；这不改变本表的原生协议启用情况，详见[扩展说明](extensions.md)。
+
 ## 图标 key
 
 同品牌套餐共用同一 `iconName`；`id` 与 `iconName` 不一一对应。
