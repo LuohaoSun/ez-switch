@@ -83,6 +83,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        ConfigStore.shared.flushPendingConfigWrites()
+    }
+
     func applicationDidBecomeActive(_ notification: Notification) {
         AutoFallbackNotificationService.shared.activate()
     }

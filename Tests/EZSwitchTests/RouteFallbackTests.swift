@@ -127,6 +127,7 @@ struct RouteFallbackTests {
         store.moveFakes(sources: [first.id], before: nil)
         #expect(store.config.fakes.map(\.id) == [second.id, first.id])
         store.moveFakes(sources: [first.id], before: second.id)
+        store.flushPendingConfigWrites()
         let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: url))
         #expect(persisted.remotes.map(\.id) == [a.id, b.id, c.id])
         #expect(persisted.fakes.map(\.id) == [first.id, second.id])

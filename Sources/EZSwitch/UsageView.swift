@@ -7,6 +7,7 @@ struct UsageView: View {
     let store: UsageStore
 
     @StateObject private var model: UsageViewModel
+    @StateObject private var chartSelection = UsageChartSelection()
 
     private let columnWidth: CGFloat = 72
 
@@ -283,6 +284,7 @@ struct UsageView: View {
                 )
                 .foregroundStyle(by: .value("类型", "输入"))
                 .cornerRadius(3)
+                .opacity(chartSelection.date == nil || chartSelection.date == point.date ? 1 : 0.35)
 
                 BarMark(
                     x: .value(isHourlyChart ? "时间" : "日期", point.date, unit: chartUnit),
@@ -290,6 +292,7 @@ struct UsageView: View {
                 )
                 .foregroundStyle(by: .value("类型", "输出"))
                 .cornerRadius(3)
+                .opacity(chartSelection.date == nil || chartSelection.date == point.date ? 1 : 0.35)
             }
             .chartForegroundStyleScale(["输入": Color.accentColor, "输出": Color.teal])
             .chartLegend(position: .top, alignment: .trailing)
@@ -317,8 +320,43 @@ struct UsageView: View {
             }
             // 固定 X 轴为当前区间，避免「近 7 天只有一天有数据」时被压成今日外观。
             .chartXScale(domain: model.range.from...model.range.to)
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    Rectangle().fill(Color.clear).contentShape(Rectangle())
+                        .onTapGesture { location in
+                            let plot = geometry[proxy.plotAreaFrame]
+                            guard plot.contains(location),
+                                  let date: Date = proxy.value(atX: location.x - plot.minX) else {
+                                chartSelection.date = nil
+                                return
+                            }
+                            chartSelection.toggle(at: date, points: chartPoints, unit: chartUnit)
+                        }
+                }
+            }
             .frame(height: 180)
+
+            if let date = chartSelection.date,
+               let point = chartPoints.first(where: { $0.date == date }) {
+                HStack(spacing: 12) {
+                    Text(isHourlyChart ? point.date.formatted(date: .abbreviated, time: .shortened)
+                         : UsageFormat.day(point.date))
+                    Text("输入 \(UsageFormat.exact(point.input))")
+                    Text("输出 \(UsageFormat.exact(point.output))")
+                    Text("合计 \(UsageFormat.exact(point.input + point.output)) token")
+                    Spacer(minLength: 0)
+                    Button { chartSelection.date = nil } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("取消柱状图选择")
+                }
+                .font(.caption)
+                .monospacedDigit()
+                .textSelection(.enabled)
+            }
         }
+        .onChange(of: model.reloadKey) { _ in chartSelection.date = nil }
         .cardSurface()
     }
 

@@ -10,6 +10,7 @@ final class RouterServer {
 
     private let router: Router
     private let recordUsage: UsageRecorder?
+    private let activityStore: ActivityStore?
     private let onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)?
     private let session: URLSession
     private let extensionRegistry: ExtensionRegistry
@@ -19,9 +20,11 @@ final class RouterServer {
 
     /// 生产入口：注入可选 store（nil = 不统计）与上游 URLSession（默认生产单例）。
     /// 测试可改为传 `recordUsage:` + `session:` 的 mock，不触碰全局状态。
+    /// `activityStore` 提供结构化实时活动快照（默认 `.shared`；传 nil 可关闭，测试可注入独立实例）。
     /// `onAutoFallback` 在每次真正开始下一个候选之前回调一次（默认 nil = 不通知）。
     /// `extensionRegistry` 提供已注册的连接器定义（默认为内置扩展），连接器来源经它转发。
     init(router: Router, usageStore: UsageStore? = nil, recordUsage: UsageRecorder? = nil,
+         activityStore: ActivityStore? = .shared,
          session: URLSession = Forwarder.session,
          extensionRegistry: ExtensionRegistry = .builtIn,
          maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests,
@@ -34,6 +37,7 @@ final class RouterServer {
         } else {
             self.recordUsage = nil
         }
+        self.activityStore = activityStore
         self.onAutoFallback = onAutoFallback
         self.session = session
         self.extensionRegistry = extensionRegistry
@@ -44,6 +48,7 @@ final class RouterServer {
     func start(port: Int) throws {
         let router = self.router
         let recordUsage = self.recordUsage
+        let activityStore = self.activityStore
         let onAutoFallback = self.onAutoFallback
         let session = self.session
         let extensionRegistry = self.extensionRegistry
@@ -58,6 +63,7 @@ final class RouterServer {
                 // 导致 channelInactive 不触发、上游无法取消。串行化改由 ProxyHandler 负责。
                 ch.pipeline.configureHTTPServerPipeline(withPipeliningAssistance: false).flatMap {
                     ch.pipeline.addHandler(ProxyHandler(router: router, recordUsage: recordUsage,
+                                                        activityStore: activityStore,
                                                         session: session,
                                                         extensionRegistry: extensionRegistry,
                                                         maxPendingRequests: maxPendingRequests,
@@ -92,6 +98,7 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
 
     private let router: Router
     private let recordUsage: UsageRecorder?
+    private let activityStore: ActivityStore?
     private let onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)?
     private let session: URLSession
     private let extensionRegistry: ExtensionRegistry
@@ -104,12 +111,14 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
     private var closing = false
     private var disconnected = false
 
-    init(router: Router, recordUsage: UsageRecorder?, session: URLSession,
+    init(router: Router, recordUsage: UsageRecorder?, activityStore: ActivityStore?,
+         session: URLSession,
          extensionRegistry: ExtensionRegistry = .builtIn,
          maxPendingRequests: Int = RouterServer.defaultMaxPendingRequests,
          onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) {
         self.router = router
         self.recordUsage = recordUsage
+        self.activityStore = activityStore
         self.onAutoFallback = onAutoFallback
         self.session = session
         self.extensionRegistry = extensionRegistry
@@ -162,7 +171,8 @@ final class ProxyHandler: ChannelInboundHandler, @unchecked Sendable {
         let next = queue.removeFirst()
         task = Task {
             await RequestProcessor.process(channel: channel, head: next.head, body: next.body,
-                                           router: router, recordUsage: recordUsage, session: session,
+                                           router: router, recordUsage: recordUsage,
+                                           activityStore: activityStore, session: session,
                                            extensionRegistry: extensionRegistry,
                                            onAutoFallback: onAutoFallback)
             // 回到 event loop 串行化下一个请求（连接已关闭则不再调度）。
@@ -198,6 +208,7 @@ enum RequestProcessor {
 
     static func process(channel: Channel, head: HTTPRequestHead, body: ByteBuffer,
                         router: Router, recordUsage: UsageRecorder? = nil,
+                        activityStore: ActivityStore? = nil,
                         session: URLSession = Forwarder.session,
                         extensionRegistry: ExtensionRegistry = .builtIn,
                         onAutoFallback: (@Sendable (AutoFallbackEvent) -> Void)? = nil) async {
@@ -278,6 +289,8 @@ enum RequestProcessor {
             if let req = requested, router.hasFake(fakeModelID: req) {
                 Log.shared.log("502 [\(endpoint.rawValue)] model=\(req) 未绑定可用远端")
                 let message = "model '\(req)' has no usable remote (bind one via menu bar)"
+                recordEarlyFailure(activityStore, requested: req, endpoint: endpoint, method: head.method,
+                                   status: 502, reason: "no usable remote")
                 if isGemini {
                     await writeGeminiError(channel: channel, status: 502, message: message)
                 } else {
@@ -290,6 +303,8 @@ enum RequestProcessor {
                 let known = router.fakeIDs()
                 Log.shared.log("404 [\(endpoint.rawValue)] unknown model=\(requested ?? "(nil)") known=\(known)")
                 let message = "unknown model id '\(requested ?? "")'"
+                recordEarlyFailure(activityStore, requested: requested, endpoint: endpoint, method: head.method,
+                                   status: 404, reason: "unknown model")
                 if isGemini {
                     await writeGeminiError(channel: channel, status: 404, message: message)
                 } else {
@@ -311,6 +326,9 @@ enum RequestProcessor {
                 ? "model '\(fake.fakeModelID)' has no usable remote (bind one via menu bar)"
                 : "model '\(fake.fakeModelID)' 的候选模型均未启用 \(endpoint.displayName)"
             Log.shared.log("502 [\(endpoint.rawValue)] model=\(fake.fakeModelID) 无可用上游")
+            recordEarlyFailure(activityStore, requested: fake.fakeModelID, endpoint: endpoint,
+                               method: head.method, status: 502,
+                               reason: unbound ? "no usable remote" : "no candidate supports endpoint")
             if isGemini {
                 await writeGeminiError(channel: channel, status: 502, message: message)
             } else {
@@ -330,6 +348,13 @@ enum RequestProcessor {
         let requestID = UUID()
         let requestStarted = Date()
         let requestStartMonotonic = DispatchTime.now()
+        // 结构化实时活动埋点。defer 兜底保证恰好一次终结：早期失败/取消/断开都不会永久在途。
+        let activity = ActivityTracker(store: activityStore, requestID: requestID,
+                                       route: fake.fakeModelID,
+                                       routeName: fake.displayName.isEmpty ? fake.fakeModelID : fake.displayName,
+                                       endpoint: endpoint.rawValue, method: head.method.rawValue)
+        defer { activity.finishIfNeeded() }
+        activity.start(at: requestStarted)
         var headWritten = false
         var selected: (remote: RemoteModel, upstream: UpstreamResponse)?
         var selectedAdapter: ProtocolAdapter = .passthrough
@@ -341,6 +366,7 @@ enum RequestProcessor {
         for (index, candidate) in compatible.enumerated() {
             let remote = candidate.remote
             let adapter = candidate.adapter
+            let upstreamEndpoint: EndpointKind = adapter == .chatToResponses ? .chat : endpoint
             if let pending = pendingFallback {
                 pendingFallback = nil
                 // 连接已取消/断开就不再启动下一个候选，也不通知。
@@ -349,13 +375,23 @@ enum RequestProcessor {
                                                   from: pending.from,
                                                   to: remote.routeLabel,
                                                   reason: pending.reason))
+                // 回退只追加轨迹，绝不终结请求（请求保持 inFlight/receiving）。
+                let fallbackReason: ActivityFallbackReason
+                switch pending.reason {
+                case .httpStatus(let code): fallbackReason = .httpStatus(code)
+                case .connectionFailure: fallbackReason = .connectionFailure
+                }
+                activity.fallback(from: pending.from, to: remote.routeLabel,
+                                  reason: fallbackReason, at: Date())
             }
             let attempt = index + 1
             let attemptStarted = Date()
             // 单调起点在建请求之前捕获：TTFT 覆盖连接/建包/桥接准备，且不会
             // 因上游 body 被 URLSession 后台预读而失真。
             let attemptStartMonotonic = DispatchTime.now()
-            let endpointBaseURL = remote.endpointSetting(for: adapter == .chatToResponses ? .chat : endpoint).baseURL
+            activity.startAttempt(attempt: attempt, remote: remote,
+                                  upstreamEndpoint: upstreamEndpoint, at: attemptStarted)
+            let endpointBaseURL = remote.endpointSetting(for: upstreamEndpoint).baseURL
             Log.shared.log("[\(endpoint.rawValue)] \(head.method) \(path) model=\(fake.fakeModelID) → \(remote.name) \(hostOf(endpointBaseURL))/\(remote.model)")
             do {
                 let upstream = try await Forwarder.makeRequest(clientHead: head, body: bodyData,
@@ -380,6 +416,11 @@ enum RequestProcessor {
                                       started: attemptStarted, tokens: upstream.usage?.tokens,
                                       performance: upstream.performance?.performance)
                     }
+                    // 只记短标签，绝不落任何上游错误正文（正文仅进 log）。
+                    activity.finishAttempt(attempt: attempt, outcome: .httpError, statusCode: status,
+                                           reason: "HTTP \(status)",
+                                           tokens: upstream.usage?.tokens ?? UsageTokens(),
+                                           performance: upstream.performance?.performance)
                     upstream.cancel()
                     if Task.isCancelled { return }
                     if account {
@@ -397,7 +438,11 @@ enum RequestProcessor {
                 lastError = error
                 // 请求本身在发往上游前就被拒绝（Responses 转换 / 连接器适配）：没有
                 // HTTP attempt，不算可计费，直接返回客户端错误，不回退。
-                if isClientError(error) { break }
+                if isClientError(error) {
+                    activity.finishAttempt(attempt: attempt, outcome: .clientError, statusCode: nil,
+                                           reason: "clientError", tokens: UsageTokens(), performance: nil)
+                    break
+                }
                 if Task.isCancelled || error is CancellationError {
                     // 取消不再 fallback 到下一个供应商，只记录这一次尝试
                     if account {
@@ -406,6 +451,8 @@ enum RequestProcessor {
                                       attempt: attempt, status: nil, outcome: "cancelled",
                                       started: attemptStarted, tokens: nil, performance: nil)
                     }
+                    activity.finishAttempt(attempt: attempt, outcome: .cancelled, statusCode: nil,
+                                           reason: nil, tokens: UsageTokens(), performance: nil)
                     return
                 }
                 let nsError = error as NSError
@@ -426,11 +473,17 @@ enum RequestProcessor {
                                            reason: .connectionFailure)
                     }
                 }
+                // 只存域+码，不存 error 描述（可能含 URL/query）。
+                activity.finishAttempt(attempt: attempt, outcome: .networkError, statusCode: nil,
+                                       reason: "\(nsError.domain)(\(nsError.code))",
+                                       tokens: UsageTokens(), performance: nil)
             }
         }
         guard let (remote, upstream) = selected else {
             let status = isClientError(lastError) ? 400 : 502
             let message = "upstream: \(lastError.map(String.init(describing:)) ?? "no usable remote")"
+            activity.fail(statusCode: status,
+                          reason: isClientError(lastError) ? "clientError" : "no usable upstream")
             if isGemini {
                 await writeGeminiError(channel: channel, status: status, message: message)
             } else {
@@ -480,6 +533,7 @@ enum RequestProcessor {
                 headWritten = true
 
                 var bytes = 0
+                var sawFirstResponse = false
                 var iterator = upstream.body.makeAsyncIterator()
                 while let chunk = try await iterator.next() {
                     if Task.isCancelled { break }
@@ -490,6 +544,11 @@ enum RequestProcessor {
                         }
                     }
                     bytes += try await write(chunk)
+                    // 首个响应字节开始转发（含 SSE 心跳/role 帧；不代表首字内容）。
+                    if !sawFirstResponse, bytes > 0 {
+                        sawFirstResponse = true
+                        activity.responseStarted(at: Date())
+                    }
                 }
                 if let reorderer {
                     for block in reorderer.finish() {
@@ -502,6 +561,10 @@ enum RequestProcessor {
                     if s.releasedAtFinish > 0 || s.overflowFlushes > 0 {
                         Log.shared.log("[\(endpoint.rawValue)] SSE reorder: 流结束时仍有 \(s.releasedAtFinish) 个事件被扣住（上游流不完整），强制放行 \(s.overflowFlushes) 次")
                     }
+                }
+                if !sawFirstResponse, bytes > 0 {
+                    sawFirstResponse = true
+                    activity.responseStarted(at: Date())
                 }
                 if Task.isCancelled {
                     outcome = "cancelled"
@@ -549,6 +612,17 @@ enum RequestProcessor {
                           started: selectedStarted, tokens: upstream.usage?.tokens,
                           performance: upstream.performance?.performance)
         }
+        // 活动终结与是否记账无关（countTokens 也终结）。选中 attempt 的 tokens/性能此时才完整。
+        let terminalReason: String?
+        switch outcome {
+        case "httpError": terminalReason = "HTTP \(upstream.response.statusCode)"
+        case "streamError": terminalReason = "streamError"
+        default: terminalReason = nil
+        }
+        activity.complete(attempt: selectedAttempt, statusCode: upstream.response.statusCode,
+                          outcome: outcome, reason: terminalReason,
+                          tokens: upstream.usage?.tokens ?? UsageTokens(),
+                          performance: upstream.performance?.performance, at: Date())
     }
 
     /// 请求级客户端错误：请求体本身不被适配器接受，应在发往上游前返回 400 且不回退。
@@ -559,6 +633,23 @@ enum RequestProcessor {
         if let failure = error as? any ClientRequestFailure { return failure.clientError }
         if let error = error as? ResponseTranslationError { return error.clientError }
         return false
+    }
+
+    /// 早期路由失败（未知模型 / 未绑定远端 / 无候选）也必须终结活动，避免永久在途。
+    /// `reason` 只传短标签，不含正文/URL/凭据。
+    private static func recordEarlyFailure(_ store: ActivityStore?, requested: String?,
+                                           endpoint: EndpointKind, method: HTTPMethod,
+                                           status: Int, reason: String) {
+        guard let store else { return }
+        let id = UUID()
+        let now = Date()
+        let route = requested ?? ""
+        store.start(ActivityRequestStart(requestID: id, route: route, routeName: route,
+                                         endpoint: endpoint.rawValue, method: method.rawValue,
+                                         startedAt: now))
+        store.finish(requestID: id, status: .failed, outcome: "routerError", statusCode: status,
+                     reason: reason, selectedAttempt: nil, tokens: UsageTokens(),
+                     performance: nil, at: Date())
     }
 
     /// 记录一次上游尝试。record 非阻塞、不抛错；null-ish 计数字段保持 nil（不猜）。
@@ -697,5 +788,114 @@ enum RequestProcessor {
                                     status: HTTPResponseStatus(statusCode: response.statusCode),
                                     headers: headers)
         try await channel.writeAndFlush(HTTPServerResponsePart.head(head)).get()
+    }
+}
+
+/// 单请求活动埋点：集中 route/endpoint 上下文，并保证恰好一次终结。
+/// 只在处理该请求的单个 Task 上访问，不需要额外加锁；`store` 为 nil 时全部 no-op。
+/// 传入 store 的一律是短标签（无正文/URL/query/凭据）。
+private final class ActivityTracker {
+    private let store: ActivityStore?
+    private let requestID: UUID
+    private let route: String
+    private let routeName: String
+    private let endpoint: String
+    private let method: String
+    private var started = false
+    private var finished = false
+
+    init(store: ActivityStore?, requestID: UUID, route: String, routeName: String,
+         endpoint: String, method: String) {
+        self.store = store
+        self.requestID = requestID
+        self.route = route
+        self.routeName = routeName
+        self.endpoint = endpoint
+        self.method = method
+    }
+
+    func start(at date: Date) {
+        guard let store, !started else { return }
+        started = true
+        store.start(ActivityRequestStart(requestID: requestID, route: route, routeName: routeName,
+                                         endpoint: endpoint, method: method, startedAt: date))
+    }
+
+    func startAttempt(attempt: Int, remote: RemoteModel, upstreamEndpoint: EndpointKind, at date: Date) {
+        guard let store, started, !finished else { return }
+        store.startAttempt(ActivityAttemptStart(requestID: requestID, attempt: attempt,
+                                                remoteID: remote.id.uuidString,
+                                                provider: splitProviderModel(remote.name).provider,
+                                                model: remote.model,
+                                                label: remote.routeLabel,
+                                                source: remote.source.rawValue,
+                                                endpoint: upstreamEndpoint.rawValue,
+                                                startedAt: date))
+    }
+
+    func finishAttempt(attempt: Int, outcome: ActivityAttemptOutcome, statusCode: Int?,
+                       reason: String?, tokens: UsageTokens, performance: UsagePerformance?) {
+        guard let store, started, !finished else { return }
+        store.finishAttempt(requestID: requestID, attempt: attempt, outcome: outcome,
+                            statusCode: statusCode, reason: reason, tokens: tokens,
+                            performance: performance, at: Date())
+    }
+
+    func responseStarted(at date: Date) {
+        guard let store, started, !finished else { return }
+        store.responseStarted(requestID: requestID, at: date)
+    }
+
+    func fallback(from: String, to: String, reason: ActivityFallbackReason, at date: Date) {
+        guard let store, started, !finished else { return }
+        store.fallback(requestID: requestID, from: from, to: to, reason: reason, at: date)
+    }
+
+    /// 无候选可用/客户端错误等收尾失败。
+    /// 仍 pending 的尝试表示从未拿到响应头，故以 `.networkError` 终结（无对应的通用失败枚举）。
+    func fail(statusCode: Int?, reason: String?) {
+        guard let store, started, !finished else { return }
+        store.finishPendingAttempts(requestID: requestID, outcome: .networkError, at: Date())
+        store.finish(requestID: requestID, status: .failed, outcome: "routerError",
+                     statusCode: statusCode, reason: reason, selectedAttempt: nil,
+                     tokens: UsageTokens(), performance: nil, at: Date())
+        finished = true
+    }
+
+    /// 选中 attempt 的终态：先终结该 attempt，再终结请求。
+    /// `outcome` 与 `UsageRecord.outcome` 同口径（success/httpError/streamError/cancelled）。
+    func complete(attempt: Int, statusCode: Int?, outcome: String, reason: String?,
+                  tokens: UsageTokens, performance: UsagePerformance?, at date: Date) {
+        guard let store, started, !finished else { return }
+        let attemptOutcome: ActivityAttemptOutcome
+        let status: ActivityStatus
+        switch outcome {
+        case "success": attemptOutcome = .success; status = .succeeded
+        case "cancelled": attemptOutcome = .cancelled; status = .cancelled
+        case "streamError": attemptOutcome = .streamError; status = .failed
+        default: attemptOutcome = .httpError; status = .failed
+        }
+        store.finishAttempt(requestID: requestID, attempt: attempt, outcome: attemptOutcome,
+                            statusCode: statusCode, reason: reason, tokens: tokens,
+                            performance: performance, at: date)
+        store.finish(requestID: requestID, status: status, outcome: outcome, statusCode: statusCode,
+                     reason: reason, selectedAttempt: attempt, tokens: tokens,
+                     performance: performance, at: date)
+        finished = true
+    }
+
+    /// defer 兜底：任何未显式终结的路径（取消 / 客户端断开 / 提前 return）都在此终结。
+    /// 先终结仍 pending 的尝试，避免详情停留在 pending；取消（Task.isCancelled）记为
+    /// cancelled，其余记为 failed，杜绝永久在途。
+    func finishIfNeeded() {
+        guard let store, started, !finished else { return }
+        let cancelled = Task.isCancelled
+        store.finishPendingAttempts(requestID: requestID,
+                                    outcome: cancelled ? .cancelled : .networkError, at: Date())
+        store.finish(requestID: requestID, status: cancelled ? .cancelled : .failed,
+                     outcome: cancelled ? "cancelled" : "routerError", statusCode: nil,
+                     reason: cancelled ? nil : "incomplete", selectedAttempt: nil,
+                     tokens: UsageTokens(), performance: nil, at: Date())
+        finished = true
     }
 }

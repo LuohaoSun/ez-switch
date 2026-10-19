@@ -6,6 +6,8 @@ import SwiftUI
 enum CollapsibleMetrics {
     static let separator: CGFloat = 1
     static let supplierSeparatorTop: CGFloat = 6
+    static let supplierListTop: CGFloat = 10
+    static let supplierSelectionInset: CGFloat = 10
 
     static let routeSeparatorTop: CGFloat = 6
     static let routeListTop: CGFloat = 4
@@ -20,7 +22,7 @@ enum CollapsibleMetrics {
     /// 表格高度未量到前返回 0（首帧后回填，回填不触发动画）。
     static func supplierBodyHeight(tableHeight: CGFloat) -> CGFloat {
         guard tableHeight > 0 else { return 0 }
-        return separator + supplierSeparatorTop + tableHeight
+        return separator + supplierSeparatorTop + supplierListTop + tableHeight
     }
 
     static func routeBodyHeight(candidateCount: Int, rowHeight: CGFloat = CollapsibleMetrics.routeRowHeight) -> CGFloat {
