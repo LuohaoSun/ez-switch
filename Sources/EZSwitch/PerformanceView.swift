@@ -3,7 +3,8 @@ import SwiftUI
 /// 性能统计视图，嵌在「用量」页内，与用量共用时间区间筛选。
 ///
 /// 顶部三张平均指标卡（平均 TTFT、平均 TPS 含 TTFT、平均 TPS 不含 TTFT，各带独立样本数），
-/// 下方是可切换分组（路由 / 供应商 / 模型）与排序字段的比较表。
+/// 下方是可切换分组（路由 / 供应商 / 模型）的比较表；排序不占控件，直接点击列头：
+/// 点击某列按其默认方向排序，再次点击同一列反向，当前排序列显示方向箭头。
 /// 路由维度的 TTFT / 含 TTFT 的 TPS 是含自动回退的请求口径；供应商 / 模型维度是单次上游尝试口径；
 /// 不含 TTFT 的 TPS 两个维度共用同一字段。顶部总览固定为请求口径（与旧的 overall requestTTFT 一致）。
 struct PerformanceView: View {
@@ -158,7 +159,7 @@ struct PerformanceView: View {
     private var comparisonCard: some View {
         let rows = model.sortedPerformanceGroups
         return VStack(alignment: .leading, spacing: 0) {
-            // 与用量明细同一层级：标题、分组 segmented 紧邻，Spacer 后是排序字段/方向与项数。
+            // 与用量明细同一层级：标题、分组 segmented 紧邻；排序不再占用控件，改为点击列头。
             HStack(spacing: 12) {
                 Text("性能明细").font(.headline)
 
@@ -175,26 +176,7 @@ struct PerformanceView: View {
 
                 Spacer(minLength: 8)
 
-                Picker("排序", selection: $model.performanceSortKey) {
-                    ForEach(PerformanceSortKey.allCases) { key in
-                        Text(key.title(for: model.performanceGrouping)).tag(key)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
-                .accessibilityLabel("排序字段")
-                .help("排序字段：\(model.performanceSortKey.title(for: model.performanceGrouping))")
-
-                Button {
-                    model.performanceSortAscending.toggle()
-                } label: {
-                    Label(model.performanceSortAscending ? "升序" : "降序",
-                          systemImage: model.performanceSortAscending ? "arrow.up" : "arrow.down")
-                }
-                .help(model.performanceSortAscending ? "当前升序：小值在前，未测/未知置后"
-                                                     : "当前降序：大值在前，未测/未知置后")
-
+                Text("点击列头排序").font(.caption).foregroundStyle(.tertiary)
                 Text("\(rows.count) 项").font(.caption).foregroundStyle(.secondary)
             }
             .padding(.bottom, 10)
@@ -234,12 +216,52 @@ struct PerformanceView: View {
         .padding(.bottom, 6)
     }
 
+    /// 列头即排序入口：点击按该列排序，再次点击反向；当前排序列右侧显示方向箭头。
     private func headerCell(_ key: PerformanceSortKey) -> some View {
-        Text(key.columnTitle(for: model.performanceGrouping))
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
+        let isActive = model.isPerformanceSortActive(key)
+        return Button {
+            model.togglePerformanceSort(key)
+        } label: {
+            HStack(spacing: 4) {
+                Text(key.columnTitle(for: model.performanceGrouping))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                sortArrow(for: key)
+            }
             .frame(width: columnWidth, alignment: .trailing)
-            .help(columnHelp(key))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(headerHelp(key))
+        .accessibilityLabel("按\(key.columnTitle(for: model.performanceGrouping))排序")
+        .accessibilityValue(isActive
+                            ? (model.performanceSortAscending ? "已按升序排列" : "已按降序排列")
+                            : "未排序")
+    }
+
+    /// 简洁排序箭头：只标当前排序列；隐藏时保留同宽占位，避免列表横向跳动。
+    private func sortArrow(for key: PerformanceSortKey) -> some View {
+        let isActive = model.isPerformanceSortActive(key)
+        return Image(systemName: model.performanceSortAscending ? "arrow.up" : "arrow.down")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(isActive ? Color.primary : Color.clear)
+            .frame(width: 9)
+            .accessibilityHidden(true)
+    }
+
+    /// 列口径 + 点击排序提示（当前方向 / 新列默认方向、未测置后）合成一个 tooltip。
+    private func headerHelp(_ key: PerformanceSortKey) -> String {
+        let sortHint: String
+        if model.isPerformanceSortActive(key) {
+            sortHint = model.performanceSortAscending
+                ? "当前升序（小值在前），点击改为降序"
+                : "当前降序（大值在前），点击改为升序"
+        } else {
+            sortHint = key.defaultAscending
+                ? "点击排序，默认升序（小值在前）"
+                : "点击排序，默认降序（大值在前）"
+        }
+        return "\(columnHelp(key))\n\(sortHint)；未测/未知恒定置后。"
     }
 
     /// 列口径进入表头 tooltip，替代原先独立的分组说明行。

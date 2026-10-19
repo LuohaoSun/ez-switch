@@ -83,6 +83,7 @@ struct ConfigStoreTests {
         store.moveProviders(sources: ["Alpha"], before: "Missing")
         store.moveProviders(sources: ["Missing"], before: nil)
         #expect(store.config.remotes.map(\.id) == [aOne.id, aTwo.id, beta.id, gamma.id])
+        store.flushPendingConfigWrites()
         let reloaded = ConfigStore(configURL: store.configURL)
         #expect(reloaded.config.remotes.map(\.id) == [aOne.id, aTwo.id, beta.id, gamma.id])
         #expect(reloaded.groupedRemotes().map(\.provider) == ["Alpha", "Beta", "Gamma"])

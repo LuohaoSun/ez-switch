@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import EZSwitch
 
-/// 性能视图的排序、格式化、空态判定与刷新竞态。
+/// 性能视图的排序（含列头点击）、格式化、空态判定与刷新竞态。
 ///
 /// 数据源通过闭包注入 `refreshPerformance`，因此无需真实 SQLite 即可覆盖竞态与失败路径。
 @MainActor
@@ -153,6 +153,145 @@ struct PerformanceViewModelTests {
         #expect(PerformanceSortKey.ttftMean.title(for: .model) == "平均TTFT")
         #expect(PerformanceSortKey.tpsIncludingTTFT.title(for: .route) == "平均TPS(含TTFT)")
         #expect(PerformanceSortKey.tpsExcludingTTFT.columnTitle(for: .model) == "平均TPS(不含TTFT)")
+    }
+
+    /// 同值 tie-break 与方向无关：先按标题，再按 id；点列头反复切换也不会抖动。
+    @Test func tiesBreakByTitleThenIDRegardlessOfDirection() {
+        let rows = [makeRow("zeta", tpsExcluding: 50), makeRow("alpha", tpsExcluding: 50)]
+        for ascending in [true, false] {
+            let sorted = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT,
+                                                grouping: .model, ascending: ascending)
+            #expect(sorted.map(\.title) == ["alpha", "zeta"])
+        }
+    }
+
+    @Test func tiesBreakByIDWhenTitlesMatch() {
+        var first = makeRow("dup", tpsExcluding: 50)
+        first.id = "b-id"
+        var second = makeRow("dup", tpsExcluding: 50)
+        second.id = "a-id"
+
+        let sorted = PerformanceSort.sorted([first, second], by: .tpsExcludingTTFT,
+                                             grouping: .model, ascending: false)
+        #expect(sorted.map(\.id) == ["a-id", "b-id"])
+    }
+
+    /// 非有限值（NaN / 无穷）与 nil 同样视为未知：既不参与比较，也不随排序算法漂移。
+    @Test func nonFiniteValuesSortAsUnknownAndStayLast() {
+        let rows = [
+            makeRow("nan", tpsExcluding: .nan),
+            makeRow("slow", tpsExcluding: 10),
+            makeRow("infinite", tpsExcluding: .infinity),
+            makeRow("fast", tpsExcluding: 90),
+            makeRow("none"),
+        ]
+
+        let ascending = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT,
+                                               grouping: .model, ascending: true)
+        #expect(ascending.map(\.title) == ["slow", "fast", "infinite", "nan", "none"])
+
+        let descending = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT,
+                                                grouping: .model, ascending: false)
+        #expect(descending.map(\.title) == ["fast", "slow", "infinite", "nan", "none"])
+    }
+
+    // MARK: - 列头点击排序
+
+    /// 首次点击某列用该列默认方向：延迟类越小越好（升序），吞吐类越大越好（降序）。
+    @Test func columnDefaultsPutTheBetterValueFirst() {
+        #expect(PerformanceSortKey.ttftMean.defaultAscending)
+        #expect(!PerformanceSortKey.tpsIncludingTTFT.defaultAscending)
+        #expect(!PerformanceSortKey.tpsExcludingTTFT.defaultAscending)
+    }
+
+    /// 换列用该列默认方向（不沿用上一列方向）；同列再点反向，键保持不变。
+    @Test func clickingColumnSwitchesThenReverses() {
+        let model = UsageViewModel()
+        #expect(model.performanceSortKey == .ttftMean)
+        #expect(model.performanceSortAscending)
+
+        model.togglePerformanceSort(.tpsExcludingTTFT)
+        #expect(model.performanceSortKey == .tpsExcludingTTFT)
+        #expect(!model.performanceSortAscending)          // 吞吐列默认降序
+
+        model.togglePerformanceSort(.tpsExcludingTTFT)
+        #expect(model.performanceSortKey == .tpsExcludingTTFT)
+        #expect(model.performanceSortAscending)           // 同列再点反向
+
+        model.togglePerformanceSort(.ttftMean)
+        #expect(model.performanceSortKey == .ttftMean)
+        #expect(model.performanceSortAscending)           // 回到该列默认，而非沿用上一列方向
+
+        model.togglePerformanceSort(.ttftMean)
+        #expect(!model.performanceSortAscending)
+    }
+
+    @Test func sortActiveFlagFollowsClickedColumn() {
+        let model = UsageViewModel()
+        #expect(model.isPerformanceSortActive(.ttftMean))
+        #expect(!model.isPerformanceSortActive(.tpsIncludingTTFT))
+
+        model.togglePerformanceSort(.tpsIncludingTTFT)
+        #expect(model.isPerformanceSortActive(.tpsIncludingTTFT))
+        #expect(!model.isPerformanceSortActive(.ttftMean))
+    }
+
+    /// 点击列头后的真实行序：TTFT 默认升序、同列再点降序，换 TPS 列用降序默认。
+    @Test func sortedPerformanceGroupsFollowHeaderClicks() async {
+        let model = UsageViewModel()
+        var snapshot = PerformanceSnapshot()
+        snapshot.groups = [
+            makeRow("slow", ttftMean: 300, tpsExcluding: 90),
+            makeRow("fast", ttftMean: 100, tpsExcluding: 10),
+        ]
+        await load(snapshot, into: model)
+
+        // 默认按平均 TTFT 升序（快者在前，与总览"越小越好"一致）。
+        #expect(model.sortedPerformanceGroups.map(\.title) == ["fast", "slow"])
+
+        model.togglePerformanceSort(.ttftMean)
+        #expect(model.sortedPerformanceGroups.map(\.title) == ["slow", "fast"])
+
+        model.togglePerformanceSort(.tpsExcludingTTFT)
+        #expect(model.sortedPerformanceGroups.map(\.title) == ["slow", "fast"])   // 吞吐默认降序
+
+        model.togglePerformanceSort(.tpsExcludingTTFT)
+        #expect(model.sortedPerformanceGroups.map(\.title) == ["fast", "slow"])
+    }
+
+    /// 无论点哪一列、朝哪个方向，未测/未知行恒定排在最后（不因降序被顶到前面）。
+    @Test func headerClicksKeepUnknownRowsLastInBothDirections() async {
+        let model = UsageViewModel()
+        var snapshot = PerformanceSnapshot()
+        snapshot.groups = [
+            makeRow("measured-slow", tpsExcluding: 10),
+            makeRow("unknown"),
+            makeRow("measured-fast", tpsExcluding: 90),
+        ]
+        await load(snapshot, into: model)
+
+        model.togglePerformanceSort(.tpsExcludingTTFT)
+        #expect(model.sortedPerformanceGroups.map(\.title) == ["measured-fast", "measured-slow", "unknown"])
+
+        model.togglePerformanceSort(.tpsExcludingTTFT)
+        #expect(model.sortedPerformanceGroups.map(\.title) == ["measured-slow", "measured-fast", "unknown"])
+    }
+
+    /// 点列头排序不改变分组、也不触发重新查询（排序只在本地派生行序）。
+    @Test func headerClicksDoNotChangeGroupingOrReloadKey() async {
+        let model = UsageViewModel()
+        var snapshot = PerformanceSnapshot()
+        snapshot.summary.attempts = 4
+        snapshot.groups = [makeRow("a", ttftMean: 1), makeRow("b", ttftMean: 2)]
+        await load(snapshot, into: model)
+
+        let reloadKey = model.reloadKey
+        model.togglePerformanceSort(.tpsIncludingTTFT)
+        model.togglePerformanceSort(.tpsIncludingTTFT)
+
+        #expect(model.performanceGrouping == .model)
+        #expect(model.reloadKey == reloadKey)
+        #expect(model.performanceSnapshot.summary.attempts == 4)
     }
 
     // MARK: - 格式化

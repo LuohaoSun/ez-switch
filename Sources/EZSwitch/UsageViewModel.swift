@@ -228,6 +228,15 @@ enum PerformanceSortKey: String, CaseIterable, Identifiable {
 
     /// 表格表头与卡片同名，保持口径名词唯一。
     func columnTitle(for grouping: UsageGrouping) -> String { title(for: grouping) }
+
+    /// 首次点击该列时的默认方向：按"越好越靠前"取值——
+    /// 延迟类（TTFT）越小越好，用升序；吞吐类（TPS）越大越好，用降序。
+    var defaultAscending: Bool {
+        switch self {
+        case .ttftMean: return true
+        case .tpsIncludingTTFT, .tpsExcludingTTFT: return false
+        }
+    }
 }
 
 /// 排序取值与比较：nil（未测/未知）恒定排在最后，与升降序无关；同值时按标题稳定排序。
@@ -246,13 +255,23 @@ enum PerformanceSort {
         }
     }
 
+    /// 排序专用取值：非有限值（NaN / 无穷）与 nil 同样视为未知。
+    /// 否则 NaN 的每次比较都为 false，会破坏严格弱序、让顺序随排序算法内部实现漂移。
+    private static func sortableValue(_ key: PerformanceSortKey,
+                                      row: PerformanceGroupRow,
+                                      grouping: UsageGrouping) -> Double? {
+        guard let value = value(key, row: row, grouping: grouping), value.isFinite else { return nil }
+        return value
+    }
+
+    /// 按列与方向排序：nil（含非有限值）恒定置后；同值按标题、再按 id 稳定 tie-break。
     static func sorted(_ rows: [PerformanceGroupRow],
                        by key: PerformanceSortKey,
                        grouping: UsageGrouping,
                        ascending: Bool) -> [PerformanceGroupRow] {
         rows.sorted { lhs, rhs in
-            let a = value(key, row: lhs, grouping: grouping)
-            let b = value(key, row: rhs, grouping: grouping)
+            let a = sortableValue(key, row: lhs, grouping: grouping)
+            let b = sortableValue(key, row: rhs, grouping: grouping)
             switch (a, b) {
             case let (x?, y?):
                 if x != y { return ascending ? x < y : x > y }
@@ -372,6 +391,21 @@ final class UsageViewModel: ObservableObject {
                                by: performanceSortKey,
                                grouping: performanceGrouping,
                                ascending: performanceSortAscending)
+    }
+
+    /// 点表头排序：同一列再次点击反向；切换到新列时用该列的默认方向（越大越好者降序，越小越好者升序）。
+    func togglePerformanceSort(_ key: PerformanceSortKey) {
+        guard performanceSortKey == key else {
+            performanceSortKey = key
+            performanceSortAscending = key.defaultAscending
+            return
+        }
+        performanceSortAscending.toggle()
+    }
+
+    /// 该列当前是否正被用于排序（用于表头箭头显隐）。
+    func isPerformanceSortActive(_ key: PerformanceSortKey) -> Bool {
+        performanceSortKey == key
     }
 
     /// 区间内完全没有转发尝试记录（与"有历史但无性能样本"区分开）。

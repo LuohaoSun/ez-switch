@@ -51,6 +51,19 @@ struct RouteWorkspaceView: View {
         NativeWorkspaceSplit(suppliers: supplierPanel, routes: routePanel)
             .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
         .navigationTitle("供应商与路由")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button("添加供应商") { ui.sheet = .newProvider }
+                    Button("添加路由") { ui.sheet = .route(nil) }
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .menuIndicator(.hidden)
+                .help("添加供应商或路由")
+                .accessibilityLabel("添加")
+            }
+        }
         .sheet(item: $ui.sheet) { target in
             switch target {
             case .newProvider:
@@ -71,6 +84,15 @@ struct RouteWorkspaceView: View {
                     ModelCatalogSheet(store: store, provider: name, remote: remote)
                 }
             }
+        }
+        .alert("配置未保存", isPresented: Binding(
+            get: { store.configSaveError != nil },
+            set: { if !$0 { store.configSaveError = nil } }
+        )) {
+            Button("重试保存") { store.save() }
+            Button("关闭", role: .cancel) { store.configSaveError = nil }
+        } message: {
+            Text(store.configSaveError ?? "")
         }
         .alert("删除供应商？", isPresented: Binding(
             get: { ui.providerToDelete != nil }, set: { if !$0 { ui.providerToDelete = nil } }
@@ -101,14 +123,6 @@ struct RouteWorkspaceView: View {
             HStack {
                 Text("供应商与模型").font(.headline)
                 Spacer()
-                Button { ui.sheet = .newProvider } label: {
-                    Image(systemName: "plus")
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .help("添加供应商")
-                .accessibilityLabel("添加供应商")
             }
             TextField("搜索供应商或模型", text: $ui.query)
                 .textFieldStyle(.roundedBorder)
@@ -150,13 +164,7 @@ struct RouteWorkspaceView: View {
                 }
             } accessory: {
                 Menu {
-                    Button("获取模型列表…") { ui.sheet = .catalog(group.provider) }
-                    Button("添加模型…") {
-                        if let first = group.remotes.first { ui.sheet = .newModel(first.id) }
-                    }
-                    Button("编辑供应商…") { ui.sheet = .provider(group.provider) }
-                    Divider()
-                    Button("删除供应商…", role: .destructive) { ui.providerToDelete = group.provider }
+                    providerMenu(group)
                 } label: {
                     Image(systemName: "ellipsis")
                         .frame(width: 28, height: 24)
@@ -166,6 +174,8 @@ struct RouteWorkspaceView: View {
                 .help("管理 \(group.provider)")
                 .accessibilityLabel("管理 \(group.provider) 供应商")
             }
+            .contentShape(Rectangle())
+            .contextMenu { providerMenu(group) }
             if let connector = unavailableConnector(group) {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle").font(.caption)
@@ -179,7 +189,9 @@ struct RouteWorkspaceView: View {
             CollapsibleBody(isExpanded: expanded,
                             expandedHeight: CollapsibleMetrics.supplierBodyHeight(
                                 tableHeight: ui.supplierTableHeights[group.provider] ?? 0)) {
-                Divider().padding(.top, CollapsibleMetrics.supplierSeparatorTop)
+                Divider()
+                    .padding(.horizontal, CollapsibleMetrics.supplierSelectionInset)
+                    .padding(.top, CollapsibleMetrics.supplierSeparatorTop)
                 NativeSupplierModelList(
                     items: group.remotes.map {
                         SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: $0.needsCredentials)
@@ -202,6 +214,7 @@ struct RouteWorkspaceView: View {
                     },
                     isInteractive: expanded
                 )
+                .padding(.top, CollapsibleMetrics.supplierListTop)
             } collapsed: {
                 // 供应商卡片收起时不保留摘要，与原有行为一致。
                 EmptyView()
@@ -211,6 +224,25 @@ struct RouteWorkspaceView: View {
         .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private func providerMenu(_ group: RemoteGroup) -> some View {
+        Button("获取模型列表…") { ui.sheet = .catalog(group.provider) }
+        Button("添加模型…") {
+            if let first = group.remotes.first { ui.sheet = .newModel(first.id) }
+        }
+        Button("编辑供应商…") { ui.sheet = .provider(group.provider) }
+        Divider()
+        Button("删除供应商…", role: .destructive) { ui.providerToDelete = group.provider }
+    }
+
+    @ViewBuilder
+    private func routeMenu(_ fake: FakeModel) -> some View {
+        Button("编辑路由 ID…") { ui.sheet = .route(fake.id) }
+        Button("复制路由 ID") { copyText(fake.fakeModelID) }
+        Divider()
+        Button("删除路由…", role: .destructive) { ui.routeToDelete = fake.id }
     }
 
     /// 扩展连接器供应商：连接由扩展/CLI 提供，native 端点恒关闭。返回不可用时用于提示的
@@ -241,14 +273,6 @@ struct RouteWorkspaceView: View {
             HStack {
                 Text("路由 ID").font(.title2.bold())
                 Spacer()
-                Button { ui.sheet = .route(nil) } label: {
-                    Image(systemName: "plus")
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .help("添加路由")
-                .accessibilityLabel("添加路由")
             }
             if store.config.fakes.isEmpty {
                 EmptyState(title: "添加第一条路由", detail: "创建客户端模型 ID，然后从左侧拖入模型。", symbol: "arrow.triangle.branch")
@@ -283,10 +307,7 @@ struct RouteWorkspaceView: View {
                         set: { store.setRouteTargets(fakeID: fake.id, remoteIDs: fake.orderedRemoteIDs, autoFallback: $0) }
                     )).toggleStyle(.switch).controlSize(.small)
                     Menu {
-                        Button("编辑路由 ID…") { ui.sheet = .route(fake.id) }
-                        Button("复制路由 ID") { copyText(fake.fakeModelID) }
-                        Divider()
-                        Button("删除路由…", role: .destructive) { ui.routeToDelete = fake.id }
+                        routeMenu(fake)
                     } label: {
                         Image(systemName: "ellipsis")
                             .frame(width: 28, height: 24)
@@ -296,6 +317,8 @@ struct RouteWorkspaceView: View {
                     .accessibilityLabel("管理路由 \(fake.fakeModelID)")
                 }
             }
+            .contentShape(Rectangle())
+            .contextMenu { routeMenu(fake) }
             .padding(.horizontal, 14)
             .padding(.top, 10)
             CollapsibleBody(isExpanded: expanded,

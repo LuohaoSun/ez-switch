@@ -13,8 +13,12 @@ import Foundation
 ///     86 response.output_text.delta   idx=1             ← 活跃项已错位 → Codex 丢弃增量
 ///
 /// Codex 报 `OutputTextDelta without active item` 并丢弃这些增量，表现为流式渲染缺字。
-/// 本组件把每个输出项的 added…done 区间收拢成原子块再按序放出：某项未收尾前，它后面
-/// 的事件一律扣住。事件流本就规范时（无交错）输入 = 输出，是恒等变换。
+///
+/// 本组件只在**真的发生跨项交错**时才暂存：当前活跃输出项（`groupOrder` 中最早的未收尾项）
+/// 的 added/delta/done 一律即时放出，首字与增量延迟不被缓冲；只有后一项在前一项收尾之前
+/// 提前开场时，它及其后续事件才被扣住。前一项 done 一放出，后一项已到的事件立即随之放出
+/// （即使后一项自身还没 done），其后增量继续即时流式。事件流本就规范时（无交错）输入 = 输出，
+/// 是恒等变换。
 ///
 /// 只用于 `/v1/responses` 的 text/event-stream 响应；chat / messages 端点不经过这里。
 /// 重排会让上游 `sequence_number` 乱序，因此写出的每个事件按输出顺序统一重编号。
@@ -27,9 +31,18 @@ final class SSEReorderer {
         let closesItem: Bool    // payload.type == response.output_item.done
     }
 
-    private var pending: [Event] = []
-    private var knownIndexes: Set<Int> = []     // 见过的输出项（含已收尾的）
+    /// 暂存项。无归属事件额外记录"放行前需先完全放出的组数"（到达时已开场的组数），
+    /// 以保持它与输出项的先后关系——不这样的话活跃组被扣住时 `completed` 会抢跑到前面。
+    private struct Buffered {
+        let event: Event
+        let requiresGroups: Int
+    }
+
+    private var pending: [Buffered] = []
+    private var groupOrder: [Int] = []          // 输出项首次出现顺序（= 放行顺序）
+    private var knownIndexes: Set<Int> = []     // 见过的输出项索引
     private var openIndexes: Set<Int> = []      // 尚未收到 output_item.done 的
+    private var releasedGroups = 0              // groupOrder 前多少个组已完全放出
     private var buffer = Data()                 // 尚未凑出空行（事件边界）的字节
     private var emittedCount = 0
 
@@ -37,8 +50,8 @@ final class SSEReorderer {
 
     struct Stats {
         var emitted = 0
-        var heldEvents = 0        // 入队等待的事件数
-        var releasedAtFinish = 0  // 流结束时仍被扣住的（异常流兜底）
+        var heldEvents = 0        // 入队的事件数
+        var releasedAtFinish = 0  // 流结束时仍被扣住、由 finish 兜底放出的（异常流）
         var overflowFlushes = 0   // 超过上限强制放行的次数
         var parseFailures = 0
     }
@@ -64,7 +77,7 @@ final class SSEReorderer {
         return serialize(ready)
     }
 
-    /// 流结束：仅放出被扣住的**完整**事件（不吞事件），返回追加字节。
+    /// 流结束：先放出仍被扣住的**完整**事件（不吞事件），返回追加字节。
     ///
     /// SSE 规范要求 EOF 时丢弃尚未以空行结束的不完整尾部，因此这里不做"把残余字节当完整
     /// 事件"的处理；只有仍停留在缓冲区、但在 EOF 处恰好构成完整事件（例如以 `\r\r` 收尾）
@@ -75,13 +88,10 @@ final class SSEReorderer {
             guard let event = parse(block) else { continue }
             enqueue(event, into: &ready)
         }
-        let rest = pending
-        pending.removeAll()
-        openIndexes.removeAll()
+        let rest = forceFlush()
         stats.releasedAtFinish += rest.count
-        ready.append(contentsOf: rest)
         buffer.removeAll()
-        return serialize(ready)
+        return serialize(ready + rest)
     }
 
     /// 尚未放行的事件数（流正常结束时应为 0）
@@ -91,85 +101,88 @@ final class SSEReorderer {
 
     private func enqueue(_ event: Event, into ready: inout [Event]) {
         if let idx = event.index {
-            knownIndexes.insert(idx)
+            if knownIndexes.insert(idx).inserted { groupOrder.append(idx) }
             if event.opensItem { openIndexes.insert(idx) }
             if event.closesItem { openIndexes.remove(idx) }
         }
-        pending.append(event)
+        // 无归属事件到达时已开场的组数：这些组全部放完它才能放行
+        let requires = event.index == nil ? groupOrder.count : 0
+        pending.append(Buffered(event: event, requiresGroups: requires))
         stats.heldEvents += 1
 
         drain(into: &ready)
 
         if pending.count > maxHeld {   // 兜底：流不完整时强制按序放行，避免无限扣住
             stats.overflowFlushes += 1
-            ready.append(contentsOf: pending)
+            ready.append(contentsOf: pending.map { $0.event })
             pending.removeAll()
             openIndexes.removeAll()
+            releasedGroups = groupOrder.count
         }
     }
 
-    /// 按输出项分组后放行（组内保持插入序，组间按首次出现序）。
+    /// 放出可即时下发的事件，其余留在 pending。
     ///
-    /// 只放行"已收尾的连续前缀"：遇到第一个仍在进行中的输出项就停住，它之后的一切都不越过。
-    /// 无归属事件（created/in_progress/completed 等）不属任何组，只要没被未收尾的组挡住就按其
-    /// 插入位置出队——因此规范流（无交错）是恒等变换。
-    ///
-    /// 上游交错时（推理项的收尾事件被插在 message 开场之后）两组的成员会交错入队，
-    /// 这里按组重组，使每个输出项的 added…done 输出为连续块。
+    /// 放行规则：
+    /// 1. `groupOrder` 从前向后，已收到 `output_item.done` 的组视为"完全放出"，直到遇到
+    ///    第一个未收尾组为止（`releasedGroups` 即该连续前缀长度）。
+    /// 2. 这些已放出组的遗留事件（交错时晚到的收尾件）先按组序输出，保证前一项的 done 一定
+    ///    早于后一项的 added。
+    /// 3. 紧随其后的第一个未收尾组是当前活跃组，它已到的事件即时放出（流式，不整项缓冲）。
+    /// 4. 更靠后的组一律暂存；等它前面的组收尾后，在下一次 drain 里成为活跃组被立即放出。
+    /// 5. 无归属事件（created/in_progress/completed 等）在"其出现前已开场的组全部放出"后
+    ///    按插入位放出——因此活跃组/后项被扣住时不会抢跑，也不会把 completed 提前。
     private func drain(into ready: inout [Event]) {
-        guard pending.contains(where: { $0.index != nil }) else {
-            ready.append(contentsOf: pending)
-            pending.removeAll()
-            return
+        while releasedGroups < groupOrder.count,
+              !openIndexes.contains(groupOrder[releasedGroups]) {
+            releasedGroups += 1
+        }
+        guard !pending.isEmpty else { return }
+
+        var position: [Int: Int] = [:]
+        position.reserveCapacity(groupOrder.count)
+        for (i, g) in groupOrder.enumerated() { position[g] = i }
+
+        // 已放出组的遗留事件，按组序聚合（组内保持插入序）
+        var lateByGroup: [Int: [Event]] = [:]
+        for b in pending {
+            guard let idx = b.event.index, let p = position[idx], p < releasedGroups else { continue }
+            lateByGroup[idx, default: []].append(b.event)
         }
 
-        var groups: [Int: [Event]] = [:]       // 输出项 → 该组事件（插入序）
-        var groupOrder: [Int] = []             // 组首次出现的顺序
-
-        for ev in pending {
-            guard let idx = ev.index else { continue }
-            if groups[idx] == nil { groups[idx] = []; groupOrder.append(idx) }
-            groups[idx]?.append(ev)
-        }
-
-        // 已收尾的连续前缀（组序）；遇到第一个未收尾的组即停
-        var releasable: [Int] = []
-        for idx in groupOrder {
-            let closed = knownIndexes.contains(idx) && !openIndexes.contains(idx)
-            guard closed else { break }
-            releasable.append(idx)
-        }
-        let releasableSet = Set(releasable)
-
-        // 已收尾组之前不存在未收尾组时，这些组连同其前面的无归属事件可以整体出队
         var out: [Event] = []
-        var remaining: [Event] = []
-        var emittedGroups: Set<Int> = []
-        var blocked = false
-        for ev in pending {
-            if let idx = ev.index {
-                if releasableSet.contains(idx) {
-                    if !emittedGroups.contains(idx) {
-                        out.append(contentsOf: groups[idx] ?? [])
-                        emittedGroups.insert(idx)
-                    }
-                } else {
-                    blocked = true
-                    remaining.append(ev)
-                }
-            } else if blocked {
-                remaining.append(ev)          // 未收尾组之后的无归属事件：留在原位
-            } else {
-                out.append(ev)                // 未收尾组之前的无归属事件：原位透传
-            }
+        var remaining: [Buffered] = []
+        for k in 0..<releasedGroups {
+            if let evs = lateByGroup[groupOrder[k]] { out.append(contentsOf: evs) }
         }
-        // 交错造成的迟到件：已收尾组若仍有事件在后面，按组补到末尾
-        for idx in releasable where !emittedGroups.contains(idx) {
-            out.append(contentsOf: groups[idx] ?? [])
-            emittedGroups.insert(idx)
+        for b in pending {
+            if let idx = b.event.index {
+                guard let p = position[idx] else { remaining.append(b); continue }
+                if p < releasedGroups { continue }              // 已在上面放出
+                if p == releasedGroups { out.append(b.event) }  // 活跃组：即时流式
+                else { remaining.append(b) }                    // 后项：暂存
+            } else if b.requiresGroups <= releasedGroups {
+                out.append(b.event)
+            } else {
+                remaining.append(b)
+            }
         }
         pending = remaining
         ready.append(contentsOf: out)
+    }
+
+    /// 流结束时强制放出所有剩余事件（不吞事件）：视为所有组都已收尾，按组序放出。
+    private func forceFlush() -> [Event] {
+        guard !pending.isEmpty else { return [] }
+        openIndexes.removeAll()
+        releasedGroups = groupOrder.count
+        var out: [Event] = []
+        drain(into: &out)
+        if !pending.isEmpty {   // 理论上不会到达：所有组已视为收尾
+            out.append(contentsOf: pending.map { $0.event })
+            pending.removeAll()
+        }
+        return out
     }
 
     // MARK: 解析 / 序列化

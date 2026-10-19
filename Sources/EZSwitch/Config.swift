@@ -752,6 +752,7 @@ final class ConfigStore: ObservableObject {
 
     @Published private(set) var config: AppConfig
     @Published var serverError: String?
+    @Published var configSaveError: String?
     /// 磁盘配置解析失败的原因（nil = 正常）。失败时使用空安全配置、绝不写盘覆盖原文件，
     /// 也不把示例 routes 呈现给用户；成功 reload 后自动解除。
     @Published private(set) var configLoadError: String?
@@ -772,6 +773,7 @@ final class ConfigStore: ObservableObject {
     private var started = false
     /// 磁盘配置解析失败期间禁止写盘，避免用内存中的空配置覆盖用户的原始文件。
     private var writeBlocked = false
+    private let persistence: ConfigPersistence
 
     convenience init() {
         self.init(configURL: ConfigStore.resolveConfigURL(), startsWatching: true)
@@ -784,6 +786,7 @@ final class ConfigStore: ObservableObject {
         self.router = Router(registry: registry)
         self.usageStore = UsageStore(url: UsageStore.databaseURL(for: url))
         let (loaded, shouldPersistMigration, loadError) = ConfigStore.loadOrCreate(at: url)
+        self.persistence = ConfigPersistence(url: url)
         let (baseNormalized, didNormalizeBaseURLs) = ConfigStore.normalizeBaseURLs(loaded)
         let (merged, didMerge) = ConfigStore.mergeDuplicateRemotes(baseNormalized)
         let (normalizedFakes, didNormalizeFakes) = ConfigStore.normalizeFakes(merged)
@@ -1141,8 +1144,7 @@ final class ConfigStore: ObservableObject {
         guard reordered != config.fakes else { return }
         config.fakes = reordered
         router.update(config)
-        save()
-        Log.shared.log("fake: 排序更新（\(config.fakes.count) 个）")
+        saveOrderInBackground()
     }
 
     /// 行尾展示：当前绑定远端的模型 id（未绑定 → "未配置"）
@@ -1236,8 +1238,7 @@ final class ConfigStore: ObservableObject {
         guard reordered != config.remotes else { return }
         config.remotes = reordered
         router.update(config)
-        save()
-        Log.shared.log("provider: 排序更新（\(groups.count) 个）")
+        saveOrderInBackground()
     }
 
     /// 模型只在所属供应商内排序，不改变其他供应商在配置中的位置。
@@ -1658,16 +1659,42 @@ final class ConfigStore: ObservableObject {
             Log.shared.log("config: 跳过写盘 — 磁盘配置文件解析失败，保护原文件不被覆盖")
             return .blocked
         }
-        do {
-            let data = try ConfigStore.encoder.encode(config)
-            try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
-            try data.write(to: configURL, options: .atomic)
+        switch persistence.save(config) {
+        case .saved:
+            if configSaveError != nil { configSaveError = nil }
             return .saved
-        } catch {
-            Log.shared.log("config: save failed: \(error)")
-            return .failed(String(describing: error))
+        case .failed(let reason):
+            configSaveError = "配置未保存：\(reason)"
+            Log.shared.log("config: save failed: \(reason)")
+            return .failed(reason)
+        case .changedOnDisk:
+            return .failed("config changed on disk")
         }
+    }
+
+    private func saveOrderInBackground() {
+        guard !writeBlocked else {
+            configSaveError = "排序未保存：磁盘配置无法解析，请修正文件后重新加载。"
+            return
+        }
+        persistence.enqueue(config) { [weak self] revision, result in
+            Task { @MainActor [weak self] in
+                guard let self, self.persistence.isCurrent(revision) else { return }
+                switch result {
+                case .saved:
+                    if self.configSaveError != nil { self.configSaveError = nil }
+                case .failed(let reason):
+                    self.configSaveError = "排序未保存：\(reason)"
+                    Log.shared.log("config: order save failed: \(reason)")
+                case .changedOnDisk:
+                    self.reloadFromDisk()
+                }
+            }
+        }
+    }
+
+    func flushPendingConfigWrites() {
+        persistence.flush()
     }
 
     func reloadFromDisk() {
@@ -1676,7 +1703,7 @@ final class ConfigStore: ObservableObject {
             return
         }
         do {
-            let data = try Data(contentsOf: configURL)
+            guard let data = try persistence.changedData() else { return }
             let shouldPersistMigration = ConfigStore.hasLegacyRemoteFields(data)
                 || ConfigStore.hasLegacyTransportFields(data)
             let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
