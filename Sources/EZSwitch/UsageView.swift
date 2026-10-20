@@ -7,7 +7,6 @@ struct UsageView: View {
     let store: UsageStore
 
     @StateObject private var model: UsageViewModel
-    @StateObject private var chartSelection = UsageChartSelection()
 
     private let columnWidth: CGFloat = 72
 
@@ -75,11 +74,20 @@ struct UsageView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(sectionTitle).font(.title2.bold())
+                if let pending = model.pendingBucket {
+                    selectionLoadingIndicator(pending)
+                } else if let error = model.selectionError {
+                    selectionErrorIndicator(error)
+                } else if let bucket = model.selectedBucket {
+                    selectionIndicator(bucket)
+                }
                 Spacer(minLength: 8)
                 if model.isExporting || model.isClearing {
                     ProgressView().controlSize(.small)
                 }
             }
+            // 状态 chip 的出现/消失不改变标题行高度。
+            .frame(minHeight: 28, alignment: .leading)
 
             // 单行只放区间选择器；自定义天数输入另起一行，避免在最小宽度下撑宽布局。
             Picker("时间区间", selection: $model.preset) {
@@ -127,6 +135,54 @@ struct UsageView: View {
     private var rangeSummary: String {
         let range = model.range
         return "\(UsageFormat.day(range.from)) – \(UsageFormat.day(range.inclusiveEnd))"
+    }
+
+    /// 已选柱的时段指示与清除入口。
+    private func selectionIndicator(_ bucket: UsageChartSelection) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "chart.bar.fill")
+            Text("已选 \(bucket.label())")
+            Button { model.clearSelection() } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("清除所选时段")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.primary.opacity(0.06), in: Capsule())
+        .accessibilityElement(children: .contain)
+    }
+
+    /// 取数中的目标：点击立即有反馈，已展示数据保持到提交。
+    private func selectionLoadingIndicator(_ bucket: UsageChartSelection) -> some View {
+        HStack(spacing: 6) {
+            ProgressView().controlSize(.mini)
+            Text("正在加载 \(bucket.label())…")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.primary.opacity(0.06), in: Capsule())
+        .accessibilityElement(children: .combine)
+    }
+
+    /// 加载失败：保留上一个 scope，仅就地提示，不改变布局。
+    private func selectionErrorIndicator(_ message: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle")
+            Text("所选时段加载失败")
+        }
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.orange.opacity(0.1), in: Capsule())
+        .help(message)
+        .accessibilityElement(children: .combine)
     }
 
     /// 仅合法正整数即时生效；非法输入只改缓冲，提交时回退，避免瞬时错误范围。
@@ -203,8 +259,10 @@ struct UsageView: View {
 
     // MARK: - 总览
 
+    /// 卡片与明细都跟随图表选择；取数期间保持上一个 scope 的结构与数据，
+    /// 由标题旁的 chip 标明当前状态。
     private var overviewCard: some View {
-        let totals = model.snapshot.totals
+        let totals = model.scopedTotals
         return HStack(spacing: 12) {
             metricTile(title: "输入", value: totals.input, reported: totals.inputAttempts,
                        attempts: totals.attempts, unit: "Tokens")
@@ -212,10 +270,29 @@ struct UsageView: View {
                        attempts: totals.attempts, unit: "Tokens")
             metricTile(title: "缓存命中", value: totals.cachedInput, reported: totals.cachedInputAttempts,
                        attempts: totals.attempts, unit: "Tokens", helpNote: "输入的子集")
+            cacheRateTile
             metricTile(title: "请求数", value: totals.requests, reported: totals.requests,
                        attempts: 0, unit: "次", helpNote: coverageSummary)
         }
         .cardSurface()
+    }
+
+    /// 缓存命中率卡：上游没上报缓存/输入或输入为 0 时显示「—」，不用精确的 0% 冒充缺失。
+    private var cacheRateTile: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("缓存命中率").font(.caption).foregroundStyle(.secondary)
+            Text(UsageFormat.cacheRateText(model.cacheHitRate))
+                .font(.system(.title2, design: .rounded).weight(.semibold))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(model.cacheRateCaption).font(.caption2).foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+        .help(model.cacheRateHelp)
+        .accessibilityElement(children: .combine)
     }
 
     private func metricTile(title: String, value: Int, reported: Int, attempts: Int, unit: String,
@@ -241,7 +318,7 @@ struct UsageView: View {
 
     /// 上游尝试用量的覆盖情况；仅在存在尝试时有意义，作为「请求数」指标卡的 tooltip 补充。
     private var coverageSummary: String? {
-        let totals = model.snapshot.totals
+        let totals = model.scopedTotals
         guard totals.attempts > 0 else { return nil }
         let unknown = max(0, totals.attempts - totals.knownAttempts)
         var text = "已获取 \(totals.knownAttempts)/\(totals.attempts) 次上游尝试用量"
@@ -253,15 +330,16 @@ struct UsageView: View {
 
     // MARK: - 图表
 
-    /// 「今天」按小时展示，其余区间按天展示。
-    private var isHourlyChart: Bool { model.preset == .today }
+    /// 图表粒度：今天按小时，其余区间按天。
+    private var isHourlyChart: Bool { model.chartUnit == .hour }
 
+    /// 图表始终是整个区间的序列：选中某根柱不裁掉其它柱，其余柱依然可点。
     private var chartPoints: [UsageDay] {
         isHourlyChart ? model.snapshot.hours : model.snapshot.days
     }
 
     /// X 轴单位：今天用小时，其余用天。
-    private var chartUnit: Calendar.Component { isHourlyChart ? .hour : .day }
+    private var chartUnit: Calendar.Component { model.chartUnit }
 
     private var chartDates: [Date] {
         let range = model.range
@@ -284,7 +362,7 @@ struct UsageView: View {
                 )
                 .foregroundStyle(by: .value("类型", "输入"))
                 .cornerRadius(3)
-                .opacity(chartSelection.date == nil || chartSelection.date == point.date ? 1 : 0.35)
+                .opacity(model.activeBucket == nil || model.activeBucket?.date == point.date ? 1 : 0.35)
 
                 BarMark(
                     x: .value(isHourlyChart ? "时间" : "日期", point.date, unit: chartUnit),
@@ -292,7 +370,7 @@ struct UsageView: View {
                 )
                 .foregroundStyle(by: .value("类型", "输出"))
                 .cornerRadius(3)
-                .opacity(chartSelection.date == nil || chartSelection.date == point.date ? 1 : 0.35)
+                .opacity(model.activeBucket == nil || model.activeBucket?.date == point.date ? 1 : 0.35)
             }
             .chartForegroundStyleScale(["输入": Color.accentColor, "输出": Color.teal])
             .chartLegend(position: .top, alignment: .trailing)
@@ -327,43 +405,24 @@ struct UsageView: View {
                             let plot = geometry[proxy.plotAreaFrame]
                             guard plot.contains(location),
                                   let date: Date = proxy.value(atX: location.x - plot.minX) else {
-                                chartSelection.date = nil
+                                model.clearSelection()
                                 return
                             }
-                            chartSelection.toggle(at: date, points: chartPoints, unit: chartUnit)
+                            model.toggleSelection(at: date, points: chartPoints, unit: chartUnit) { from, to, grouping in
+                                try await store.snapshot(from: from, to: to, grouping: grouping)
+                            }
                         }
                 }
             }
             .frame(height: 180)
-
-            if let date = chartSelection.date,
-               let point = chartPoints.first(where: { $0.date == date }) {
-                HStack(spacing: 12) {
-                    Text(isHourlyChart ? point.date.formatted(date: .abbreviated, time: .shortened)
-                         : UsageFormat.day(point.date))
-                    Text("输入 \(UsageFormat.exact(point.input))")
-                    Text("输出 \(UsageFormat.exact(point.output))")
-                    Text("合计 \(UsageFormat.exact(point.input + point.output)) token")
-                    Spacer(minLength: 0)
-                    Button { chartSelection.date = nil } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("取消柱状图选择")
-                }
-                .font(.caption)
-                .monospacedDigit()
-                .textSelection(.enabled)
-            }
         }
-        .onChange(of: model.reloadKey) { _ in chartSelection.date = nil }
         .cardSurface()
     }
 
     // MARK: - 明细
 
     private var detailsCard: some View {
-        let groups = model.snapshot.groups
+        let groups = model.scopedSnapshot?.groups ?? []
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
                 Text("使用明细").font(.headline)
@@ -384,8 +443,8 @@ struct UsageView: View {
             }
             .padding(.bottom, 10)
 
-            tableHeader
             Divider()
+            tableHeader
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(groups) { row in
                     groupRow(row)
@@ -408,6 +467,7 @@ struct UsageView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+        .padding(.top, 6)
         .padding(.bottom, 6)
     }
 

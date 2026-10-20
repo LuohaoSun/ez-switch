@@ -98,6 +98,75 @@ struct ProviderPresetDraftTests {
         #expect(draft.endpoints == APIEndpointSettings(chat: .disabled, responses: .disabled, messages: .disabled))
     }
 
+    // MARK: OpenCode 会话头：每个新草稿独立、草稿内稳定
+
+    @Test
+    func newOpenCodeDraftsEachGenerateUniqueSession() throws {
+        let zen = try #require(ProviderPreset.all.first { $0.id == "opencode-zen" })
+        let go = try #require(ProviderPreset.all.first { $0.id == "opencode-go" })
+
+        let zenDraft = RemoteEditDraft(source: nil, preset: zen)
+        let anotherZenDraft = RemoteEditDraft(source: nil, preset: zen)
+        let goDraft = RemoteEditDraft(source: nil, preset: go)
+
+        let sessions = [zenDraft, anotherZenDraft, goDraft].compactMap(session)
+        #expect(sessions.count == 3)
+        #expect(Set(sessions).count == 3, "每个新供应商草稿必须生成独立 UUID")
+        for value in sessions {
+            #expect(UUID(uuidString: value) != nil)
+        }
+        // 不再预填 x-opencode-client。
+        for draft in [zenDraft, anotherZenDraft, goDraft] {
+            #expect(draft.headers.contains { $0.key.lowercased() == "x-opencode-client" } == false)
+        }
+    }
+
+    @Test
+    func openCodeDraftSessionStaysStableAcrossEdits() throws {
+        let preset = try #require(ProviderPreset.all.first { $0.id == "opencode-go" })
+        let draft = RemoteEditDraft(source: nil, preset: preset)
+        let original = try #require(session(draft))
+
+        // 同一草稿内反复编辑（名称 / key / 模型 / 额外头）不得重新生成。
+        draft.providerName = "OpenCode Go 2"
+        draft.apiKey = "new-key"
+        draft.model = "new-model"
+        draft.headers.append(HeaderRow(key: "X-Extra", value: "1"))
+
+        #expect(session(draft) == original)
+        #expect(draft.headers.filter { $0.key.lowercased() == "x-opencode-session" }.count == 1)
+    }
+
+    @Test
+    func addingModelDraftInheritsPersistedOpenCodeSession() {
+        let persisted = remote("OpenCode Go", "m1",
+                               headers: ["x-opencode-session": "0f8fad5b-d9cb-469f-a165-70867728950e",
+                                         "x-opencode-client": "legacy-client"])
+
+        // “添加模型”复用供应商的已持久化配置（RemoteEditSheet 以 template 作为 source）。
+        let draft = RemoteEditDraft(source: persisted)
+
+        #expect(session(draft) == "0f8fad5b-d9cb-469f-a165-70867728950e")
+        #expect(draft.headers.contains { $0.key == "x-opencode-client" && $0.value == "legacy-client" })
+    }
+
+    @Test
+    func editingExistingProviderLeavesCustomHeadersUntouched() {
+        let existing = remote("OpenCode Go", "m1",
+                              headers: ["x-opencode-client": "ezswitch"])
+
+        let draft = RemoteEditDraft(source: existing)
+
+        // 已有供应商不生成新 UUID，也不改写既有头。
+        #expect(draft.headers.map(\.key) == ["x-opencode-client"])
+        #expect(draft.headers.first?.value == "ezswitch")
+        #expect(session(draft) == nil)
+    }
+
+    private func session(_ draft: RemoteEditDraft) -> String? {
+        draft.headers.first { $0.key.lowercased() == "x-opencode-session" }?.value
+    }
+
     @Test
     func editingExistingRemoteKeepsItsFields() {
         let source = remote("Alpha", "one", key: "secret",

@@ -13,6 +13,8 @@ struct PerformanceView: View {
 
     /// 三列指标与一列样本数；表头与卡片同名，留出足够宽度。
     private let columnWidth: CGFloat = 120
+    /// 样本数列的宽度：表头文案更长（"有效样本(TTFT/TPS)"），单独给宽度避免被压缩。
+    private let samplesColumnWidth: CGFloat = 140
 
     var body: some View {
         content
@@ -208,7 +210,10 @@ struct PerformanceView: View {
             headerCell(.ttftMean)
             headerCell(.tpsIncludingTTFT)
             headerCell(.tpsExcludingTTFT)
-            Text("TTFT / TPS").frame(width: columnWidth, alignment: .trailing)
+            Text("有效样本(TTFT/TPS)")
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(width: samplesColumnWidth, alignment: .trailing)
                 .help("有效样本数：TTFT 样本 / TPS 样本（两者可能不同）")
         }
         .font(.caption)
@@ -324,7 +329,7 @@ struct PerformanceView: View {
         Text("\(PerformanceFormat.samples(ttftSampleCount(s))) / \(PerformanceFormat.samples(s.tpsSamples))")
             .font(.system(.callout, design: .rounded))
             .monospacedDigit()
-            .frame(width: columnWidth, alignment: .trailing)
+            .frame(width: samplesColumnWidth, alignment: .trailing)
             .help("有效样本 TTFT / TPS = \(ttftSampleCount(s)) / \(s.tpsSamples)；尝试 \(s.attempts)")
     }
 

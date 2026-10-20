@@ -243,9 +243,6 @@ enum Forwarder {
         }
 
         if url.host == "opencode.ai", url.path.hasPrefix("/zen/go/v1/") {
-            // Go uses a per-conversation session for routing/cache; 客户端会话头已在
-            // 上方透传，这里只在客户端未提供 user-agent 时补 EZSwitch 默认值，
-            // 绝不生成固定 session（否则会把不同会话混在一起）。
             if req.value(forHTTPHeaderField: "user-agent") == nil {
                 let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
                 req.setValue("EZSwitch/\(version)", forHTTPHeaderField: "user-agent")

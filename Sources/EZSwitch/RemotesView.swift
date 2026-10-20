@@ -469,9 +469,7 @@ final class RemoteEditDraft: ObservableObject {
             model = ""
             endpoints = preset.endpoints
             apiKey = ""
-            headers = preset.extraHeaders
-                .sorted { $0.key < $1.key }
-                .map { HeaderRow(key: $0.key, value: $0.value) }
+            headers = Self.initialHeaders(for: preset)
         } else {
             providerName = ""
             model = ""
@@ -479,6 +477,16 @@ final class RemoteEditDraft: ObservableObject {
             apiKey = ""
             headers = []
         }
+    }
+
+    /// 每个草稿仅生成一次，后续编辑及目录请求复用该值。
+    static func initialHeaders(for preset: ProviderPreset) -> [HeaderRow] {
+        var values = preset.extraHeaders
+        if preset.generatesOpenCodeSession {
+            values["x-opencode-session"] = UUID().uuidString
+        }
+        return values.sorted { $0.key < $1.key }
+            .map { HeaderRow(key: $0.key, value: $0.value) }
     }
 }
 

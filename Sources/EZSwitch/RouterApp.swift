@@ -207,7 +207,7 @@ struct MenuView: View {
         Button(usage.menuTitle) {
             AppWindowCoordinator.shared.showSettings(store: store, section: .usage)
         }
-        .help("打开用量统计，查看今日与本机历史 Token 用量")
+        .help(usage.menuHelp)
 
         if let release = updater.availableRelease {
             Button("新版本 \(release.version) 可用…") {

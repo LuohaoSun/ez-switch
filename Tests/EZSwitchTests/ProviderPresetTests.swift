@@ -6,9 +6,18 @@ import Testing
 @MainActor
 @Suite("Provider presets")
 struct ProviderPresetTests {
-    private func remote(_ preset: ProviderPreset, apiKey: String = "test-key") -> RemoteModel {
+    private func remote(_ preset: ProviderPreset, apiKey: String = "test-key",
+                        headers: [String: String]? = nil) -> RemoteModel {
         RemoteModel(id: UUID(), name: "\(preset.name) · model", apiKey: apiKey, model: "model",
-                    extraHeaders: preset.extraHeaders, apiEndpoints: preset.endpoints)
+                    extraHeaders: headers ?? preset.extraHeaders, apiEndpoints: preset.endpoints)
+    }
+
+    private func newDraft(for preset: ProviderPreset) -> RemoteEditDraft {
+        RemoteEditDraft(source: nil, preset: preset, existingProviders: [])
+    }
+
+    private func headerValues(_ draft: RemoteEditDraft) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: draft.headers.map { ($0.key, $0.value) })
     }
 
     private func head(_ path: String, _ headers: [(String, String)]) -> HTTPRequestHead {
@@ -115,42 +124,51 @@ struct ProviderPresetTests {
         #expect(try url("opencode-go", .messages) == "https://opencode.ai/zen/go/v1/messages")
     }
 
-    // MARK: OpenCode：不固化会话 ID
+    // MARK: OpenCode：会话 ID 由每个新草稿生成
 
-    @Test func openCodePresetsOnlyPinClientHeader() throws {
+    @Test func openCodeCatalogMarksGeneratedSessionWithoutStaticValue() throws {
         for id in ["opencode-zen", "opencode-go"] {
             let preset = try #require(ProviderPreset.all.first { $0.id == id })
-            #expect(preset.extraHeaders == ["x-opencode-client": "ezswitch"])
-            for key in preset.extraHeaders.keys {
-                #expect(!key.hasPrefix("x-opencode-session"))
-                #expect(!key.hasPrefix("x-opencode-project"))
-                #expect(!key.hasPrefix("x-opencode-request"))
-            }
+            #expect(preset.generatesOpenCodeSession)
+            // 静态目录保持稳定：随机 UUID 只在新建草稿时生成，不固化在这里。
+            #expect(preset.extraHeaders.isEmpty)
+            #expect(preset.extraHeaders["x-opencode-client"] == nil)
+            #expect(preset.extraHeaders["x-opencode-session"] == nil)
             for value in preset.extraHeaders.values {
-                // 绝不预填固定 UUID。
                 #expect(value.range(of: #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"#,
                                     options: .regularExpression) == nil)
             }
         }
+        for preset in ProviderPreset.all where !["opencode-zen", "opencode-go"].contains(preset.id) {
+            #expect(!preset.generatesOpenCodeSession)
+            #expect(preset.extraHeaders["x-opencode-session"] == nil)
+        }
     }
 
-    @Test func openCodeForwardingKeepsClientSessionDynamic() throws {
+    @Test func openCodeForwardingOverridesInboundSessionWithDraftHeader() throws {
         let preset = try #require(ProviderPreset.all.first { $0.id == "opencode-go" })
+        let headers = headerValues(newDraft(for: preset))
+        let session = try #require(headers["x-opencode-session"])
+        #expect(UUID(uuidString: session) != nil)
+
         let request = try Forwarder.buildRequest(
             clientHead: head("/zen/go/v1/chat/completions", [
-                ("x-opencode-session", "sess-dynamic"),
+                // 大小写与预置头不同，仍必须被远端 extraHeaders 覆盖。
+                ("X-OpenCode-Session", "sess-dynamic"),
                 ("x-opencode-project", "proj-dynamic"),
                 ("x-opencode-request", "req-dynamic"),
                 ("x-opencode-client", "opencode"),
             ]),
-            body: Data(#"{"model":"main"}"#.utf8), endpoint: .chat, remote: remote(preset), query: "")
+            body: Data(#"{"model":"main"}"#.utf8), endpoint: .chat,
+            remote: remote(preset, headers: headers), query: "")
 
-        // 客户端每次会话的动态头原样透传，预设不生成也不覆盖它们。
-        #expect(request.value(forHTTPHeaderField: "x-opencode-session") == "sess-dynamic")
+        // remote.extraHeaders 最后应用：同名入站会话头被草稿持久化的 UUID 覆盖。
+        #expect(request.value(forHTTPHeaderField: "x-opencode-session") == session)
+        #expect(request.value(forHTTPHeaderField: "X-OPENCODE-SESSION") == session)
+        // 其它逐会话头与客户端自称值原样透传；不再强制 x-opencode-client。
         #expect(request.value(forHTTPHeaderField: "x-opencode-project") == "proj-dynamic")
         #expect(request.value(forHTTPHeaderField: "x-opencode-request") == "req-dynamic")
-        // 预设的 client 标识最后覆盖客户端自称值。
-        #expect(request.value(forHTTPHeaderField: "x-opencode-client") == "ezswitch")
+        #expect(request.value(forHTTPHeaderField: "x-opencode-client") == "opencode")
         #expect(request.url?.absoluteString == "https://opencode.ai/zen/go/v1/chat/completions")
     }
 
@@ -158,6 +176,11 @@ struct ProviderPresetTests {
 
     @Test func presetConfigRoundTripsThroughAddProvider() throws {
         let preset = try #require(ProviderPreset.all.first { $0.id == "opencode-go" })
+        let draft = newDraft(for: preset)
+        let headers = headerValues(draft)
+        let session = try #require(headers["x-opencode-session"])
+        #expect(UUID(uuidString: session) != nil)
+
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("EZSwitchPresetTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -168,25 +191,36 @@ struct ProviderPresetTests {
         let store = ConfigStore(configURL: url)
         let endpoints = ConfigStore.normalizedEndpoints(preset.endpoints)
         let error = store.addProvider(name: preset.name, modelIDs: ["m1", "m2"], apiKey: "",
-                                      extraHeaders: preset.extraHeaders, apiEndpoints: endpoints)
+                                      extraHeaders: headers, apiEndpoints: endpoints)
         #expect(error == nil)
 
         let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: url))
         #expect(persisted.remotes.map(\.name) == ["OpenCode Go · m1", "OpenCode Go · m2"])
         for r in persisted.remotes {
-            #expect(r.extraHeaders == ["x-opencode-client": "ezswitch"])
+            #expect(r.extraHeaders == headers)
+            #expect(r.extraHeaders["x-opencode-session"] == session)
             #expect(r.apiEndpoints == endpoints)
             #expect(r.apiKey.isEmpty)
         }
+
+        // 后续给同一供应商加模型时复制已持久化的会话头，不生成新的 UUID。
+        #expect(store.addModel(provider: preset.name, model: "m3") == nil)
+        let withModel = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: url))
+        let added = try #require(withModel.remotes.first { $0.model == "m3" })
+        #expect(added.extraHeaders == headers)
+        #expect(added.extraHeaders["x-opencode-session"] == session)
     }
 
     @Test func modelCatalogRequestRebuildsPresetURLAndHeaders() throws {
         // chat 优先：OpenCode Go 走 /models。
         let go = try #require(ProviderPreset.all.first { $0.id == "opencode-go" })
-        let goRequest = try ProviderModelCatalog.request(for: remote(go, apiKey: "go-key"))
+        let goHeaders = headerValues(newDraft(for: go))
+        let goRequest = try ProviderModelCatalog.request(for: remote(go, apiKey: "go-key",
+                                                                    headers: goHeaders))
         #expect(goRequest.url?.absoluteString == "https://opencode.ai/zen/go/v1/models")
         #expect(goRequest.value(forHTTPHeaderField: "authorization") == "Bearer go-key")
-        #expect(goRequest.value(forHTTPHeaderField: "x-opencode-client") == "ezswitch")
+        #expect(goRequest.value(forHTTPHeaderField: "x-opencode-session")
+                == goHeaders["x-opencode-session"])
 
         // 仅 messages 的预设用 /v1/models 且走 Anthropic 鉴权头。
         let anthropic = try #require(ProviderPreset.all.first { $0.id == "anthropic" })
