@@ -80,32 +80,22 @@ struct PerformanceView: View {
     // MARK: - 顶部指标
 
     private var metricsCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // 总览固定请求口径；口径说明只放在各卡片 tooltip，不常驻成行。
-            Text("总览").font(.headline)
-
-            HStack(spacing: 12) {
-                metricTile(title: "平均TTFT",
-                           value: PerformanceFormat.milliseconds(summaryTTFTValue),
-                           unit: "总等待",
-                           samples: summary.requestTTFTSamples,
-                           help: ttftMeanHelp(requestScope: true))
-                metricTile(title: "平均TPS(含TTFT)",
-                           value: PerformanceFormat.tps(summaryTPSIncludingValue),
-                           unit: "Tokens/秒",
-                           samples: summary.tpsSamples,
-                           help: tpsMeanHelp(includingTTFT: true))
-                metricTile(title: "平均TPS(不含TTFT)",
-                           value: PerformanceFormat.tps(summaryTPSExcludingValue),
-                           unit: "Tokens/秒",
-                           samples: summary.tpsSamples,
-                           help: tpsMeanHelp(includingTTFT: false))
-            }
-
-            Label(coverageText, systemImage: "info.circle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help(coverageHelp)
+        HStack(spacing: 12) {
+            metricTile(title: "平均TTFT",
+                       value: PerformanceFormat.milliseconds(summaryTTFTValue),
+                       unit: "总等待",
+                       samples: summary.requestTTFTSamples,
+                       help: "\(ttftMeanHelp(requestScope: true))\n\(coverageHelp)")
+            metricTile(title: "平均TPS(含TTFT)",
+                       value: PerformanceFormat.tps(summaryTPSIncludingValue),
+                       unit: "Tokens/秒",
+                       samples: summary.tpsSamples,
+                       help: "\(tpsMeanHelp(includingTTFT: true))\n\(coverageHelp)")
+            metricTile(title: "平均TPS(不含TTFT)",
+                       value: PerformanceFormat.tps(summaryTPSExcludingValue),
+                       unit: "Tokens/秒",
+                       samples: summary.tpsSamples,
+                       help: "\(tpsMeanHelp(includingTTFT: false))\n\(coverageHelp)")
         }
         .cardSurface()
     }
@@ -113,7 +103,11 @@ struct PerformanceView: View {
     private func metricTile(title: String, value: String, unit: String,
                             samples: Int, help: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
             Text(value)
                 .font(.system(.title2, design: .rounded).weight(.semibold))
                 .monospacedDigit()
@@ -122,6 +116,8 @@ struct PerformanceView: View {
             Text(samples > 0 ? "\(unit) · 样本 \(PerformanceFormat.samples(samples))" : "暂无样本")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
@@ -142,18 +138,11 @@ struct PerformanceView: View {
             : "平均输出吞吐（不含 TTFT，请求口径）：同一批有效样本的上游输出 token 总量 ÷ 生成时长总量（不含 TTFT），按生成时长加权；输出 token 含推理 token。"
     }
 
-    /// 中性样本覆盖行：只报告各指标的有效样本数，不把旧历史中的失败尝试渲染成警告。
-    private var coverageText: String {
-        let s = summary
-        guard s.attempts > 0 else { return "区间内暂无转发尝试" }
-        return "有效样本：TTFT \(PerformanceFormat.samples(s.requestTTFTSamples)) · TPS \(PerformanceFormat.samples(s.tpsSamples))"
-    }
-
     /// 分母解释：只统计成功流式请求，以及包含升级前无性能数据的全部尝试历史。
     private var coverageHelp: String {
         let s = summary
         guard s.attempts > 0 else { return "区间内没有转发尝试，因此没有可统计的性能样本。" }
-        return "TTFT / TPS 只统计成功完成的流式请求：区间内共 \(s.attempts) 次转发尝试，其中 \(s.successfulStreamingAttempts) 次为成功流式、进入有效样本。升级前的历史未采集性能数据，可能计入尝试却没有有效样本。"
+        return "TTFT / TPS 只统计成功完成的流式请求：区间内共 \(s.attempts) 次转发尝试，其中 \(s.successfulStreamingAttempts) 次为成功流式、进入有效样本；缺少计时字段的尝试仍可能没有样本。升级前的历史未采集性能数据，也可能计入尝试却没有有效样本。"
     }
 
     // MARK: - 比较表

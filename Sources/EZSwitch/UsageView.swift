@@ -463,6 +463,7 @@ struct UsageView: View {
             Text("输入").frame(width: columnWidth, alignment: .trailing)
             Text("输出").frame(width: columnWidth, alignment: .trailing)
             Text("缓存").frame(width: columnWidth, alignment: .trailing)
+            Text("缓存率").frame(width: columnWidth, alignment: .trailing)
             Text("请求").frame(width: columnWidth, alignment: .trailing)
         }
         .font(.caption)
@@ -498,6 +499,7 @@ struct UsageView: View {
             numberCell(value: totals.input, reported: totals.inputAttempts, attempts: totals.attempts)
             numberCell(value: totals.output, reported: totals.outputAttempts, attempts: totals.attempts)
             numberCell(value: totals.cachedInput, reported: totals.cachedInputAttempts, attempts: totals.attempts)
+            cacheRateCell(totals)
             numberCell(value: totals.requests, reported: totals.requests, attempts: 0)
         }
         .padding(.vertical, 7)
@@ -515,6 +517,25 @@ struct UsageView: View {
             .monospacedDigit()
             .frame(width: columnWidth, alignment: .trailing)
             .help(missing ? "未上报" : "精确值：\(UsageFormat.exact(value))")
+    }
+
+    private func cacheRateCell(_ totals: UsageTotals) -> some View {
+        Text(UsageFormat.cacheRateText(UsageCacheRate.value(for: totals)))
+            .font(.system(.callout, design: .rounded))
+            .monospacedDigit()
+            .frame(width: columnWidth, alignment: .trailing)
+            .help(cacheRateHelp(totals))
+    }
+
+    private func cacheRateHelp(_ totals: UsageTotals) -> String {
+        if let reason = UsageCacheRate.unknownReason(for: totals) {
+            return "\(reason)，缓存率未知"
+        }
+        var text = "缓存率 = 已上报缓存 \(UsageFormat.exact(totals.cachedInput)) ÷ 已上报输入 \(UsageFormat.exact(totals.input))"
+        if UsageCacheRate.isPartial(for: totals) {
+            text += "\n仅 \(totals.cachedInputAttempts)/\(totals.inputAttempts) 次上游尝试上报了缓存用量，比值只按已上报部分计算"
+        }
+        return text
     }
 
     // MARK: - 空 / 错误 / 加载
