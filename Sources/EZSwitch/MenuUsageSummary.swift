@@ -12,6 +12,10 @@ final class MenuUsageSummary: ObservableObject {
     struct TodaySummary: Equatable {
         var tokens: Int
         var isCompleteCoverage: Bool
+        /// 缓存命中率；`nil` = 上游未上报缓存用量或输入为 0。
+        var cacheRate: Double? = nil
+        /// 缓存上报覆盖不足：只有部分尝试上报了缓存用量。
+        var isCacheCoveragePartial: Bool = false
     }
 
     typealias Loader = (_ from: Date, _ to: Date) async throws -> TodaySummary
@@ -22,8 +26,12 @@ final class MenuUsageSummary: ObservableObject {
 
     @Published private(set) var todayTokens: Int?
     @Published private(set) var isAvailable = true
-    /// 覆盖完整（已知用量 == 上游尝试数）时省略"（已知）"后缀。
+    /// 覆盖完整（已知用量 == 上游尝试数）；只描述 input / output，不代表缓存覆盖。
     @Published private(set) var isCompleteCoverage = true
+    /// 缓存上报覆盖不足：只有部分尝试上报了缓存用量。
+    @Published private(set) var isCacheCoveragePartial = false
+    /// 缓存命中率；`nil` = 上游未上报缓存用量或输入为 0。
+    @Published private(set) var cacheRate: Double?
 
     private let load: Loader
     private let calendar: Calendar
@@ -43,8 +51,11 @@ final class MenuUsageSummary: ObservableObject {
                      notificationCenter: NotificationCenter = .default) {
         self.init(load: { from, to in
             let snapshot = try await store.snapshot(from: from, to: to, grouping: .route)
-            return TodaySummary(tokens: snapshot.totals.total,
-                                isCompleteCoverage: snapshot.totals.knownAttempts >= snapshot.totals.attempts)
+            let totals = snapshot.totals
+            return TodaySummary(tokens: totals.total,
+                                isCompleteCoverage: totals.knownAttempts >= totals.attempts,
+                                cacheRate: UsageCacheRate.value(for: totals),
+                                isCacheCoveragePartial: UsageCacheRate.isPartial(for: totals))
         },
         changeSource: store, calendar: calendar, now: now,
         coalesceInterval: coalesceInterval, notificationCenter: notificationCenter)
@@ -75,8 +86,23 @@ final class MenuUsageSummary: ObservableObject {
     var menuTitle: String {
         guard isAvailable else { return "今日用量: 暂不可用" }
         guard let tokens = todayTokens else { return "今日用量: 读取中…" }
-        let suffix = isCompleteCoverage ? "" : "（已知）"
-        return "今日用量: \(UsageFormat.compact(tokens)) Tokens\(suffix)"
+        return "今日用量: \(UsageFormat.compact(tokens)) Tokens · 缓存率 \(UsageFormat.cacheRateText(cacheRate))"
+    }
+
+    /// 菜单项的补充说明：缓存率是已上报字段之间的比值，各字段覆盖可能不同。
+    var menuHelp: String {
+        var lines = ["打开用量统计，查看今日与本机历史 Token 用量",
+                     "缓存率 = 已上报的缓存命中输入 ÷ 已上报的输入 token"]
+        if cacheRate == nil {
+            lines.append("上游未上报缓存用量或输入为 0，缓存率显示 —")
+        }
+        if isCacheCoveragePartial {
+            lines.append("部分记录未上报缓存用量，缓存率为已上报部分的比率")
+        }
+        if !isCompleteCoverage {
+            lines.append("部分上游尝试未上报用量，各字段覆盖可能不同")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// 标记数据可能已失效并合并刷新。
@@ -151,10 +177,13 @@ final class MenuUsageSummary: ObservableObject {
             guard !Task.isCancelled else { return }
             todayTokens = summary.tokens
             isCompleteCoverage = summary.isCompleteCoverage
+            isCacheCoveragePartial = summary.isCacheCoveragePartial
+            cacheRate = summary.cacheRate
             isAvailable = true
         } catch {
             guard !Task.isCancelled else { return }
             todayTokens = nil
+            cacheRate = nil
             isAvailable = false
         }
     }

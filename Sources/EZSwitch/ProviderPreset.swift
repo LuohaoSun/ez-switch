@@ -13,6 +13,8 @@ struct ProviderPreset: Identifiable {
     let iconName: String
     let endpoints: APIEndpointSettings
     let extraHeaders: [String: String]
+    /// 随机值在新建草稿时生成，不能存进共享的静态目录。
+    var generatesOpenCodeSession = false
     /// 搜索别名（中英文品牌词）。
     var aliases: [String] = []
 
@@ -42,7 +44,8 @@ struct ProviderPreset: Identifiable {
             endpoints: make(chat: "https://opencode.ai/inference/v1",
                             responses: "https://opencode.ai/inference/v1",
                             messages: "https://opencode.ai/inference"),
-            extraHeaders: ["x-opencode-client": "ezswitch"],
+            extraHeaders: [:],
+            generatesOpenCodeSession: true,
             aliases: ["opencode", "zen", "console"]
         ),
         ProviderPreset(
@@ -51,7 +54,8 @@ struct ProviderPreset: Identifiable {
             iconName: "opencode",
             endpoints: make(chat: "https://opencode.ai/zen/go/v1",
                             messages: "https://opencode.ai/zen/go"),
-            extraHeaders: ["x-opencode-client": "ezswitch"],
+            extraHeaders: [:],
+            generatesOpenCodeSession: true,
             aliases: ["opencode", "go"]
         ),
         // messages 的 base 不含 /v1：/v1/messages 由路由器补齐。

@@ -296,6 +296,163 @@ struct MenuUsageSummaryTests {
         #expect(summary.isAvailable)
         #expect(summary.todayTokens == 2)
         #expect(summary.isCompleteCoverage == false)
-        #expect(summary.menuTitle.contains("已知"))   // 覆盖不完整时的后缀
+        #expect(!summary.menuTitle.contains("已知"))   // 覆盖不完整时不再常驻"（已知）"后缀
+    }
+
+    // MARK: - 缓存率
+
+    /// 转调共用实现（与用量页同一口径与格式），避免菜单与页面文案漂移。
+    private func cacheRate(input: Int?, cachedInput: Int?) -> Double? {
+        UsageFormat.cacheRate(input: input, cachedInput: cachedInput)
+    }
+
+    private func cacheRateText(_ rate: Double?) -> String {
+        UsageFormat.cacheRateText(rate)
+    }
+
+    /// 上游同时上报输入与缓存命中：缓存率 = 缓存命中的输入 ÷ 输入。
+    @Test
+    func cacheRateUsesCachedOverReportedInput() async {
+        let summary = MenuUsageSummary(load: { _, _ in
+            .init(tokens: 300, isCompleteCoverage: true,
+                  cacheRate: UsageFormat.cacheRate(input: 200, cachedInput: 50))
+        }, coalesceInterval: 0, notificationCenter: NotificationCenter())
+
+        summary.invalidate()
+        await summary.waitForIdle()
+
+        #expect(summary.cacheRate == 0.25)
+        #expect(summary.menuTitle.contains("缓存率 25.0%"))
+    }
+
+    /// 上游未上报缓存用量：属于缺失，不能显示成精确的 0%。
+    @Test
+    func cacheRateIsDashWhenCachedDataMissing() async {
+        let summary = MenuUsageSummary(load: { _, _ in
+            .init(tokens: 100, isCompleteCoverage: true,
+                  cacheRate: UsageFormat.cacheRate(input: 100, cachedInput: nil))
+        }, coalesceInterval: 0, notificationCenter: NotificationCenter())
+
+        summary.invalidate()
+        await summary.waitForIdle()
+
+        #expect(summary.cacheRate == nil)
+        #expect(summary.menuTitle.contains("缓存率 —"))
+        #expect(!summary.menuTitle.contains("0.0%"))
+    }
+
+    /// 输入为 0：没有分母，显示 —。
+    @Test
+    func cacheRateIsDashWhenInputIsZero() async {
+        let summary = MenuUsageSummary(load: { _, _ in
+            .init(tokens: 0, isCompleteCoverage: true,
+                  cacheRate: UsageFormat.cacheRate(input: 0, cachedInput: 0))
+        }, coalesceInterval: 0, notificationCenter: NotificationCenter())
+
+        summary.invalidate()
+        await summary.waitForIdle()
+
+        #expect(summary.cacheRate == nil)
+        #expect(summary.menuTitle.contains("缓存率 —"))
+    }
+
+    /// 上游明确上报缓存命中为 0：是精确的 0%，与"缺失"区分开。
+    @Test
+    func cacheRateIsExactZeroWhenReportedZero() async {
+        let summary = MenuUsageSummary(load: { _, _ in
+            .init(tokens: 100, isCompleteCoverage: true,
+                  cacheRate: UsageFormat.cacheRate(input: 100, cachedInput: 0))
+        }, coalesceInterval: 0, notificationCenter: NotificationCenter())
+
+        summary.invalidate()
+        await summary.waitForIdle()
+
+        #expect(summary.cacheRate == 0)
+        #expect(summary.menuTitle.contains("缓存率 0.0%"))
+    }
+
+    /// 部分上报（覆盖不完整）时不再常驻"（已知）"后缀，说明改到 tooltip。
+    @Test
+    func menuTitleOmitsKnownSuffixAndKeepsCoverageNote() async {
+        let summary = MenuUsageSummary(load: { _, _ in
+            .init(tokens: 100, isCompleteCoverage: false,
+                  cacheRate: UsageFormat.cacheRate(input: 100, cachedInput: 20),
+                  isCacheCoveragePartial: true)
+        }, coalesceInterval: 0, notificationCenter: NotificationCenter())
+
+        summary.invalidate()
+        await summary.waitForIdle()
+
+        #expect(summary.isCompleteCoverage == false)
+        #expect(!summary.menuTitle.contains("已知"))
+        #expect(!summary.menuTitle.contains("（已知）"))
+        #expect(summary.menuTitle.contains("缓存率 20.0%"))
+        #expect(summary.menuHelp.contains("部分上游尝试未上报用量"))
+        #expect(summary.menuHelp.contains("部分记录未上报缓存用量"))
+    }
+
+    /// 缓存覆盖完整时不提"部分记录未上报缓存用量"。
+    @Test
+    func menuHelpOmitsCacheNoteWhenCoverageComplete() async {
+        let summary = MenuUsageSummary(load: { _, _ in
+            .init(tokens: 100, isCompleteCoverage: true,
+                  cacheRate: UsageFormat.cacheRate(input: 100, cachedInput: 20))
+        }, coalesceInterval: 0, notificationCenter: NotificationCenter())
+
+        summary.invalidate()
+        await summary.waitForIdle()
+
+        #expect(!summary.isCacheCoveragePartial)
+        #expect(!summary.menuHelp.contains("部分记录未上报缓存用量"))
+        #expect(!summary.menuHelp.contains("各字段覆盖可能不同"))
+    }
+
+    /// 缓存率取值的边界：缺失 / 零分母一律 nil；文本为一位小数百分比。
+    @Test
+    func cacheRateHelperCoversMissingAndFormatting() {
+        #expect(cacheRate(input: nil, cachedInput: 10) == nil)
+        #expect(cacheRate(input: 100, cachedInput: nil) == nil)
+        #expect(cacheRate(input: 0, cachedInput: 0) == nil)
+        #expect(cacheRate(input: 200, cachedInput: 50) == 0.25)
+
+        #expect(cacheRateText(nil) == "—")
+        #expect(cacheRateText(0.25) == "25.0%")
+        #expect(cacheRateText(0) == "0.0%")
+        #expect(cacheRateText(0.05) == "5.0%")
+        #expect(cacheRateText(0.005) == "0.5%")
+    }
+
+    /// 走真实 store：只有真正上报了缓存 token 的记录才计入缓存率。
+    @Test
+    func realStoreCacheRateFollowsReportedCachedTokens() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("menu-summary-cache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let center = NotificationCenter()
+        let store = UsageStore(url: directory.appendingPathComponent("usage.sqlite"),
+                               notificationCenter: center)
+        let summary = MenuUsageSummary(store: store, coalesceInterval: 0, notificationCenter: center)
+
+        // 未上报缓存 token：缓存率缺失，不显示成精确的 0%。
+        store.record(UsageRecord(requestID: UUID(), timestamp: Date(), routeID: "r1", routeName: "R1",
+                                 remoteID: "m1", provider: "OpenAI", model: "gpt-4o", endpoint: "chat",
+                                 attempt: 1, status: 200, outcome: "success", durationMS: 5,
+                                 tokens: UsageTokens(input: 10, output: 5)))
+        try await store.flush()
+        #expect(await waitUntil { summary.todayTokens == 15 })
+        #expect(summary.cacheRate == nil)
+        #expect(summary.menuTitle.contains("缓存率 —"))
+
+        // 补一条上报缓存命中的记录：输入 30、缓存 6 → 20%。
+        store.record(UsageRecord(requestID: UUID(), timestamp: Date(), routeID: "r1", routeName: "R1",
+                                 remoteID: "m1", provider: "OpenAI", model: "gpt-4o", endpoint: "chat",
+                                 attempt: 1, status: 200, outcome: "success", durationMS: 5,
+                                 tokens: UsageTokens(input: 20, output: 5, cachedInput: 6)))
+        try await store.flush()
+        #expect(await waitUntil { summary.todayTokens == 40 })
+        #expect(summary.cacheRate == 6.0 / 30.0)
+        #expect(summary.menuTitle.contains("缓存率 20.0%"))
     }
 }

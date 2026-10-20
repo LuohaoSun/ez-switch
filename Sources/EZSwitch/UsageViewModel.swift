@@ -30,7 +30,7 @@ enum UsageRangePreset: String, CaseIterable, Identifiable {
 }
 
 /// 半开区间 [from, to)：`to` 是选中结束日的次日零点，保证结束日整天都被包含。
-struct UsageDateRange: Equatable {
+struct UsageDateRange: Equatable, Sendable {
     var from: Date
     /// 排他上界（结束日的次日零点）
     var to: Date
@@ -184,9 +184,60 @@ enum UsageFormat {
     static func axisDay(_ date: Date) -> String { axisFormatter.string(from: date) }
     static func axisHour(_ date: Date) -> String { axisHourFormatter.string(from: date) }
     static func fileDate(_ date: Date) -> String { isoFormatter.string(from: date) }
+
+    /// 小时桶标签：`5月10日 14:00`。按传入日历的时区显示，与分桶口径一致。
+    static func bucketHour(_ date: Date, calendar: Calendar = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = calendar.timeZone
+        formatter.setLocalizedDateFormatFromTemplate("MMMd HH:mm")
+        return formatter.string(from: date)
+    }
+
+    /// 缓存命中率 = 已上报的缓存命中 token ÷ 已上报的输入 token。
+    ///
+    /// 缓存命中是输入的子集，因此分母用输入、分子用缓存命中。
+    /// 任一侧缺失（上游没上报）或输入为 0 时返回 `nil`（界面显示「—」），
+    /// 绝不把「没有数据」粉饰成精确的 0%。页面与菜单共用这一公式。
+    static func cacheRate(input: Int?, cachedInput: Int?) -> Double? {
+        guard let input, let cachedInput, input > 0, cachedInput >= 0 else { return nil }
+        return Double(cachedInput) / Double(input)
+    }
+
+    /// 缓存命中率的显示文本：常规一位小数百分比；未知为「—」。
+    static func cacheRateText(_ rate: Double?) -> String {
+        guard let rate, rate.isFinite else { return "—" }
+        return String(format: "%.1f%%", rate * 100)
+    }
 }
 
 // MARK: - 页面状态
+
+/// 缓存命中率的统计口径包装：把「上报计数」翻译成 `UsageFormat.cacheRate` 的可选输入。
+///
+/// 上报计数为 0 表示该列没有任何记录上报过，区别于「明确上报为 0」；
+/// 因此缺项一律按未知处理（`nil` → 显示「—」），不粉饰成精确的 0%。
+enum UsageCacheRate {
+    /// 命中率（0...1）；nil = 未知（没上报输入 / 没上报缓存 / 输入为 0）。
+    static func value(for totals: UsageTotals) -> Double? {
+        UsageFormat.cacheRate(input: totals.inputAttempts > 0 ? totals.input : nil,
+                              cachedInput: totals.cachedInputAttempts > 0 ? totals.cachedInput : nil)
+    }
+
+    /// 命中率不可知的原因；nil 表示命中率已知。
+    static func unknownReason(for totals: UsageTotals) -> String? {
+        if totals.inputAttempts == 0 { return "上游未上报输入用量" }
+        if totals.cachedInputAttempts == 0 { return "上游未上报缓存用量" }
+        if totals.input <= 0 { return "区间内没有输入 token" }
+        return nil
+    }
+
+    /// 缓存上报覆盖不足：只有部分尝试上报了缓存用量。
+    /// 此时比值只按已上报部分计算，不代表全部请求的真实命中率。
+    static func isPartial(for totals: UsageTotals) -> Bool {
+        totals.cachedInputAttempts > 0 && totals.cachedInputAttempts < totals.inputAttempts
+    }
+}
 
 enum UsagePhase: Equatable {
     case idle
@@ -329,6 +380,8 @@ final class UsageViewModel: ObservableObject {
     @Published private(set) var phase: UsagePhase = .idle
     /// 最近一次刷新失败（有旧数据时以横幅提示，不覆盖已显示内容）。
     @Published private(set) var lastError: String?
+    /// 图表中选中的柱及其数据。整体一次赋值，避免 bucket 与 snapshot 分步更新产生空档。
+    @Published private(set) var selection = UsageSelectionState.empty
     @Published private(set) var performanceSnapshot = PerformanceSnapshot()
     @Published private(set) var performancePhase: UsagePhase = .idle
     @Published private(set) var performanceLastError: String?
@@ -343,10 +396,18 @@ final class UsageViewModel: ObservableObject {
     private var hasLoadedPerformance = false
     private let pollInterval: UInt64 = 5 * 1_000_000_000
 
+    /// 选中柱的请求令牌：每次选择/取消都换新，迟到的旧响应据此作废。
+    private var selectionRequest = UUID()
+    /// 已提交或取数中的选中快照所用的分组；分组变化后需要重取。
+    private var selectionGrouping: UsageGrouping?
+    /// 选择上下文（视图、区间预设、自定义天数、图表粒度）的上一次取值。
+    private var currentSelectionContext: String = ""
+
     /// 入口决定初始视图：用量入口默认用量，性能入口直达性能。
     /// 侧栏两个入口各自持有一个实例（配合稳定视图身份），互不复用，避免导航到性能时仍显示用量。
     init(section: UsageSection = .usage) {
         self.section = section
+        currentSelectionContext = selectionContext
     }
 
     /// `.task(id:)` 键：区间/分组/视图变化即重启刷新；近 N 天只在自定义预设下计入。
@@ -356,8 +417,11 @@ final class UsageViewModel: ObservableObject {
     }
 
     var range: UsageDateRange {
-        UsageRangeResolver.resolve(preset: preset, customLastNDays: customLastNDays)
+        UsageRangeResolver.resolve(preset: preset, customLastNDays: customLastNDays, now: nowProvider())
     }
+
+    /// 区间计算的当前时间；测试可注入以复现跨零点这类时间相关场景。
+    var nowProvider: () -> Date = { Date() }
 
     /// 自定义天数上限（日历可表示范围，非产品限制）。
     var maxCustomLastNDays: Int { UsageRangeResolver.maxLastNDays() }
@@ -380,6 +444,172 @@ final class UsageViewModel: ObservableObject {
     }
 
     var isEmpty: Bool { snapshot.totals.attempts == 0 }
+
+    // MARK: 图表选中
+
+    /// 已提交的柱（其数据已就绪）；nil 表示未选中。
+    var selectedBucket: UsageChartSelection? { selection.bucket }
+    /// 取数中的目标柱；nil 表示没有等待中的选择。
+    var pendingBucket: UsageChartSelection? { selection.pending }
+    /// 图表高亮的柱：取数中的目标优先。
+    var activeBucket: UsageChartSelection? { selection.activeBucket }
+    var selectionIsLoading: Bool { selection.isLoading }
+    /// 已提交柱的快照（与 `selectedBucket` 同时提交）。
+    var selectionSnapshot: UsageSnapshot? { selection.snapshot }
+    var selectionError: String? { selection.error }
+
+    /// 图表粒度：今天按小时，其余区间按天。
+    var chartUnit: Calendar.Component { preset == .today ? .hour : .day }
+
+    /// 是否需要小时分桶（仅用量页的「今天」）。
+    var usesHourlyBuckets: Bool { section == .usage && preset == .today }
+
+    /// 卡片与明细的数据源：有已提交的柱时用其快照，否则是整个区间。
+    /// 取数中的新选择不参与，上一个 scope 保持到原子提交。
+    var scopedSnapshot: UsageSnapshot? {
+        selection.bucket == nil ? snapshot : selection.snapshot
+    }
+
+    var scopedTotals: UsageTotals { scopedSnapshot?.totals ?? UsageTotals() }
+
+    /// 缓存命中率；nil = 未知（上游没上报输入/缓存，或输入为 0）。
+    var cacheHitRate: Double? { UsageCacheRate.value(for: scopedTotals) }
+
+    var cacheRateUnknownReason: String? { UsageCacheRate.unknownReason(for: scopedTotals) }
+
+    var cacheRateIsPartial: Bool { UsageCacheRate.isPartial(for: scopedTotals) }
+
+    var cacheRateCaption: String {
+        let totals = scopedTotals
+        if totals.inputAttempts == 0 || totals.cachedInputAttempts == 0 { return "未上报" }
+        if totals.input <= 0 { return "无输入" }
+        return cacheRateIsPartial ? "部分上报" : "命中/输入"
+    }
+
+    /// 比值只按已上报部分计算，不声称是配对样本。
+    var cacheRateHelp: String {
+        let totals = scopedTotals
+        var lines = ["缓存命中率 = 已上报缓存 token ÷ 已上报输入 token"]
+        if let reason = cacheRateUnknownReason {
+            lines.append("\(reason)，命中率未知")
+            return lines.joined(separator: "\n")
+        }
+        lines.append("已上报缓存 \(UsageFormat.exact(totals.cachedInput)) / 已上报输入 \(UsageFormat.exact(totals.input))")
+        if cacheRateIsPartial {
+            lines.append("仅 \(totals.cachedInputAttempts)/\(totals.inputAttempts) 次上游尝试上报了缓存用量，比值只按已上报部分计算")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// 点选图表中的柱：命中已提交的柱再次点击即取消选择；未命中任何柱同样取消。
+    /// 新目标的快照就绪前继续展示上一个 scope（整个区间或上一次选中的柱），
+    /// 就绪后原子提交，因此内容不会收缩、滚动位置也不会被钳回顶部。
+    func toggleSelection(at date: Date, points: [UsageDay], unit: Calendar.Component,
+                         calendar: Calendar = .current,
+                         load: @escaping @Sendable (Date, Date, UsageGrouping) async throws -> UsageSnapshot) {
+        guard let point = UsageChartSelection.point(at: date, points: points, unit: unit, calendar: calendar),
+              point.input > 0 || point.output > 0 else {
+            clearSelection()
+            return
+        }
+        if let bucket = selection.bucket, bucket.date == point.date, bucket.unit == unit {
+            clearSelection()
+            return
+        }
+        // 再点一次取数中的柱：放弃这次取数，回到上一个已提交的 scope。
+        if let pending = selection.pending, pending.date == point.date, pending.unit == unit {
+            cancelPendingSelection()
+            return
+        }
+        guard let bucket = UsageChartSelection.bucket(for: point, unit: unit, calendar: calendar) else {
+            clearSelection()
+            return
+        }
+        startSelectionLoad(bucket, load: load)
+    }
+
+    /// 取消选择，回到整个区间；同时作废在途的选中请求。
+    func clearSelection() {
+        selectionRequest = UUID()
+        selectionGrouping = nil
+        selection = .empty
+    }
+
+    /// 放弃取数中的目标，保留已提交的 scope（图表与卡片回到上一次状态）。
+    private func cancelPendingSelection() {
+        guard selection.pending != nil else { return }
+        selectionRequest = UUID()
+        selection = UsageSelectionState(bucket: selection.bucket, snapshot: selection.snapshot,
+                                        error: selection.error, pending: nil)
+    }
+
+    /// 标记取数目标并异步加载；不改动已提交的 bucket/snapshot。
+    private func startSelectionLoad(_ bucket: UsageChartSelection,
+                                    load: @escaping @Sendable (Date, Date, UsageGrouping) async throws -> UsageSnapshot) {
+        let token = UUID()
+        selectionRequest = token
+        let grouping = self.grouping
+        selectionGrouping = grouping
+        selection = UsageSelectionState(bucket: selection.bucket, snapshot: selection.snapshot,
+                                        error: nil, pending: bucket)
+        Task { [weak self] in
+            await self?.loadSelection(bucket: bucket, token: token, grouping: grouping, load: load)
+        }
+    }
+
+    /// 竞态安全：取消状态 + 请求令牌 + 当前分组 + 待提交目标，
+    /// 避免快速切换或改分组时旧响应覆盖新状态。
+    private func loadSelection(bucket: UsageChartSelection, token: UUID, grouping: UsageGrouping,
+                               load: @escaping @Sendable (Date, Date, UsageGrouping) async throws -> UsageSnapshot) async {
+        do {
+            let fresh = try await load(bucket.range.from, bucket.range.to, grouping)
+            guard isCurrentSelectionLoad(token: token, bucket: bucket, grouping: grouping) else { return }
+            // 原子提交：bucket 与 snapshot 同一次赋值，内容不会出现空档。
+            selection = UsageSelectionState(bucket: bucket, snapshot: fresh, error: nil, pending: nil)
+        } catch {
+            guard isCurrentSelectionLoad(token: token, bucket: bucket, grouping: grouping) else { return }
+            // 失败保留上一个 scope，只记录错误。
+            selection = UsageSelectionState(bucket: selection.bucket, snapshot: selection.snapshot,
+                                            error: error.localizedDescription, pending: nil)
+        }
+    }
+
+    private func isCurrentSelectionLoad(token: UUID, bucket: UsageChartSelection,
+                                        grouping: UsageGrouping) -> Bool {
+        guard !Task.isCancelled, selectionRequest == token, self.grouping == grouping else { return false }
+        return selection.pending?.date == bucket.date && selection.pending?.unit == bucket.unit
+    }
+
+    /// 已提交柱的静默重取：轮询/分组变化后更新数据，不进入加载态，失败也不覆盖已显示内容。
+    private func refreshCommittedSelection(_ bucket: UsageChartSelection, grouping: UsageGrouping,
+                                           store: UsageStore) async {
+        let token = selectionRequest
+        let requestedKey = reloadKey
+        do {
+            let fresh = try await store.snapshot(from: bucket.range.from, to: bucket.range.to,
+                                                 grouping: grouping)
+            guard !Task.isCancelled, selectionRequest == token, reloadKey == requestedKey,
+                  selection.pending == nil,
+                  selection.bucket?.date == bucket.date, selection.bucket?.unit == bucket.unit else { return }
+            selection = UsageSelectionState(bucket: bucket, snapshot: fresh, error: nil, pending: nil)
+            selectionGrouping = grouping
+        } catch {
+            // 静默刷新失败保留已显示数据；全区间刷新错误由横幅提示。
+        }
+    }
+
+    /// 选择上下文：视图、区间预设、自定义天数与图表粒度。
+    /// 任一变化都让已选的柱失去意义，因此必须重置选中态。
+    private var selectionContext: String {
+        let custom = preset == .custom ? "\(customLastNDays)" : ""
+        return "\(section.rawValue)|\(preset.rawValue)|\(custom)|\(chartUnit == .hour ? "hour" : "day")"
+    }
+
+    /// 已选的柱是否仍落在当前区间内（例如「今天」跨过午夜后旧小时桶已出界）。
+    private func isBucketInCurrentRange(_ bucket: UsageChartSelection) -> Bool {
+        let current = range
+        return bucket.range.from >= current.from && bucket.range.to <= current.to
+    }
 
     var isInitialLoading: Bool {
         !hasLoadedSnapshot && (phase == .idle || phase == .loading)
@@ -464,8 +694,16 @@ final class UsageViewModel: ObservableObject {
         let requestedKey = reloadKey
         if !hasLoadedSnapshot { phase = .loading }
         let current = range
+        // 区间/粒度变化后已选的柱不再有意义：先重置，再取数。
+        let context = selectionContext
+        if context != currentSelectionContext {
+            currentSelectionContext = context
+            clearSelection()
+        } else if let bucket = selection.activeBucket, !isBucketInCurrentRange(bucket) {
+            clearSelection()
+        }
         // 仅用量页的「今天」需要小时级分桶作图；其余区间与性能页不查小时数据。
-        let includeHourly = section == .usage && preset == .today
+        let includeHourly = usesHourlyBuckets
 
         do {
             let fresh = try await store.snapshot(from: current.from, to: current.to,
@@ -480,6 +718,16 @@ final class UsageViewModel: ObservableObject {
             let message = error.localizedDescription
             lastError = message
             phase = hasLoadedSnapshot ? .loaded : .failed(message)
+        }
+
+        // 已提交的选中柱随轮询静默重取（区间内可能有新记录、分组可能已变）；
+        // 取数中的目标则只在分组变化时用当前口径重启，避免每轮轮询把它打断。
+        if selection.pending == nil, let bucket = selection.bucket {
+            await refreshCommittedSelection(bucket, grouping: grouping, store: store)
+        } else if let target = selection.pending, selectionGrouping != grouping {
+            startSelectionLoad(target) { [store] from, to, grouping in
+                try await store.snapshot(from: from, to: to, grouping: grouping)
+            }
         }
     }
 

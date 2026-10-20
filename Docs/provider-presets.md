@@ -91,9 +91,13 @@ struct ProviderPreset: Identifiable {
 
 ## 额外请求头
 
-- OpenCode Zen / Go：仅固定 `x-opencode-client: ezswitch`。**不预填** `x-opencode-session` /
-  `x-opencode-project` / `x-opencode-request`，也不生成固定 UUID；这些逐会话字段由客户端传入并原样透传
-  （`Forwarder.buildRequest`）。预设不伪装成 opencode 客户端。
+- OpenCode Zen / Go：新建供应商草稿时生成一次 `x-opencode-session: <UUID>`，每个新草稿（Zen / Go 各自）
+  独立，同一草稿内编辑及获取模型列表保持同一个值，并随配置正常持久化。转发时
+  `remote.extraHeaders` 最后应用，按 header 名大小写不敏感覆盖客户端同名入站头。
+  **不预填** `x-opencode-client`（不再固定 `ezswitch`）/ `x-opencode-project` / `x-opencode-request`；
+  客户端传入这些头时仍会原样透传（`Forwarder.buildRequest`）。
+  UUID 只在新建草稿时生成，**不是**运行时逐请求生成，也不放在静态 `ProviderPreset.all` 中
+  （避免所有草稿复用同一值）；已有供应商和用户自定义请求头不受影响。
 - 其余预设 `extraHeaders` 为空；鉴权头由路由器按协议统一生成（Chat/Responses 用 `Authorization: Bearer`，
   Messages 用 `x-api-key` + `anthropic-version`，Gemini 原生用 `x-goog-api-key`）。额外头最后应用，可覆盖以上任意值。
 
@@ -153,8 +157,8 @@ struct ProviderPreset: Identifiable {
 ## 测试
 
 `Tests/EZSwitchTests/ProviderPresetTests.swift` 覆盖：目录合法性与唯一性、不含凭据、协议 URL 拼接
-（含 Messages 不出现 `/v1/v1`）、Command Code 的版本段拆分、OpenCode 不固化会话 ID 且动态透传、
-`preset → addProvider` 持久化、模型列表请求 URL/头、转发链 URL 与鉴权头。测试不发带真实密钥的网络请求。
+（含 Messages 不出现 `/v1/v1`）、Command Code 的版本段拆分、OpenCode 每个新草稿生成独立会话 UUID
+且覆盖同名入站头、`preset → addProvider` 持久化与新增模型继承、模型列表请求 URL/头、转发链 URL 与鉴权头。测试不发带真实密钥的网络请求。
 
 `Tests/EZSwitchTests/GeminiProviderTests.swift` 补充 Gemini：预设 id/name/icon 与 chat+native 端点、
 原生目录请求 URL 与 `x-goog-api-key`、`nextPageToken` 分页合并与去重（注入 mock URLSession，不换全局）、
