@@ -1,26 +1,36 @@
 import SwiftUI
+import Charts
 
 /// 性能统计视图，嵌在「用量」页内，与用量共用时间区间筛选。
 ///
-/// 顶部三张平均指标卡（平均 TTFT、平均 TPS 含 TTFT、平均 TPS 不含 TTFT，各带独立样本数），
-/// 下方是可切换分组（路由 / 供应商 / 模型）的比较表；排序不占控件，直接点击列头：
+/// 顶部四张指标卡（请求数、平均 TTFT、平均 TPS 含 / 不含 TTFT，各带独立样本数），
+/// 其下是请求数柱状图（今天按小时、其余区间按天）；点击柱子会把指标卡与性能明细收敛到该时段，
+/// 图表本身保留整个区间，再次点击同一根柱或点清除按钮回到整段。
+/// 再往下是可切换分组（路由 / 供应商 / 模型）的比较表；
+/// 全部五列（名称、三个指标、请求）都可排序，排序不占控件，直接点击列头：
 /// 点击某列按其默认方向排序，再次点击同一列反向，当前排序列显示方向箭头。
-/// 路由维度的 TTFT / 含 TTFT 的 TPS 是含自动回退的请求口径；供应商 / 模型维度是单次上游尝试口径；
-/// 不含 TTFT 的 TPS 两个维度共用同一字段。顶部总览固定为请求口径（与旧的 overall requestTTFT 一致）。
+/// 路由维度的 TTFT / 含 TTFT 的 TPS 是含自动回退的请求口径；供应商 / 模型维度是单次上游尝试口径。
+/// 不含 TTFT 的 TPS 只算生成时长，两维度共用，仅作对照。
+/// 顶部总览固定为请求口径（与旧的 overall requestTTFT 一致）。
 struct PerformanceView: View {
     @ObservedObject var model: UsageViewModel
     let store: UsageStore
 
-    /// 三列指标与一列样本数；表头与卡片同名，留出足够宽度。
-    private let columnWidth: CGFloat = 120
-    /// 样本数列的宽度：表头文案更长（"有效样本(TTFT/TPS)"），单独给宽度避免被压缩。
-    private let samplesColumnWidth: CGFloat = 140
+    /// 列宽：名称列定宽、指标列贴合内容；剩余空间由列间等距留白吸收，
+    /// 避免数值列内部出现大片空白（数值列不多时按权重平分会显得松散）。
+    /// 表头与数据行使用同一组宽度与间距，逐列严格对齐。
+    private let nameColumnWidth: CGFloat = 200
+    private let ttftColumnWidth: CGFloat = 96
+    private let tpsColumnWidth: CGFloat = 112
+    private let requestsColumnWidth: CGFloat = 60
+    private let columnGap: CGFloat = 16
 
     var body: some View {
         content
     }
 
-    private var summary: PerformanceSummary { model.performanceSnapshot.summary }
+    /// 指标卡与性能明细跟随选中的柱；未选中时是整个区间。
+    private var summary: PerformanceSummary { model.scopedPerformanceSummary }
 
     /// 路由维度用含自动回退的请求口径，其余维度用单次上游尝试口径。
     private var isRouteGrouping: Bool { model.performanceGrouping == .route }
@@ -58,15 +68,18 @@ struct PerformanceView: View {
     private var loadedContent: some View {
         if model.performanceIsEmpty {
             noHistoryState
-        } else if model.performanceHasNoSamples {
-            noSamplesState
         } else {
+            // 有转发记录就始终展示请求数与图表；无性能样本时仅以提示条说明 TTFT / TPS 为「—」。
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let error = model.performanceLastError {
                         warningBanner(error)
                     }
+                    if model.performanceHasNoSamples {
+                        noSamplesBanner
+                    }
                     metricsCard
+                    requestChartCard
                     comparisonCard
                 }
                 .padding(.horizontal, 24)
@@ -81,6 +94,10 @@ struct PerformanceView: View {
 
     private var metricsCard: some View {
         HStack(spacing: 12) {
+            StatTile(title: "请求数",
+                     value: UsageFormat.compact(summary.requests),
+                     caption: "次 · 尝试 \(PerformanceFormat.samples(summary.attempts))",
+                     help: requestCountHelp)
             metricTile(title: "平均TTFT",
                        value: PerformanceFormat.milliseconds(summaryTTFTValue),
                        unit: "总等待",
@@ -100,30 +117,18 @@ struct PerformanceView: View {
         .cardSurface()
     }
 
+    /// 请求数口径：去重计数与尝试数并列给出，说明自动回退只计一次。
+    private var requestCountHelp: String {
+        "请求数：按 request_id 去重，同一请求的多次自动回退尝试只计一次。\n" +
+        "区间内共 \(summary.attempts) 次转发尝试（含失败 / 取消 / 非流式，均计入请求数）。"
+    }
+
     private func metricTile(title: String, value: String, unit: String,
                             samples: Int, help: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-            Text(value)
-                .font(.system(.title2, design: .rounded).weight(.semibold))
-                .monospacedDigit()
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-            Text(samples > 0 ? "\(unit) · 样本 \(PerformanceFormat.samples(samples))" : "暂无样本")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
-        .help(help)
-        .accessibilityElement(children: .combine)
+        StatTile(title: title,
+                 value: value,
+                 caption: samples > 0 ? "\(unit) · 样本 \(PerformanceFormat.samples(samples))" : "暂无样本",
+                 help: help)
     }
 
     private func ttftMeanHelp(requestScope: Bool) -> String {
@@ -132,10 +137,12 @@ struct PerformanceView: View {
             : "平均首输出延迟：单次上游尝试首输出（不含自动回退等待）的平均值。"
     }
 
+    /// 含 TTFT 的吞吐分母覆盖整个响应期，攒批一次性下发也不失真；
+    /// 不含 TTFT 的版本只算生成时长，作为服务端"纯生成速度"的对照，攒批下发时会偏高。
     private func tpsMeanHelp(includingTTFT: Bool) -> String {
         includingTTFT
             ? "平均输出吞吐（含 TTFT，请求口径）：同一批有效样本的上游输出 token 总量 ÷（请求总等待 + 生成时长）总量，按总时长加权，不是逐请求速率的平均；输出 token 含推理 token。"
-            : "平均输出吞吐（不含 TTFT，请求口径）：同一批有效样本的上游输出 token 总量 ÷ 生成时长总量（不含 TTFT），按生成时长加权；输出 token 含推理 token。"
+            : "平均输出吞吐（不含 TTFT）：同一批有效样本的上游输出 token 总量 ÷ 生成时长总量（首分片到响应结束，不含首字等待），按生成时长加权，不是逐请求速率的平均；输出 token 含推理 token。攒批一次性下发的上游会低估生成时长、让该值偏高，请与含 TTFT 的版本对照着看。"
     }
 
     /// 分母解释：只统计成功流式请求，以及包含升级前无性能数据的全部尝试历史。
@@ -145,6 +152,48 @@ struct PerformanceView: View {
         return "TTFT / TPS 只统计成功完成的流式请求：区间内共 \(s.attempts) 次转发尝试，其中 \(s.successfulStreamingAttempts) 次为成功流式、进入有效样本；缺少计时字段的尝试仍可能没有样本。升级前的历史未采集性能数据，也可能计入尝试却没有有效样本。"
     }
 
+    // MARK: - 请求数图表
+
+    /// 图表粒度与用量页一致：今天按小时，其余区间按天。
+    private var isHourlyChart: Bool { model.chartUnit == .hour }
+
+    /// 请求数柱状图：展示整个区间的去重请求数序列；点击柱子收敛指标卡与明细，图表本身不裁剪。
+    private var requestChartCard: some View {
+        Chart(model.chartPoints) { point in
+            BarMark(
+                x: .value(isHourlyChart ? "时间" : "日期", point.date, unit: model.chartUnit),
+                y: .value("请求数", point.requests)
+            )
+            .foregroundStyle(Color.accentColor)
+            .cornerRadius(3)
+            .opacity(model.performanceActiveBucket == nil
+                     || model.performanceActiveBucket?.date == point.date ? 1 : 0.35)
+        }
+        // 固定 X 轴为当前区间，与用量图表一致，避免只有零星柱时被压缩。
+        .chartXScale(domain: model.range.from...model.range.to)
+        .statsChartAxes(isHourly: isHourlyChart,
+                        dates: isHourlyChart ? model.chartHours : model.chartDates)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                Rectangle().fill(Color.clear).contentShape(Rectangle())
+                    .onTapGesture { location in
+                        let plot = geometry[proxy.plotAreaFrame]
+                        guard plot.contains(location),
+                              let date: Date = proxy.value(atX: location.x - plot.minX) else {
+                            model.clearPerformanceSelection()
+                            return
+                        }
+                        model.togglePerformanceSelection(
+                            at: date, points: model.chartPoints, unit: model.chartUnit
+                        ) { from, to, grouping in
+                            try await store.performanceSnapshot(from: from, to: to, grouping: grouping)
+                        }
+                    }
+            }
+        }
+        .statsChartCard(title: isHourlyChart ? "每小时请求数" : "每日请求数")
+    }
+
     // MARK: - 比较表
 
     private var comparisonCard: some View {
@@ -152,7 +201,9 @@ struct PerformanceView: View {
         return VStack(alignment: .leading, spacing: 0) {
             // 与用量明细同一层级：标题、分组 segmented 紧邻；排序不再占用控件，改为点击列头。
             HStack(spacing: 12) {
-                Text("性能明细").font(.headline)
+                Text("性能明细")
+                    .font(.headline)
+                    .help("数值悬停可查看该分组的有效样本数；顶部卡片显示所选范围的总样本数。")
 
                 Picker("分组", selection: $model.performanceGrouping) {
                     ForEach(UsageGrouping.allCases) { grouping in
@@ -167,7 +218,6 @@ struct PerformanceView: View {
 
                 Spacer(minLength: 8)
 
-                Text("点击列头排序").font(.caption).foregroundStyle(.tertiary)
                 Text("\(rows.count) 项").font(.caption).foregroundStyle(.secondary)
             }
             .padding(.bottom, 10)
@@ -194,16 +244,21 @@ struct PerformanceView: View {
     }
 
     private var tableHeader: some View {
-        HStack(spacing: 12) {
-            Text("名称").frame(maxWidth: .infinity, alignment: .leading)
+        HStack(spacing: 0) {
+            headerCell(.name)
+                .frame(width: nameColumnWidth, alignment: .leading)
+            Spacer(minLength: columnGap)
             headerCell(.ttftMean)
+                .frame(width: ttftColumnWidth)
+            Spacer(minLength: columnGap)
             headerCell(.tpsIncludingTTFT)
+                .frame(width: tpsColumnWidth)
+            Spacer(minLength: columnGap)
             headerCell(.tpsExcludingTTFT)
-            Text("有效样本(TTFT/TPS)")
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-                .frame(width: samplesColumnWidth, alignment: .trailing)
-                .help("有效样本数：TTFT 样本 / TPS 样本（两者可能不同）")
+                .frame(width: tpsColumnWidth)
+            Spacer(minLength: columnGap)
+            headerCell(.requests)
+                .frame(width: requestsColumnWidth)
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -216,14 +271,9 @@ struct PerformanceView: View {
         return Button {
             model.togglePerformanceSort(key)
         } label: {
-            HStack(spacing: 4) {
-                Text(key.columnTitle(for: model.performanceGrouping))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                sortArrow(for: key)
-            }
-            .frame(width: columnWidth, alignment: .trailing)
-            .contentShape(Rectangle())
+            columnLabel(title: key.columnTitle(for: model.performanceGrouping),
+                        arrow: sortArrow(for: key),
+                        leading: key == .name)
         }
         .buttonStyle(.plain)
         .help(headerHelp(key))
@@ -231,6 +281,31 @@ struct PerformanceView: View {
         .accessibilityValue(isActive
                             ? (model.performanceSortAscending ? "已按升序排列" : "已按降序排列")
                             : "未排序")
+    }
+
+    /// 列头文字与箭头：名称列左对齐、箭头在文字后（文字左边缘不动）；
+    /// 数值列右对齐、箭头在文字前——文字右边缘与下方数值严格齐平，
+    /// 箭头显隐都不改变任何文字的位置。宽度由上方列宽常量统一约定。
+    private func columnLabel(title: String, arrow: some View, leading: Bool) -> some View {
+        let text = Text(title)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+        return Group {
+            if leading {
+                HStack(spacing: 4) {
+                    text
+                    arrow
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                HStack(spacing: 4) {
+                    arrow
+                    text
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .contentShape(Rectangle())
     }
 
     /// 简洁排序箭头：只标当前排序列；隐藏时保留同宽占位，避免列表横向跳动。
@@ -243,7 +318,8 @@ struct PerformanceView: View {
             .accessibilityHidden(true)
     }
 
-    /// 列口径 + 点击排序提示（当前方向 / 新列默认方向、未测置后）合成一个 tooltip。
+    /// 列口径 + 点击排序提示（当前方向 / 新列默认方向）合成一个 tooltip。
+    /// 「未测/未知恒定置后」只对三个指标列有意义：名称总有值，请求数恒为已知值。
     private func headerHelp(_ key: PerformanceSortKey) -> String {
         let sortHint: String
         if model.isPerformanceSortActive(key) {
@@ -255,12 +331,22 @@ struct PerformanceView: View {
                 ? "点击排序，默认升序（小值在前）"
                 : "点击排序，默认降序（大值在前）"
         }
-        return "\(columnHelp(key))\n\(sortHint)；未测/未知恒定置后。"
+        let base = "\(columnHelp(key))\n\(sortHint)"
+        switch key {
+        case .ttftMean, .tpsIncludingTTFT, .tpsExcludingTTFT:
+            return "\(base)；未测/未知恒定置后。"
+        case .name, .requests:
+            return "\(base)。"
+        }
     }
 
     /// 列口径进入表头 tooltip，替代原先独立的分组说明行。
     private func columnHelp(_ key: PerformanceSortKey) -> String {
         switch key {
+        case .name:
+            return "名称：当前分组（路由/供应商/模型）的显示名。"
+        case .requests:
+            return "请求数：按 request_id 去重；同一请求的自动回退尝试只计一次。"
         case .ttftMean:
             return isRouteGrouping
                 ? "路由维度：含自动回退的请求总等待（从请求进入路由器到首个有效输出片段）的平均值。"
@@ -270,7 +356,7 @@ struct PerformanceView: View {
                 ? "含 TTFT 的平均吞吐：请求口径下按（总等待 + 生成时长）总量加权，输出 token 含推理。"
                 : "含 TTFT 的平均吞吐：按（上游首输出 + 生成时长）总量加权，输出 token 含推理。"
         case .tpsExcludingTTFT:
-            return "不含 TTFT 的平均吞吐：输出 token 总量 ÷ 生成时长总量（不含 TTFT），按生成时长加权，输出 token 含推理。"
+            return "不含 TTFT 的平均吞吐：按生成时长（首分片到响应结束）总量加权，不含首字等待；两维度共用同一口径，攒批下发会让它偏高，请与含 TTFT 的版本对照。"
         }
     }
 
@@ -281,7 +367,7 @@ struct PerformanceView: View {
         let tpsExcluding = PerformanceFormat.tps(s.tpsExcludingTTFT)
         let sampleCount = ttftSampleCount(s)
 
-        return HStack(spacing: 12) {
+        return HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(row.title)
                     .font(.callout)
@@ -297,11 +383,20 @@ struct PerformanceView: View {
             }
             .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             .help(row.subtitle.isEmpty ? row.title : "\(row.title)\n\(row.subtitle)")
+            .frame(width: nameColumnWidth, alignment: .leading)
 
+            Spacer(minLength: columnGap)
             valueCell(ttft, help: "\(PerformanceSortKey.ttftMean.columnTitle(for: model.performanceGrouping))：\(sampleCount) 个 TTFT 样本")
+                .frame(width: ttftColumnWidth)
+            Spacer(minLength: columnGap)
             valueCell(tpsIncluding, help: "\(PerformanceSortKey.tpsIncludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
+                .frame(width: tpsColumnWidth)
+            Spacer(minLength: columnGap)
             valueCell(tpsExcluding, help: "\(PerformanceSortKey.tpsExcludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
-            samplesCell(s)
+                .frame(width: tpsColumnWidth)
+            Spacer(minLength: columnGap)
+            requestsCell(s)
+                .frame(width: requestsColumnWidth)
         }
         .padding(.vertical, 7)
     }
@@ -310,16 +405,16 @@ struct PerformanceView: View {
         Text(text)
             .font(.system(.callout, design: .rounded))
             .monospacedDigit()
-            .frame(width: columnWidth, alignment: .trailing)
+            .frame(maxWidth: .infinity, alignment: .trailing)
             .help(text == "—" ? "未测或样本不足\n\(help)" : help)
     }
 
-    private func samplesCell(_ s: PerformanceSummary) -> some View {
-        Text("\(PerformanceFormat.samples(ttftSampleCount(s))) / \(PerformanceFormat.samples(s.tpsSamples))")
+    private func requestsCell(_ s: PerformanceSummary) -> some View {
+        Text(UsageFormat.compact(s.requests))
             .font(.system(.callout, design: .rounded))
             .monospacedDigit()
-            .frame(width: samplesColumnWidth, alignment: .trailing)
-            .help("有效样本 TTFT / TPS = \(ttftSampleCount(s)) / \(s.tpsSamples)；尝试 \(s.attempts)")
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .help("请求数：\(UsageFormat.exact(s.requests))（按 request_id 去重）\n转发尝试：\(UsageFormat.exact(s.attempts)) 次")
     }
 
     // MARK: - 空 / 错误 / 加载
@@ -327,7 +422,7 @@ struct PerformanceView: View {
     private var noHistoryState: some View {
         VStack(spacing: 14) {
             EmptyState(title: "当前区间暂无记录",
-                       detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史性能；这里会统计流式请求的平均首输出延迟与平均吞吐。",
+                       detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史性能；这里会统计请求数与流式请求的平均首输出延迟、平均吞吐。",
                        symbol: "speedometer")
             Text("转发本身不受影响。")
                 .font(.caption)
@@ -337,25 +432,25 @@ struct PerformanceView: View {
         .padding(.top, 40)
     }
 
-    private var noSamplesState: some View {
-        VStack(spacing: 14) {
-            // 分组控件在任何状态都需可达：否则切到无样本的维度后无法切回有样本的维度。
-            Picker("分组", selection: $model.performanceGrouping) {
-                ForEach(UsageGrouping.allCases) { grouping in
-                    Text(grouping.title).tag(grouping)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 220)
-            .accessibilityLabel("按分组查看性能")
-
-            EmptyState(title: "有转发记录，但暂无性能样本",
-                       detail: "仅成功完成的流式请求参与 TTFT / TPS 统计；非流式、失败或被取消的请求不会计入。升级前的历史记录没有采集性能数据，因此旧流式历史也可能没有可展示的样本。",
-                       symbol: "speedometer")
-            Spacer()
+    /// 有转发记录但无 TTFT / TPS 样本：请求数与图表照常展示，仅提示延迟 / 吞吐不可用。
+    private var noSamplesBanner: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "info.circle")
+            Text(noSamplesBannerText)
+            Spacer(minLength: 0)
         }
-        .padding(.top, 40)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
+    }
+
+    /// 选中柱时点名所选时段，避免把「这一小时没样本」误读成「整个区间没样本」。
+    private var noSamplesBannerText: String {
+        let scope = model.performanceSelectedBucket.map { "所选时段（\($0.label())）" } ?? "当前区间"
+        return "\(scope)有转发记录，但暂无 TTFT / TPS 样本：仅成功完成的流式请求参与性能统计；请求数仍统计全部转发尝试。"
     }
 
     private func errorState(_ message: String) -> some View {
@@ -402,18 +497,5 @@ struct PerformanceView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-// MARK: - 卡片外观
-
-private extension View {
-    /// 与用量页一致的轻量卡片外观（file-private，不与 UsageView 的同名扩展冲突）。
-    func cardSurface() -> some View {
-        self
-            .padding(16)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.07)))
-            .padding(.trailing, 2)
     }
 }

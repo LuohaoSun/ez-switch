@@ -372,7 +372,6 @@ struct GeminiParserTests {
         p.finish(at: at(2_000_000))
         let perf = p.makePerformance()
         #expect(perf.outputDeltaCount == 1)
-        #expect(perf.tps(outputTokens: 100) == nil) // needs >= 2 valid events
     }
 
     @Test func chunksSplittingLinesAndCRLFAreSafe() {
@@ -398,7 +397,6 @@ struct GeminiParserTests {
         #expect(perf.outputDeltaCount == 0)
         #expect(perf.ttftMS == nil)
         #expect(perf.generationMS == nil)
-        #expect(perf.tps(outputTokens: 100) == nil)
     }
 
     @Test func accumulatorMapsGeminiPerformanceEndpoint() {

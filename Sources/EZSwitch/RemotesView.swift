@@ -657,6 +657,11 @@ struct RemoteEditSheet: View {
             }
                 .keyboardShortcut(.defaultAction)
                 .disabled(errorText != nil || draft.fetchingModels)
+            if managesConnection, draft.catalogModels == nil {
+                Button("保存") { save() }
+                    .disabled(errorText != nil || draft.fetchingModels)
+                    .help("暂不获取模型，先保存连接设置。需要代理的供应商：保存后到「扩展 → 出站代理」勾选并配置，再从供应商菜单获取模型列表。")
+            }
         }
         .padding(12)
     }
@@ -757,6 +762,11 @@ struct RemoteEditSheet: View {
             draft.error = store.updateModel(id: src.id, model: model)
         } else if addingModelToProvider {
             draft.error = store.addModel(provider: provider, model: model)
+        } else if draft.catalogModels == nil {
+            // 允许零模型保存：先落地供应商连接配置，获取模型列表与代理配置随后进行。
+            draft.error = store.addProvider(name: provider, modelIDs: [], apiKey: draft.apiKey,
+                                            extraHeaders: parsedHeaders,
+                                            apiEndpoints: draft.endpoints)
         } else {
             guard let models = draft.catalogModels,
                   draft.selectedModels.isSubset(of: Set(models)) else { return }

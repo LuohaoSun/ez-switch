@@ -8,6 +8,8 @@ enum CollapsibleMetrics {
     static let supplierSeparatorTop: CGFloat = 6
     static let supplierListTop: CGFloat = 10
     static let supplierSelectionInset: CGFloat = 10
+    /// 空壳供应商（尚无模型行）的提示高度：caption 两行 + 上下内边距。
+    static let emptySupplierHintHeight: CGFloat = 48
 
     static let routeSeparatorTop: CGFloat = 6
     static let routeListTop: CGFloat = 4

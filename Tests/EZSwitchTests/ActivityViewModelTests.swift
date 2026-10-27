@@ -295,21 +295,126 @@ struct ActivityViewModelTests {
 
     // MARK: - 表列宽自适应
 
-    @Test("窄窗口下 API 类型 / 路由 / 上游模型三列各自有下限，不合并")
+    @Test("窄窗口下 API 类型 / 路由 / 上游模型三列各自独立，不合并")
     func columnsKeepThreeDistinctWidths() {
         let narrow = ActivityColumns(width: 420)
         #expect(narrow.apiWidth > 0)
-        #expect(narrow.routeMinWidth > 0)
+        #expect(narrow.routeWidth > 0)
         #expect(narrow.upstreamMinWidth > 0)
         #expect(!narrow.showTime)
         #expect(!narrow.showElapsed)
+        #expect(!narrow.showTTFT)
+        #expect(!narrow.showTPS)
+        #expect(narrow.ttftWidth == 0)
+        #expect(narrow.tpsIncludingWidth == 0)
+
+        // TTFT 宽度可控，与「耗时」同档出现；TPS 更占宽度，等窗口更大再显示。
+        let medium = ActivityColumns(width: 900)
+        #expect(medium.showTime)
+        #expect(medium.showElapsed)
+        #expect(medium.showTTFT)
+        #expect(!medium.showTPS)
+        #expect(medium.ttftWidth > 0)
+        #expect(medium.tpsIncludingWidth == 0)
 
         let wide = ActivityColumns(width: 1000)
         #expect(wide.showTime)
         #expect(wide.showElapsed)
+        #expect(wide.showTTFT)
+        #expect(wide.showTPS)
+        #expect(wide.ttftWidth > 0)
+        #expect(wide.tpsIncludingWidth > 0)
         #expect(wide.apiWidth >= narrow.apiWidth)
-        #expect(wide.routeMinWidth >= narrow.routeMinWidth)
+        #expect(wide.routeWidth >= narrow.routeWidth)
         #expect(wide.upstreamMinWidth >= narrow.upstreamMinWidth)
+
+        // 路由列定宽：更宽的窗口只把多余空间给上游模型，不把路由列撑大。
+        let extraWide = ActivityColumns(width: 1400)
+        #expect(extraWide.routeWidth == wide.routeWidth)
+    }
+
+    // MARK: - 请求级性能明细
+
+    private func performance(streaming: Bool = true,
+                             ttft: Double? = 100,
+                             requestTTFT: Double? = 200,
+                             generation: Double? = 800,
+                             deltaCount: Int = 4) -> UsagePerformance {
+        UsagePerformance(streaming: streaming, ttftMS: ttft, requestTTFTMS: requestTTFT,
+                         generationMS: generation, outputDeltaCount: deltaCount)
+    }
+
+    @Test("性能明细优先请求级 requestTTFT，含 TTFT 除以总时长")
+    func requestPerformanceDetailUsesRequestTTFTAndGeneration() {
+        let model = row(phase: .succeeded,
+                        tokens: UsageTokens(input: 12, output: 10),
+                        performance: performance())
+        // 10 × 1000 / (200 + 800) = 10.0。
+        #expect(model.ttftText == "200 ms")
+        #expect(model.tpsIncludingTTFTText == "10.0")
+        #expect(model.requestPerformanceDetail?.ttftMS == 200)
+    }
+
+    @Test("缺少请求级 TTFT 时回退尝试级 TTFT，生成时长口径不变")
+    func requestPerformanceDetailFallsBackToAttemptTTFT() {
+        let model = row(phase: .succeeded,
+                        tokens: UsageTokens(output: 10),
+                        performance: performance(ttft: 100, requestTTFT: nil, generation: 900))
+        // 10 × 1000 / (100 + 900) = 10.0。
+        #expect(model.ttftText == "100 ms")
+        #expect(model.tpsIncludingTTFTText == "10.0")
+
+        // 长 TTFT 退化为秒，保持窄列可读。
+        let long = row(phase: .succeeded,
+                       tokens: UsageTokens(output: 10),
+                       performance: performance(ttft: nil, requestTTFT: 1_500, generation: 500))
+        #expect(long.ttftText == "1.5 s")
+    }
+
+    @Test("进行中 / 失败 / 取消 / 非流式 / 缺数据一律显示 —，不伪造零")
+    func performanceDetailOnlyShowsCompletedValidValues() {
+        let tokens = UsageTokens(input: 12, output: 10)
+        for phase in [ActivityPhase.inFlight, .receiving, .failed, .cancelled] {
+            let model = row(phase: phase, tokens: tokens, performance: performance())
+            #expect(model.requestPerformanceDetail == nil)
+            #expect(model.ttftText == "—")
+            #expect(model.tpsIncludingTTFTText == "—")
+        }
+
+        let nonStreaming = row(phase: .succeeded, tokens: tokens,
+                               performance: performance(streaming: false))
+        #expect(nonStreaming.ttftText == "—")
+        #expect(nonStreaming.tpsIncludingTTFTText == "—")
+
+        let missingPerformance = row(phase: .succeeded, tokens: tokens, performance: nil)
+        #expect(missingPerformance.ttftText == "—")
+        #expect(missingPerformance.tpsIncludingTTFTText == "—")
+
+        let missingOutput = row(phase: .succeeded, tokens: UsageTokens(input: 12),
+                                performance: performance())
+        #expect(missingOutput.tpsIncludingTTFTText == "—")
+    }
+
+    @Test("输出 token / 生成时长 / 输出增量 / TTFT 不满足有效性约束时为 —")
+    func performanceDetailRejectsInsufficientData() {
+        func model(output: Int? = 10,
+                   ttft: Double? = 100,
+                   requestTTFT: Double? = 200,
+                   generation: Double? = 800,
+                   deltaCount: Int = 4) -> ActivityRowModel {
+            row(phase: .succeeded, tokens: UsageTokens(output: output),
+                performance: performance(ttft: ttft, requestTTFT: requestTTFT,
+                                         generation: generation, deltaCount: deltaCount))
+        }
+
+        #expect(model(output: 1).tpsIncludingTTFTText == "—")       // 输出 token 不足 2
+        #expect(model(generation: 0).tpsIncludingTTFTText == "—")   // 生成时长必须 > 0
+        #expect(model(generation: -1).tpsIncludingTTFTText == "—")
+        #expect(model(generation: .nan).tpsIncludingTTFTText == "—")
+        #expect(model(generation: .infinity).tpsIncludingTTFTText == "—")
+        #expect(model(deltaCount: 1).tpsIncludingTTFTText == "—")   // 输出增量不足 2
+        #expect(model(ttft: nil, requestTTFT: nil).ttftText == "—") // 无有效 TTFT
+        #expect(model(ttft: nil, requestTTFT: nil).tpsIncludingTTFTText == "—")
     }
 
     // MARK: - 有界展示

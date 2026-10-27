@@ -22,7 +22,7 @@
 
 点击图表中的某根柱（小时或自然日）会把上方的总览卡片与下方的使用明细都收敛到该小时／该日；图表本身始终保留整个区间的序列，选中后其余柱依然可以点选。标题旁会出现所选时段的指示与清除按钮；再次点击同一根柱、点清除按钮或点坐标轴留白处都会回到整个区间。切换时间区间（含自定义天数）、切换视图或图表粒度（今天按小时、其余按天）都会重置所选柱——旧柱在新区间或新粒度下不再成立。总览卡片另含「缓存命中率」指标，口径见上文「范围与口径」。
 
-侧栏「性能」是独立入口，复用用量页的同一组区间预设，展示同一数据源下流式请求的首输出延迟（TTFT）与吞吐（TPS），口径见下文「性能统计」。「性能明细」表点击列头排序：首次点击按该列默认方向（延迟类升序、吞吐类降序），再次点击同一列反向，未测或未知的样本恒定置后。
+侧栏「性能」是独立入口，复用用量页的同一组区间预设，展示同一数据源下的请求数与流式请求的首输出延迟（TTFT）、吞吐（TPS），口径见下文「性能统计」。请求数按 `request_id` 去重（一个请求自动回退多次只计一次），以指标卡、柱状图（今天按小时、其余按天，与用量页同一图表外壳）与「性能明细」表的「请求」列三种粒度展示；有转发记录但暂无性能样本时，请求数照常展示，TTFT／TPS 显示「—」并附提示条。点击柱状图中的某根柱会把指标卡与性能明细收敛到该时段（图表本身仍保留整段），再次点击同一根柱、点标题旁的清除按钮或点坐标轴留白处回到整段；请求数为 0 的柱不可选，没有性能样本的时段会显示「暂无样本」提示而不是空页。有效样本数不单独占列，数值悬停可查看该分组的 TTFT／TPS 样本数，顶部均值卡显示所选范围的总样本数。「性能明细」表点击列头排序：首次点击按该列默认方向（延迟类升序、吞吐类降序），再次点击同一列反向，未测或未知的样本恒定置后。
 
 CSV 导出保留所选时间范围内的逐次上游尝试记录。缓存和推理字段在导出中单独保留。导出不包含 API Key、请求头、提示词或回答正文。清空记录需要在界面确认，不修改路由配置。
 
@@ -42,7 +42,7 @@ ezs usage --performance --group route --json
 - `--period today|7d|month`：预设区间，默认 `today`。`7d` 含今天及前 6 个自然日。
 - `--from`／`--to`：自定义区间，必须成对且不能与 `--period` 同时出现；日期按 `YYYY-MM-DD`，`--to` 含当天，实际日历有效性由应用校验。
 - `--group route|provider|model` 与 `--limit 1..1000`：分组维度与最大分组数，默认 `route`、`100`；被截断时提示 `showing N of M groups`。
-- `--performance`：在用量报告之外追加流式性能统计（TTFT/TPS）；未显式给出 `--group` 时性能默认按 `model` 分组，普通用量默认仍是 `route`。见下文「性能统计」。
+- `--performance`：在用量报告之外追加流式性能统计（TTFT 与含 TTFT 的 TPS）；未显式给出 `--group` 时性能默认按 `model` 分组，普通用量默认仍是 `route`。见下文「性能统计」。
 - `--json`：输出日期范围、总量、每日趋势、分组明细和报告覆盖率，Token 数值保留精确整数。分组限制只影响明细行，不改变总量或每日趋势；加 `--performance` 时输出 `{"usage": …, "performance": …}` 两个对象。
 
 文本输出给出精确的输入／输出／合计、缓存与推理细分、请求数、上游尝试、失败尝试与覆盖率，并列出每日趋势与分组摘要。覆盖率不足时明确标注合计为已上报部分、不是估算。空区间显示 `No usage recorded`，表示该范围内确实没有记录，而不是数据缺失。分组名称中的控制字符会被转义，避免终端转义序列注入；输出不含 API Key 或本机路径。旧版本应用不支持 `usage` 时会提示更新并重启。
@@ -56,11 +56,11 @@ ezs usage --performance --group route --json
 - **测量范围**：原生 Responses、Chat Completions、Anthropic Messages、原生 Gemini SSE，以及经桥接转换的路由，均按**原始上游响应**测量；协议转换补出的事件不参与统计。
 - **TTFT**：从开始准备该次上游请求到收到**首个非空正文、推理或工具参数片段**的毫秒数。心跳、仅含角色或生命周期信息的事件不计入。Gemini 按 `candidates[].content.parts[]` 判定：非空 `text`（含 `thought: true` 的思考文本）、非空名称的 `functionCall`（零参数工具可省略 `args` 或传 `{}`）、以及有效的 `inlineData` 多模态结果都算有效输出；仅 `thoughtSignature`、空 part、`safetyRatings`／`finishReason`／`role` 或仅用量事件不计入。流式片段可能包含多个 token，无法据此还原模型内部的首 token 生成时刻。
 - **Gemini 非 SSE 流**：`streamGenerateContent` 不带 `alt=sse` 时返回 JSON 数组，需要完整响应体才能解析，**不产生任何性能样本**（不显示 TTFT／TPS），但用量仍按完整有界缓冲提取。需要性能统计时应使用 SSE 入口。
-- **TPS**：输出计数使用上游报告的输出 token，可能包含思考 token。含 TTFT 时计入首输出等待与生成时间，不含 TTFT 时只计首个有效输出片段到响应体正常结束的时间；两者均按总 token ÷ 总时间汇总。上游缓冲和网络传输会影响观测值，无法据此还原模型内部解码速度。
-- **有效样本**：平均 TTFT 使用成功完成（2xx）、对应 TTFT 有效且有限的流式尝试，不要求上报 token 数。两种 TPS 使用同一组样本，额外要求两种 TTFT 有效、完整生成时间有限且大于零、输出 tokens ≥ 2、有效输出事件 ≥ 2。失败、取消或无法可靠解析的样本不计入对应指标。
+- **TPS**：输出计数使用上游报告的输出 token，可能包含思考 token。分母计入首输出等待与生成时间（覆盖从请求进入到响应体正常结束的整个响应期），按总 token ÷ 总时间汇总。上游缓冲和网络传输会影响观测值，无法据此还原模型内部解码速度。应用内性能页另展示「不含 TTFT」的平均 TPS（分母只算首分片到响应结束的生成时间），仅作对照；攒批一次性下发的上游会低估生成时长、让该值偏高。
+- **有效样本**：平均 TTFT 使用成功完成（2xx）、对应 TTFT 有效且有限的流式尝试，不要求上报 token 数。TPS 使用同一组样本，额外要求两种 TTFT 有效、完整生成时间有限且大于零、输出 tokens ≥ 2、有效输出事件 ≥ 2。失败、取消或无法可靠解析的样本不计入对应指标。
 - **requestTTFT 与 attemptTTFT**：整体汇总与按 `route` 分组时展示 **requestTTFT**，从路由器收到完整请求并进入候选尝试阶段开始计时，包含自动回退等待；按 `provider`／`model` 分组时展示 **attemptTTFT**，仅包含该次上游尝试自身的首输出等待。两者都在原始上游流上测量，后续输出翻译、事件重排及客户端渲染延迟不属于该口径。
 - **样本数**：TTFT samples 与展示口径一致——`route` 分组为 request 级样本数（JSON `requestTTFTSamples`），`provider`／`model` 分组为上游 attempt 样本数（`ttftSamples`）。两者可能不同；request 级样本缺失时按 0 显示并给出 warning，绝不用上游样本数冒充路由样本。TPS samples 独立统计。
-- **聚合指标**：平均 TTFT = 有效 TTFT 之和 ÷ 样本数；平均 TPS（含 TTFT）= `Σ输出 Token ÷ Σ(TTFT + 生成时间)`；平均 TPS（不含 TTFT）= `Σ输出 Token ÷ Σ生成时间`。时间以秒计，TPS 单位为 `tok/s`；两个 TPS 均不对每次请求的速率求算术平均。
+- **聚合指标**：平均 TTFT = 有效 TTFT 之和 ÷ 样本数；平均 TPS（含 TTFT）= `Σ输出 Token ÷ Σ(TTFT + 生成时间)`。应用内性能页另给出平均 TPS（不含 TTFT）= `Σ输出 Token ÷ Σ生成时间`，与含 TTFT 版本共用同一批样本、只换分母。时间以秒计，TPS 单位为 `tok/s`；TPS 不对每次请求的速率求算术平均。
 - **无样本**：没有对应样本时显示 `—`，JSON 中对应字段为 `null`，绝不显示为 0。
 - **历史**：早于本功能开始记录的历史尝试没有性能数据，与「无样本」一致；统计不持久化任何提示词或回答正文，只保留时延与 token 计数。
 
@@ -76,13 +76,12 @@ Summary
   TTFT samples: 9  TPS samples: 8
   Average TTFT: 480 ms
   Average TPS (incl TTFT): 38.1 tok/s
-  Average TPS (excl TTFT): 42.3 tok/s
 
 Groups — basis: upstream attempt
   deepseek-v4.1-flash (command-wsz)
     Attempts 12  Successful streaming 9/12 attempts
     TTFT samples 9  TPS samples 8
-    Average TTFT 480 ms  Average TPS (incl TTFT) 38.1 tok/s  Average TPS (excl TTFT) 42.3 tok/s
+    Average TTFT 480 ms  Average TPS (incl TTFT) 38.1 tok/s
 ```
 
 按 `route` 分组时，明细标注 `Groups — basis: request (includes fallback)`，使用 requestTTFT；整体汇总始终使用请求口径。

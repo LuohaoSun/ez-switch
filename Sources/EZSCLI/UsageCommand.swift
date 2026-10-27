@@ -27,7 +27,7 @@ struct UsageOptions: Equatable {
     var from: String? = nil
     var to: String? = nil
     var json: Bool = false
-    /// `--performance` adds TTFT/TPS statistics to the request.
+    /// `--performance` adds TTFT / TPS (incl TTFT) statistics to the request.
     var performance: Bool = false
     /// Whether `--group` was given explicitly; drives the performance default.
     var groupExplicitlySet: Bool = false
@@ -282,8 +282,6 @@ struct PerformanceReportSummary: Decodable, Equatable {
     var tpsIncludingTTFT: Double?
     /// Request-scope variant of `tpsIncludingTTFT`, including fallback waiting.
     var requestTpsIncludingTTFT: Double?
-    /// Average output throughput (tok/s) over generation time only, excluding TTFT.
-    var tpsExcludingTTFT: Double?
 }
 
 struct PerformanceReportGroup: Decodable, Equatable {
@@ -408,7 +406,7 @@ enum UsageResponseParser {
     /// server; a payload carrying only the old percentile fields does not.
     static let averageMetricKeys = [
         "ttftMeanMS", "requestTTFTMeanMS", "tpsIncludingTTFT",
-        "requestTpsIncludingTTFT", "tpsExcludingTTFT",
+        "requestTpsIncludingTTFT",
     ]
 
     /// True when the summary or any group summary carries at least one average-metric
@@ -545,8 +543,7 @@ enum UsageTextFormatter {
     // Average metrics. The overall summary is always request scope
     // (requestTTFTMeanMS / requestTpsIncludingTTFT), matching the old overall
     // requestTTFT. Group rows follow the grouping: route -> request scope,
-    // provider/model -> upstream attempt. TPS excluding TTFT is a single shared
-    // field with no request/attempt distinction.
+    // provider/model -> upstream attempt.
 
     private static func requestTTFTMean(_ summary: PerformanceReportSummary) -> Double? {
         summary.requestTTFTMeanMS
@@ -562,10 +559,6 @@ enum UsageTextFormatter {
 
     private static func groupTpsIncludingTTFT(_ summary: PerformanceReportSummary, grouping: String) -> Double? {
         grouping == "route" ? summary.requestTpsIncludingTTFT : summary.tpsIncludingTTFT
-    }
-
-    private static func tpsExcludingTTFT(_ summary: PerformanceReportSummary) -> Double? {
-        summary.tpsExcludingTTFT
     }
 
     /// The sample count backing the TTFT metric for the active grouping. A missing
@@ -616,7 +609,6 @@ enum UsageTextFormatter {
                 + "TPS samples: \(count(summary.tpsSamples))",
             "\(indent)Average TTFT: \(duration(requestTTFTMean(summary)))",
             "\(indent)Average TPS (incl TTFT): \(rate(requestTpsIncludingTTFT(summary)))",
-            "\(indent)Average TPS (excl TTFT): \(rate(tpsExcludingTTFT(summary)))",
         ]
     }
 
@@ -641,8 +633,7 @@ enum UsageTextFormatter {
             "    TTFT samples \(count(ttftSampleCount(summary, grouping: grouping)))  "
                 + "TPS samples \(count(summary.tpsSamples))",
             "    Average TTFT \(duration(groupTTFTMean(summary, grouping: grouping)))  "
-                + "Average TPS (incl TTFT) \(rate(groupTpsIncludingTTFT(summary, grouping: grouping)))  "
-                + "Average TPS (excl TTFT) \(rate(tpsExcludingTTFT(summary)))",
+                + "Average TPS (incl TTFT) \(rate(groupTpsIncludingTTFT(summary, grouping: grouping)))",
         ]
     }
 
@@ -721,7 +712,7 @@ enum EZSCLIHelp {
       --to <YYYY-MM-DD>                Custom end date (inclusive); requires --from.
       --group <route|provider|model>   How to group results. Default: route.
       --limit <1-1000>                 Maximum groups to show. Default: 100.
-      --performance                    Add TTFT/TPS streaming performance stats.
+      --performance                    Add TTFT / TPS (incl TTFT) streaming stats.
       --json                           Print the raw usage object as JSON.
 
     Dates use the local calendar; --to is inclusive. 7d covers today and the six
@@ -742,7 +733,7 @@ enum EZSCLIHelp {
       --to <YYYY-MM-DD>                Custom end date (inclusive).
       --group <route|provider|model>   How to group results. Default: route.
       --limit <1-1000>                 Maximum groups to show. Default: 100.
-      --performance                    Add TTFT/TPS streaming performance stats,
+      --performance                    Add TTFT / TPS (incl TTFT) streaming stats,
                                        grouped by model unless --group is given.
       --json                           Print the raw usage object as JSON.
       -h, --help                       Show this help.

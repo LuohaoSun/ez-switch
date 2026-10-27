@@ -80,8 +80,7 @@ enum UsageFixture {
                                    tpsSamples: Int = 3,
                                    ttftMeanMS: Double? = 1200, requestTTFTMeanMS: Double? = 1500,
                                    tpsIncludingTTFT: Double? = 42.3,
-                                   requestTpsIncludingTTFT: Double? = 38.0,
-                                   tpsExcludingTTFT: Double? = 55.1) -> [String: Any] {
+                                   requestTpsIncludingTTFT: Double? = 38.0) -> [String: Any] {
         // Average-metric keys are always present (null when unmeasured), like the
         // real payload, so the parser's key-presence check sees a mean-capable server.
         [
@@ -94,7 +93,6 @@ enum UsageFixture {
             "requestTTFTMeanMS": numeric(requestTTFTMeanMS),
             "tpsIncludingTTFT": numeric(tpsIncludingTTFT),
             "requestTpsIncludingTTFT": numeric(requestTpsIncludingTTFT),
-            "tpsExcludingTTFT": numeric(tpsExcludingTTFT),
         ]
     }
 

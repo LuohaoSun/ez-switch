@@ -100,6 +100,19 @@ enum ActivityFormat {
         return String(format: "%.1f s", value)
     }
 
+    /// 请求表首字列：短等待用毫秒保留精度，超过 1 秒退化为秒。
+    static func ttft(_ value: Double?) -> String {
+        guard let value, value.isFinite, value >= 0 else { return "—" }
+        if value < 1000 { return String(format: "%.0f ms", value) }
+        return String(format: "%.1f s", value / 1000)
+    }
+
+    /// 请求表吞吐列：保留一位小数；非有限 / 负数视为未知。
+    static func rate(_ value: Double?) -> String {
+        guard let value, value.isFinite, value >= 0 else { return "—" }
+        return String(format: "%.1f", value)
+    }
+
     /// 耗时统一取后端单调时钟 `elapsedMS`，不用 Date 差值，避免系统时钟跳变。
     static func elapsed(ms: Int) -> String {
         let interval = Double(max(0, ms)) / 1000
@@ -245,6 +258,16 @@ struct ActivityRowModel: Identifiable, Equatable {
     }
 
     var durationText: String { ActivityFormat.elapsed(ms: elapsedMS) }
+
+    /// 请求级性能明细：只有成功完成的请求才展示最终值。
+    /// 进行中、失败、取消、非流式或数据不足一律为 nil（表格显示「—」）。
+    var requestPerformanceDetail: RequestPerformanceDetail? {
+        guard phase == .succeeded else { return nil }
+        return performance?.requestDetail(outputTokens: tokens.output)
+    }
+
+    var ttftText: String { ActivityFormat.ttft(requestPerformanceDetail?.ttftMS) }
+    var tpsIncludingTTFTText: String { ActivityFormat.rate(requestPerformanceDetail?.tpsIncludingTTFT) }
 
     /// 流向图请求节点状态短语：只是 `statusText` 去掉对勾 / 叹号的紧凑版，同样只陈述快照已观测的阶段。
     /// 命中回退（有回退记录或多次尝试）时明确标注「回退后」；快照没有「正在切换上游」的实时证据，因此不这么写。

@@ -38,15 +38,15 @@ struct PerformanceParserTests {
         p.ingest(sse(#"{"choices":[{"delta":{"role":"assistant"}}]}"#), at: at(2_000_000))
         p.ingest(sse(#"{"choices":[{"delta":{"content":"Hel"}}]}"#), at: at(5_000_000))
         p.ingest(sse(#"{"choices":[{"delta":{"content":"lo world"}}]}"#), at: at(7_000_000))
-        p.finish(at: at(10_000_000))
+        // 结束定在 20ms：生成窗口 15ms。
+        p.finish(at: at(20_000_000))
 
         let perf = p.makePerformance()
         #expect(perf.streaming)
         #expect(perf.outputDeltaCount == 2) // one per event, not one per token
         #expect(approx(perf.ttftMS, 4))                 // 5ms - 1ms attempt start
         #expect(approx(perf.requestTTFTMS, 5))          // 5ms - 0 request start
-        #expect(approx(perf.generationMS, 5))           // 10ms - 5ms first delta
-        #expect(approx(perf.tps(outputTokens: 4), 800)) // 4 tokens * 1000 / 5ms
+        #expect(approx(perf.generationMS, 15))          // 20ms - 5ms first delta
     }
 
     @Test func chatReasoningAndToolCallArgumentsCountedButNameOnlyIsNot() {
@@ -76,7 +76,6 @@ struct PerformanceParserTests {
         let perf = p.makePerformance()
         #expect(perf.outputDeltaCount == 1)
         #expect(perf.ttftMS != nil)
-        #expect(perf.tps(outputTokens: 100) == nil) // needs >= 2 valid events
     }
 
     @Test func contentAndReasoningInSameDeltaCountOnce() {
@@ -138,7 +137,6 @@ struct PerformanceParserTests {
         #expect(perf.outputDeltaCount == 0)
         #expect(perf.ttftMS == nil)
         #expect(perf.generationMS == nil)
-        #expect(perf.tps(outputTokens: 9) == nil)
     }
 
     // MARK: - Boundary safety
@@ -183,7 +181,6 @@ struct PerformanceParserTests {
         #expect(perf.outputDeltaCount == 0)
         #expect(perf.ttftMS == nil)
         #expect(perf.generationMS == nil)
-        #expect(perf.tps(outputTokens: 100) == nil)
     }
 
     // MARK: - Short stream / TPS guard
@@ -196,8 +193,6 @@ struct PerformanceParserTests {
         #expect(perf.outputDeltaCount == 1)
         #expect(perf.ttftMS != nil)
         #expect(perf.generationMS != nil)
-        #expect(perf.tps(outputTokens: 50) == nil) // needs >= 2 deltas
-        #expect(perf.tps(outputTokens: 1) == nil)  // needs >= 2 tokens
     }
 
     // MARK: - Overflow / bounded parsing
@@ -205,7 +200,7 @@ struct PerformanceParserTests {
     @Test func overflowBeforeFirstDeltaSuppressesTiming() {
         var p = parser(.chat)
         // A line larger than the cap must be dropped, and the first delta is never
-        // reliably located → TTFT/generation (and TPS) stay unknown.
+        // reliably located → TTFT/generation stay unknown.
         let huge = "data: {\"choices\":[{\"delta\":{\"content\":\"" + String(repeating: "x", count: PerformanceParser.maxEventBytes + 16) + "\"}}]}"
         p.ingest(Data((huge + "\n\n").utf8), at: at(2_000_000))
         p.ingest(sse(#"{"choices":[{"delta":{"content":"hi"}}]}"#), at: at(3_000_000))
@@ -214,7 +209,6 @@ struct PerformanceParserTests {
         let perf = p.makePerformance()
         #expect(perf.ttftMS == nil)
         #expect(perf.generationMS == nil)
-        #expect(perf.tps(outputTokens: 100) == nil)
     }
 
     @Test func emptyDataLineAndDoneAreNotLosses() {
@@ -238,7 +232,6 @@ struct PerformanceParserTests {
         #expect(perf.outputDeltaCount == 1)
         #expect(approx(perf.ttftMS, 1)) // first delta still known
         #expect(perf.generationMS == nil) // count/timing no longer trustworthy
-        #expect(perf.tps(outputTokens: 100) == nil)
     }
 
     @Test func overflowAfterFirstDeltaKeepsTTFTButDropsGeneration() {
@@ -271,6 +264,5 @@ struct PerformanceParserTests {
         #expect(partial.outputDeltaCount == 2)
         #expect(partial.ttftMS != nil)
         #expect(partial.generationMS == nil) // body has not ended yet
-        #expect(partial.tps(outputTokens: 8) == nil)
     }
 }

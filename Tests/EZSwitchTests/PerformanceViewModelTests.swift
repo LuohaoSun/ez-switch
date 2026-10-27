@@ -50,9 +50,10 @@ struct PerformanceViewModelTests {
                          tpsExcluding: Double? = nil,
                          ttftSamples: Int = 0, tpsSamples: Int = 0,
                          requestSamples: Int = 0,
-                         attempts: Int = 0) -> PerformanceGroupRow {
+                         attempts: Int = 0, requests: Int = 0) -> PerformanceGroupRow {
         var summary = PerformanceSummary()
         summary.attempts = attempts
+        summary.requests = requests
         summary.ttftSamples = ttftSamples
         summary.tpsSamples = tpsSamples
         summary.requestTTFTSamples = requestSamples
@@ -82,6 +83,35 @@ struct PerformanceViewModelTests {
     private func load(_ snapshot: PerformanceSnapshot, into model: UsageViewModel) async -> UsageViewModel {
         await model.refreshPerformance { _, _, _ in snapshot }
         return model
+    }
+
+    /// 等待性能选中取数结束（提交或失败）。
+    private func waitForPerformanceSelection(_ model: UsageViewModel,
+                                             timeout: TimeInterval = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !model.performanceSelectionIsLoading,
+               model.performanceSelectionSnapshot != nil || model.performanceSelectionError != nil {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return false
+    }
+
+    private func dayPoint(_ date: Date, requests: Int = 1) -> UsageDay {
+        UsageDay(date: date, input: 0, output: 0, requests: requests)
+    }
+
+    /// 首个调用慢、其后快：用于复现「旧选中响应迟到」的竞态。
+    private final class CallGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var calls = 0
+        func isFirstCall() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            calls += 1
+            return calls == 1
+        }
     }
 
     // MARK: - 排序
@@ -128,17 +158,14 @@ struct PerformanceViewModelTests {
         #expect(sorted.map(\.title) == ["alpha", "zeta"])
     }
 
-    /// 排序跟随所选列：含 TTFT 列在路由 / 模型维度取不同字段，不含 TTFT 列两维度共用。
+    /// 排序跟随所选列：含 TTFT 列在路由 / 模型维度取不同字段。
     @Test func sortByTPSFollowsSelectedColumn() {
         let rows = [
-            makeRow("slow", tpsIncluding: 5, tpsExcluding: 90),
-            makeRow("fast", tpsIncluding: 80, tpsExcluding: 10),
+            makeRow("slow", tpsIncluding: 5),
+            makeRow("fast", tpsIncluding: 80),
         ]
         let byIncluding = PerformanceSort.sorted(rows, by: .tpsIncludingTTFT, grouping: .model, ascending: false)
         #expect(byIncluding.map(\.title) == ["fast", "slow"])
-
-        let byExcluding = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT, grouping: .model, ascending: false)
-        #expect(byExcluding.map(\.title) == ["slow", "fast"])
 
         let routeRows = [
             makeRow("a", tpsIncluding: 100, requestTpsIncluding: 10),
@@ -147,31 +174,85 @@ struct PerformanceViewModelTests {
         let byRouteIncluding = PerformanceSort.sorted(routeRows, by: .tpsIncludingTTFT,
                                                       grouping: .route, ascending: false)
         #expect(byRouteIncluding.map(\.title) == ["b", "a"])
+
+        // 不含 TTFT 的吞吐两维度共用同一字段；无样本的行恒定置后。
+        let excludingRows = [
+            makeRow("gen-slow", tpsExcluding: 10),
+            makeRow("unmeasured"),
+            makeRow("gen-fast", tpsExcluding: 60),
+        ]
+        for grouping in [UsageGrouping.route, .provider, .model] {
+            let sorted = PerformanceSort.sorted(excludingRows, by: .tpsExcludingTTFT,
+                                                grouping: grouping, ascending: false)
+            #expect(sorted.map(\.title) == ["gen-fast", "gen-slow", "unmeasured"])
+        }
     }
 
-    @Test func sortKeyTitlesUseTheThreeMetricNames() {
+    @Test func sortKeyTitlesUseTheMetricNames() {
         #expect(PerformanceSortKey.ttftMean.title(for: .model) == "平均TTFT")
         #expect(PerformanceSortKey.tpsIncludingTTFT.title(for: .route) == "平均TPS(含TTFT)")
-        #expect(PerformanceSortKey.tpsExcludingTTFT.columnTitle(for: .model) == "平均TPS(不含TTFT)")
+        #expect(PerformanceSortKey.tpsExcludingTTFT.title(for: .route) == "平均TPS(不含TTFT)")
+    }
+
+    /// 名称列按自然序比较：数字按数值大小而非逐字符（「路由 2」在「路由 10」前），降序只是反转。
+    @Test func sortByNameUsesLocalizedNaturalOrder() {
+        let rows = [makeRow("路由 10"), makeRow("路由 2")]
+        let ascending = PerformanceSort.sorted(rows, by: .name, grouping: .model, ascending: true)
+        #expect(ascending.map(\.title) == ["路由 2", "路由 10"])
+
+        let descending = PerformanceSort.sorted(rows, by: .name, grouping: .model, ascending: false)
+        #expect(descending.map(\.title) == ["路由 10", "路由 2"])
+    }
+
+    /// 名称相同的行按 id 稳定 tie-break，与方向无关。
+    @Test func sortByNameBreaksTiesByID() {
+        var first = makeRow("dup")
+        first.id = "b-id"
+        var second = makeRow("dup")
+        second.id = "a-id"
+
+        for ascending in [true, false] {
+            let sorted = PerformanceSort.sorted([first, second], by: .name,
+                                                grouping: .model, ascending: ascending)
+            #expect(sorted.map(\.id) == ["a-id", "b-id"])
+        }
+    }
+
+    /// 请求数走数值路径且恒为已知值：0 请求也参与排序，不会被当成未知置后。
+    @Test func sortByRequestsOrdersByDeduplicatedCount() {
+        let rows = [makeRow("few", requests: 2), makeRow("many", requests: 50), makeRow("none", requests: 0)]
+
+        let descending = PerformanceSort.sorted(rows, by: .requests, grouping: .model, ascending: false)
+        #expect(descending.map(\.title) == ["many", "few", "none"])
+
+        let ascending = PerformanceSort.sorted(rows, by: .requests, grouping: .model, ascending: true)
+        #expect(ascending.map(\.title) == ["none", "few", "many"])
+    }
+
+    @Test func nameAndRequestColumnsHaveExpectedDefaultsAndTitles() {
+        #expect(PerformanceSortKey.name.defaultAscending)
+        #expect(!PerformanceSortKey.requests.defaultAscending)
+        #expect(PerformanceSortKey.name.title(for: .model) == "名称")
+        #expect(PerformanceSortKey.requests.columnTitle(for: .route) == "请求")
     }
 
     /// 同值 tie-break 与方向无关：先按标题，再按 id；点列头反复切换也不会抖动。
     @Test func tiesBreakByTitleThenIDRegardlessOfDirection() {
-        let rows = [makeRow("zeta", tpsExcluding: 50), makeRow("alpha", tpsExcluding: 50)]
+        let rows = [makeRow("zeta", tpsIncluding: 50), makeRow("alpha", tpsIncluding: 50)]
         for ascending in [true, false] {
-            let sorted = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT,
+            let sorted = PerformanceSort.sorted(rows, by: .tpsIncludingTTFT,
                                                 grouping: .model, ascending: ascending)
             #expect(sorted.map(\.title) == ["alpha", "zeta"])
         }
     }
 
     @Test func tiesBreakByIDWhenTitlesMatch() {
-        var first = makeRow("dup", tpsExcluding: 50)
+        var first = makeRow("dup", tpsIncluding: 50)
         first.id = "b-id"
-        var second = makeRow("dup", tpsExcluding: 50)
+        var second = makeRow("dup", tpsIncluding: 50)
         second.id = "a-id"
 
-        let sorted = PerformanceSort.sorted([first, second], by: .tpsExcludingTTFT,
+        let sorted = PerformanceSort.sorted([first, second], by: .tpsIncludingTTFT,
                                              grouping: .model, ascending: false)
         #expect(sorted.map(\.id) == ["a-id", "b-id"])
     }
@@ -179,18 +260,18 @@ struct PerformanceViewModelTests {
     /// 非有限值（NaN / 无穷）与 nil 同样视为未知：既不参与比较，也不随排序算法漂移。
     @Test func nonFiniteValuesSortAsUnknownAndStayLast() {
         let rows = [
-            makeRow("nan", tpsExcluding: .nan),
-            makeRow("slow", tpsExcluding: 10),
-            makeRow("infinite", tpsExcluding: .infinity),
-            makeRow("fast", tpsExcluding: 90),
+            makeRow("nan", tpsIncluding: .nan),
+            makeRow("slow", tpsIncluding: 10),
+            makeRow("infinite", tpsIncluding: .infinity),
+            makeRow("fast", tpsIncluding: 90),
             makeRow("none"),
         ]
 
-        let ascending = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT,
+        let ascending = PerformanceSort.sorted(rows, by: .tpsIncludingTTFT,
                                                grouping: .model, ascending: true)
         #expect(ascending.map(\.title) == ["slow", "fast", "infinite", "nan", "none"])
 
-        let descending = PerformanceSort.sorted(rows, by: .tpsExcludingTTFT,
+        let descending = PerformanceSort.sorted(rows, by: .tpsIncludingTTFT,
                                                 grouping: .model, ascending: false)
         #expect(descending.map(\.title) == ["fast", "slow", "infinite", "nan", "none"])
     }
@@ -210,12 +291,12 @@ struct PerformanceViewModelTests {
         #expect(model.performanceSortKey == .ttftMean)
         #expect(model.performanceSortAscending)
 
-        model.togglePerformanceSort(.tpsExcludingTTFT)
-        #expect(model.performanceSortKey == .tpsExcludingTTFT)
+        model.togglePerformanceSort(.tpsIncludingTTFT)
+        #expect(model.performanceSortKey == .tpsIncludingTTFT)
         #expect(!model.performanceSortAscending)          // 吞吐列默认降序
 
-        model.togglePerformanceSort(.tpsExcludingTTFT)
-        #expect(model.performanceSortKey == .tpsExcludingTTFT)
+        model.togglePerformanceSort(.tpsIncludingTTFT)
+        #expect(model.performanceSortKey == .tpsIncludingTTFT)
         #expect(model.performanceSortAscending)           // 同列再点反向
 
         model.togglePerformanceSort(.ttftMean)
@@ -241,8 +322,8 @@ struct PerformanceViewModelTests {
         let model = UsageViewModel()
         var snapshot = PerformanceSnapshot()
         snapshot.groups = [
-            makeRow("slow", ttftMean: 300, tpsExcluding: 90),
-            makeRow("fast", ttftMean: 100, tpsExcluding: 10),
+            makeRow("slow", ttftMean: 300, tpsIncluding: 90),
+            makeRow("fast", ttftMean: 100, tpsIncluding: 10),
         ]
         await load(snapshot, into: model)
 
@@ -252,10 +333,10 @@ struct PerformanceViewModelTests {
         model.togglePerformanceSort(.ttftMean)
         #expect(model.sortedPerformanceGroups.map(\.title) == ["slow", "fast"])
 
-        model.togglePerformanceSort(.tpsExcludingTTFT)
+        model.togglePerformanceSort(.tpsIncludingTTFT)
         #expect(model.sortedPerformanceGroups.map(\.title) == ["slow", "fast"])   // 吞吐默认降序
 
-        model.togglePerformanceSort(.tpsExcludingTTFT)
+        model.togglePerformanceSort(.tpsIncludingTTFT)
         #expect(model.sortedPerformanceGroups.map(\.title) == ["fast", "slow"])
     }
 
@@ -264,16 +345,16 @@ struct PerformanceViewModelTests {
         let model = UsageViewModel()
         var snapshot = PerformanceSnapshot()
         snapshot.groups = [
-            makeRow("measured-slow", tpsExcluding: 10),
+            makeRow("measured-slow", tpsIncluding: 10),
             makeRow("unknown"),
-            makeRow("measured-fast", tpsExcluding: 90),
+            makeRow("measured-fast", tpsIncluding: 90),
         ]
         await load(snapshot, into: model)
 
-        model.togglePerformanceSort(.tpsExcludingTTFT)
+        model.togglePerformanceSort(.tpsIncludingTTFT)
         #expect(model.sortedPerformanceGroups.map(\.title) == ["measured-fast", "measured-slow", "unknown"])
 
-        model.togglePerformanceSort(.tpsExcludingTTFT)
+        model.togglePerformanceSort(.tpsIncludingTTFT)
         #expect(model.sortedPerformanceGroups.map(\.title) == ["measured-slow", "measured-fast", "unknown"])
     }
 
@@ -410,6 +491,162 @@ struct PerformanceViewModelTests {
         model.setCustomLastNDays(14)
         #expect(model.customLastNDays == 14)
         #expect(model.customLastNDaysInput == "14")
+    }
+
+    // MARK: - 请求数柱选中
+
+    /// 点柱只收敛指标卡与性能明细；图表背后的整段快照保持不变。
+    @Test func selectingRequestBarScopesCardsAndTableOnly() async {
+        let model = UsageViewModel(section: .performance)
+        let whole = makeSnapshot(attempts: 10, ttftMean: 300,
+                                 groups: [makeRow("whole", ttftMean: 300, ttftSamples: 10, attempts: 10)])
+        await load(whole, into: model)
+
+        var scoped = makeSnapshot(attempts: 3, ttftMean: 120, requestSamples: 3,
+                                  groups: [makeRow("scoped", ttftMean: 120, ttftSamples: 3, attempts: 3)])
+        scoped.summary.requests = 2
+        let day = Calendar.current.startOfDay(for: Date())
+        let point = dayPoint(day, requests: 2)
+
+        model.togglePerformanceSelection(at: point.date, points: [point], unit: .day) { _, _, _ in scoped }
+        #expect(await waitForPerformanceSelection(model))
+
+        #expect(model.performanceSelectedBucket?.date == point.date)
+        #expect(model.scopedPerformanceSummary.attempts == 3)
+        #expect(model.scopedPerformanceSummary.requests == 2)
+        #expect(model.scopedPerformanceSummary.ttftMeanMS == 120)
+        #expect(model.sortedPerformanceGroups.map(\.title) == ["scoped"])
+        // 整段快照仍是图表与空态判定的依据。
+        #expect(model.performanceSnapshot.summary.attempts == 10)
+        #expect(!model.performanceIsEmpty)
+    }
+
+    /// 再次点击同一根柱回到整段；清除按钮走同一入口。
+    @Test func clickingSelectedRequestBarAgainClearsSelection() async {
+        let model = UsageViewModel(section: .performance)
+        await load(makeSnapshot(attempts: 10, ttftMean: 300), into: model)
+        let day = Calendar.current.startOfDay(for: Date())
+        let point = dayPoint(day, requests: 1)
+        let scoped = makeSnapshot(attempts: 2, ttftMean: 50)
+
+        model.togglePerformanceSelection(at: point.date, points: [point], unit: .day) { _, _, _ in scoped }
+        #expect(await waitForPerformanceSelection(model))
+        #expect(model.performanceSelectedBucket != nil)
+
+        model.togglePerformanceSelection(at: point.date, points: [point], unit: .day) { _, _, _ in scoped }
+        #expect(model.performanceSelectedBucket == nil)
+        #expect(model.performanceSelectionSnapshot == nil)
+        #expect(model.scopedPerformanceSummary.attempts == 10)
+    }
+
+    /// 请求数为 0 的柱没有可钻取的请求，点击只清空现有选中。
+    @Test func requestBarWithoutRequestsIsNotSelectable() {
+        let model = UsageViewModel(section: .performance)
+        let day = Calendar.current.startOfDay(for: Date())
+        let empty = dayPoint(day, requests: 0)
+
+        model.togglePerformanceSelection(at: empty.date, points: [empty], unit: .day) { _, _, _ in
+            PerformanceSnapshot()
+        }
+        #expect(model.performanceSelectedBucket == nil)
+        #expect(model.performancePendingBucket == nil)
+    }
+
+    /// 换性能分组后选中柱失去意义：回到整段并按新分组重新取数。
+    @Test func changingPerformanceGroupingResetsSelection() async {
+        let model = UsageViewModel(section: .performance)
+        await load(makeSnapshot(attempts: 10, ttftMean: 300), into: model)
+        let day = Calendar.current.startOfDay(for: Date())
+        let point = dayPoint(day)
+        let scoped = makeSnapshot(attempts: 2, ttftMean: 50)
+
+        model.togglePerformanceSelection(at: point.date, points: [point], unit: .day) { _, _, _ in scoped }
+        #expect(await waitForPerformanceSelection(model))
+        #expect(model.performanceSelectedBucket != nil)
+
+        model.performanceGrouping = .route
+        await load(makeSnapshot(attempts: 10, ttftMean: 300), into: model)
+        #expect(model.performanceSelectedBucket == nil)
+        #expect(model.scopedPerformanceSummary.attempts == 10)
+    }
+
+    /// 整段有样本、但所选时段没有样本时，仍保留请求数并给出「暂无样本」提示。
+    @Test func selectedBucketWithoutSamplesFlagsNoSamples() async {
+        let model = UsageViewModel(section: .performance)
+        await load(makeSnapshot(attempts: 10, ttftMean: 300), into: model)
+        let day = Calendar.current.startOfDay(for: Date())
+        let point = dayPoint(day, requests: 4)
+        // 该时段有 4 次请求，但都不是成功流式样本。
+        var scoped = makeSnapshot(attempts: 4, ttftMean: nil)
+        scoped.summary.requests = 4
+
+        model.togglePerformanceSelection(at: point.date, points: [point], unit: .day) { _, _, _ in scoped }
+        #expect(await waitForPerformanceSelection(model))
+
+        #expect(!model.performanceIsEmpty)       // 整段仍有历史
+        #expect(model.performanceHasNoSamples)   // 但所选时段没有 TTFT/TPS 样本
+        #expect(model.scopedPerformanceSummary.requests == 4)
+        #expect(model.scopedPerformanceSummary.attempts == 4)
+    }
+
+    /// 迟到的旧选中响应不得覆盖更新的选中柱。
+    @Test func lateRequestBarSelectionDoesNotOverrideNewerSelection() async {
+        let model = UsageViewModel(section: .performance)
+        await load(makeSnapshot(attempts: 10, ttftMean: 300), into: model)
+        let calendar = Calendar.current
+        let day1 = calendar.startOfDay(for: Date())
+        let day2 = calendar.date(byAdding: .day, value: -1, to: day1)!
+        let points = [dayPoint(day1), dayPoint(day2)]
+        let first = makeSnapshot(attempts: 1, ttftMean: 999)
+        let second = makeSnapshot(attempts: 2, ttftMean: 111)
+        let gate = CallGate()
+
+        model.togglePerformanceSelection(at: day1, points: points, unit: .day) { _, _, _ in
+            if gate.isFirstCall() {
+                try await Task.sleep(nanoseconds: 400_000_000)
+            }
+            return first
+        }
+        try? await Task.sleep(nanoseconds: 60_000_000)
+        model.togglePerformanceSelection(at: day2, points: points, unit: .day) { _, _, _ in
+            if gate.isFirstCall() {
+                try await Task.sleep(nanoseconds: 400_000_000)
+            }
+            return second
+        }
+        #expect(await waitForPerformanceSelection(model))
+        #expect(model.performanceSelectedBucket?.date == day2)
+        #expect(model.scopedPerformanceSummary.ttftMeanMS == 111)
+
+        // 迟到的旧响应到达后仍是第二次选择的数据。
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        #expect(model.performanceSelectedBucket?.date == day2)
+        #expect(model.scopedPerformanceSummary.ttftMeanMS == 111)
+    }
+
+    /// 轮询刷新整段时，已提交的选中柱按自己的时段静默重取，不丢失也不退回整段。
+    @Test func wholeRangeRefreshKeepsCommittedSelectionUpdated() async {
+        let model = UsageViewModel(section: .performance)
+        model.preset = .last7Days
+        await load(makeSnapshot(attempts: 10, ttftMean: 300), into: model)
+        let calendar = Calendar.current
+        let day = calendar.date(byAdding: .day, value: -1,
+                                to: calendar.startOfDay(for: Date()))!
+        let point = dayPoint(day, requests: 1)
+        let scoped = makeSnapshot(attempts: 2, ttftMean: 50)
+
+        model.togglePerformanceSelection(at: point.date, points: [point], unit: .day) { _, _, _ in scoped }
+        #expect(await waitForPerformanceSelection(model))
+
+        let refreshedScoped = makeSnapshot(attempts: 3, ttftMean: 77)
+        await model.refreshPerformance { from, _, _ in
+            from == day ? refreshedScoped : makeSnapshot(attempts: 11, ttftMean: 333)
+        }
+
+        #expect(model.performanceSelectedBucket?.date == day)
+        #expect(model.scopedPerformanceSummary.attempts == 3)
+        #expect(model.scopedPerformanceSummary.ttftMeanMS == 77)
+        #expect(model.performanceSnapshot.summary.attempts == 11)
     }
 
     // MARK: - 空态判定
@@ -561,12 +798,12 @@ struct PerformanceViewModelTests {
         let model = UsageViewModel()
         var snapshot = PerformanceSnapshot()
         snapshot.groups = [
-            makeRow("b", ttftMean: 200, tpsExcluding: 20),
-            makeRow("a", ttftMean: 100, tpsExcluding: 50),
+            makeRow("b", ttftMean: 200, tpsIncluding: 20),
+            makeRow("a", ttftMean: 100, tpsIncluding: 50),
         ]
         await load(snapshot, into: model)
 
-        model.performanceSortKey = .tpsExcludingTTFT
+        model.performanceSortKey = .tpsIncludingTTFT
         model.performanceSortAscending = false
         #expect(model.sortedPerformanceGroups.map(\.title) == ["a", "b"])
 

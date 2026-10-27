@@ -152,7 +152,7 @@ struct RouteWorkspaceView: View {
                     if expanded { ui.collapsedProviders.insert(group.provider) }
                     else { ui.collapsedProviders.remove(group.provider) }
                 },
-                accessibilityLabel: "供应商 \(group.provider)，\(group.remotes.count) 个模型",
+                accessibilityLabel: "供应商 \(group.provider)，\(group.modelRemotes.count) 个模型",
                 help: ui.query.isEmpty ? "展开或收起；拖动标题调整供应商顺序" : "展开或收起"
             ) {
                 HStack(spacing: 8) {
@@ -160,7 +160,7 @@ struct RouteWorkspaceView: View {
                         .frame(width: 18, height: 18)
                     Text(group.provider).font(.subheadline.bold()).lineLimit(1)
                     Spacer(minLength: 8)
-                    Text("\(group.remotes.count)").font(.caption).foregroundStyle(.secondary)
+                    Text("\(group.modelRemotes.count)").font(.caption).foregroundStyle(.secondary)
                 }
             } accessory: {
                 Menu {
@@ -188,12 +188,22 @@ struct RouteWorkspaceView: View {
             }
             CollapsibleBody(isExpanded: expanded,
                             expandedHeight: CollapsibleMetrics.supplierBodyHeight(
-                                tableHeight: ui.supplierTableHeights[group.provider] ?? 0)) {
+                                tableHeight: group.modelRemotes.isEmpty
+                                    ? CollapsibleMetrics.emptySupplierHintHeight
+                                    : ui.supplierTableHeights[group.provider] ?? 0)) {
                 Divider()
                     .padding(.horizontal, CollapsibleMetrics.supplierSelectionInset)
                     .padding(.top, CollapsibleMetrics.supplierSeparatorTop)
+                if group.modelRemotes.isEmpty {
+                    Text("尚未添加模型。打开右上角菜单可获取模型列表或手动添加。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, CollapsibleMetrics.supplierSelectionInset)
+                        .padding(.vertical, 8)
+                }
                 NativeSupplierModelList(
-                    items: group.remotes.map {
+                    items: group.modelRemotes.map {
                         SupplierModelItem(id: $0.id, label: $0.model, needsCredentials: $0.needsCredentials)
                     },
                     provider: group.provider,

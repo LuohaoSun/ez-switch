@@ -236,7 +236,6 @@ struct PerformanceIntegrationTests {
         #expect(perf.requestTTFTMS != nil)
         #expect(perf.generationMS != nil)
         #expect(perf.requestTTFTMS! >= perf.ttftMS! - 0.001)
-        #expect(perf.tps(outputTokens: 3) != nil)
     }
 
     @Test func nonStreamingSuccessRecordsNonStreamingPerformance() async throws {
@@ -263,7 +262,6 @@ struct PerformanceIntegrationTests {
         #expect(perf.outputDeltaCount == 0)
         #expect(perf.ttftMS == nil)
         #expect(perf.generationMS == nil)
-        #expect(perf.tps(outputTokens: 100) == nil)
     }
 
     // MARK: Fallback
@@ -405,7 +403,6 @@ struct PerformanceIntegrationTests {
         #expect(perf.outputDeltaCount == 2)
         #expect(perf.ttftMS != nil)
         #expect(perf.generationMS == nil) // body never ended normally
-        #expect(perf.tps(outputTokens: 2) == nil)
     }
 
     // MARK: Other protocols

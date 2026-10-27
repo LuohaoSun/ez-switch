@@ -1,18 +1,25 @@
 import SwiftUI
 
-/// 请求表的列宽：按可用宽度自适应，窄窗口先隐藏「耗时」「时间」。
-/// 「API 类型」「路由」「上游模型」各自独立成列（各有下限），窄窗口也不合并。
+/// 请求表的列宽：按可用宽度自适应，窄窗口先隐藏 TPS，再隐藏 TTFT、耗时、时间。
+/// 「API 类型」「路由」「上游模型」各自独立成列，窄窗口也不合并；
+/// 路由名通常很短，用定宽避免把整段剩余宽度都吃掉，多余空间全部让给上游模型。
 struct ActivityColumns {
     let showTime: Bool
     let showElapsed: Bool
+    /// 请求级首字等待列：比吞吐轻得多，更早出现，中等宽度就能看到。
+    let showTTFT: Bool
+    /// 请求级吞吐列（TPS 含 TTFT）：最占宽度，最后出现。
+    let showTPS: Bool
     let leading: CGFloat
     let timeWidth: CGFloat
     let apiWidth: CGFloat
-    let routeMinWidth: CGFloat
+    let routeWidth: CGFloat
     let upstreamMinWidth: CGFloat
     let statusWidth: CGFloat
     let tokenWidth: CGFloat
     let elapsedWidth: CGFloat
+    let ttftWidth: CGFloat
+    let tpsIncludingWidth: CGFloat
     let spacing: CGFloat
 
     init(width: CGFloat) {
@@ -22,15 +29,27 @@ struct ActivityColumns {
         self.leading = 22
         self.showTime = w >= 720
         self.showElapsed = w >= 820
+        // TTFT 只有数字、宽度可控，和「耗时」同档出现；TPS 更宽，等窗口再大一些才加。
+        self.showTTFT = w >= 820
+        self.showTPS = w >= 960
         self.timeWidth = self.showTime ? 58 : 0
         self.elapsedWidth = self.showElapsed ? 56 : 0
+        self.ttftWidth = self.showTTFT ? 58 : 0
+        self.tpsIncludingWidth = self.showTPS ? 84 : 0
         self.apiWidth = narrow ? 60 : 68
         self.statusWidth = narrow ? 66 : 74
         self.tokenWidth = narrow ? 48 : 54
-        // 路由 / 上游模型两列在剩余宽度内平分，且各自有下限。
-        self.routeMinWidth = narrow ? 60 : 82
+        // 路由定宽（长名字中间截断、悬停看全称）；上游模型列吃掉剩余宽度，且有下限。
+        self.routeWidth = narrow ? 64 : 96
         self.upstreamMinWidth = narrow ? 72 : 96
     }
+}
+
+/// 性能列的 help / accessibility 口径说明（表头与数据行共用，避免两处口径漂移）。
+enum ActivityPerformanceHelp {
+    static let ttft = "TTFT（首字等待）：优先 requestTTFTMS，缺失时回退尝试级 ttftMS。"
+    static let tpsIncluding = "TPS（含 TTFT）= 输出 tokens × 1000 /（TTFT + 生成时长）；分母覆盖整个响应期，攒批下发也成立。"
+    static let validity = "仅流式、有效 TTFT、输出 tokens ≥ 2、生成时长 > 0 且输出增量 ≥ 2 时显示最终值；进行中、非流式、失败或数据不足显示 —。"
 }
 
 /// 表头：与请求行同列宽。
@@ -48,7 +67,7 @@ struct ActivityListHeader: View {
                 .frame(width: columns.apiWidth, alignment: .leading)
             Text("路由")
                 .lineLimit(1)
-                .frame(minWidth: columns.routeMinWidth, maxWidth: .infinity, alignment: .leading)
+                .frame(width: columns.routeWidth, alignment: .leading)
             Text("上游模型")
                 .lineLimit(1)
                 .frame(minWidth: columns.upstreamMinWidth, maxWidth: .infinity, alignment: .leading)
@@ -57,6 +76,20 @@ struct ActivityListHeader: View {
             Text("输出").frame(width: columns.tokenWidth, alignment: .trailing)
             if columns.showElapsed {
                 Text("耗时").frame(width: columns.elapsedWidth, alignment: .trailing)
+            }
+            if columns.showTTFT {
+                Text("TTFT")
+                    .lineLimit(1)
+                    .frame(width: columns.ttftWidth, alignment: .trailing)
+                    .help("\(ActivityPerformanceHelp.ttft)\n\(ActivityPerformanceHelp.validity)")
+                    .accessibilityLabel("TTFT（首字等待）")
+            }
+            if columns.showTPS {
+                Text("TPS 含 TTFT")
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                    .frame(width: columns.tpsIncludingWidth, alignment: .trailing)
+                    .help("\(ActivityPerformanceHelp.tpsIncluding)\n\(ActivityPerformanceHelp.validity)")
+                    .accessibilityLabel("TPS（含 TTFT）")
             }
         }
         .font(.system(size: 11))
@@ -107,7 +140,7 @@ struct ActivityRequestRow: View {
             Text(row.routeName)
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(1).truncationMode(.middle)
-                .frame(minWidth: columns.routeMinWidth, maxWidth: .infinity, alignment: .leading)
+                .frame(width: columns.routeWidth, alignment: .leading)
                 .help(row.routeName)
 
             upstreamCell
@@ -128,6 +161,21 @@ struct ActivityRequestRow: View {
                 Text(row.durationText)
                     .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
                     .frame(width: columns.elapsedWidth, alignment: .trailing)
+            }
+
+            if columns.showTTFT {
+                Text(row.ttftText)
+                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                    .frame(width: columns.ttftWidth, alignment: .trailing)
+                    .help("\(ActivityPerformanceHelp.ttft)\n当前：\(row.ttftText)\n\(ActivityPerformanceHelp.validity)")
+                    .accessibilityLabel("TTFT（首字等待） \(row.ttftText)")
+            }
+            if columns.showTPS {
+                Text(row.tpsIncludingTTFTText)
+                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                    .frame(width: columns.tpsIncludingWidth, alignment: .trailing)
+                    .help("\(ActivityPerformanceHelp.tpsIncluding)\n当前：\(row.tpsIncludingTTFTText)\n\(ActivityPerformanceHelp.validity)")
+                    .accessibilityLabel("TPS（含 TTFT） \(row.tpsIncludingTTFTText)")
             }
         }
         .padding(.horizontal, 12)
