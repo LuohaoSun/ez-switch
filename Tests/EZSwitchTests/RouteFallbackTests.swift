@@ -96,7 +96,7 @@ struct RouteFallbackTests {
         try JSONEncoder().encode(AppConfig(port: 8788, remotes: [], fakes: [])).write(to: url)
         let store = ConfigStore(configURL: url)
         let endpoints = APIEndpointSettings.all(baseURL: "https://example.test/v1/")
-        #expect(store.addProvider(name: "Test", modelIDs: [], apiKey: "key", extraHeaders: [:], apiEndpoints: endpoints) != nil)
+        #expect(store.addProvider(name: "Test", modelIDs: ["  "], apiKey: "key", extraHeaders: [:], apiEndpoints: endpoints) != nil)
         #expect(store.config.remotes.isEmpty)
         #expect(store.addProvider(name: "Test", modelIDs: ["one", "two"], apiKey: "key",
                                   extraHeaders: ["x-test": "value"], apiEndpoints: endpoints) == nil)

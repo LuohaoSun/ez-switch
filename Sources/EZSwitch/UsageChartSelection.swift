@@ -60,3 +60,19 @@ struct UsageSelectionState {
 
     var isLoading: Bool { pending != nil }
 }
+
+/// 性能页的图表选中态。与用量页同构，但提交的是 `PerformanceSnapshot`：
+/// 柱状图仍展示整个区间的请求数，指标卡与性能明细收敛到所选时段。
+struct PerformanceSelectionState {
+    var bucket: UsageChartSelection?
+    var snapshot: PerformanceSnapshot?
+    var error: String?
+    var pending: UsageChartSelection?
+
+    static let empty = PerformanceSelectionState()
+
+    /// 图表高亮的柱：取数中的目标优先，点击后立即有反馈。
+    var activeBucket: UsageChartSelection? { pending ?? bucket }
+
+    var isLoading: Bool { pending != nil }
+}

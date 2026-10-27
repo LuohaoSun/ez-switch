@@ -71,6 +71,8 @@ struct UsageDay: Identifiable, Sendable {
     var date: Date
     var input: Int
     var output: Int
+    /// 该分桶内去重后的请求数（同一请求的多次回退尝试只计一次）。
+    var requests: Int = 0
     var id: Date { date }
 }
 

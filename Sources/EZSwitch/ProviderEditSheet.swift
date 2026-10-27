@@ -88,7 +88,9 @@ struct ProviderEditSheet: View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("供应商设置").font(.title2.bold())
-                Text("连接设置统一应用于 \(group.remotes.count) 个模型，保留各模型 ID 和路由绑定。")
+                Text(group.modelRemotes.isEmpty
+                     ? "尚无模型；连接设置已保存，获取或添加模型时自动应用。"
+                     : "连接设置统一应用于 \(group.modelRemotes.count) 个模型，保留各模型 ID 和路由绑定。")
                     .font(.callout).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading).padding(20)
             Form {

@@ -329,10 +329,12 @@ struct ModelsPane: View {
                 Menu {
                     Button("未绑定") { store.setRoute(fakeID: fake.id, remoteID: nil) }
                     ForEach(store.groupedRemotes()) { group in
-                        Section(group.provider) {
-                            ForEach(group.remotes) { target in
-                                Button((fake.remoteID == target.id ? "✓ " : "") + target.routeLabel) {
-                                    store.setRoute(fakeID: fake.id, remoteID: target.id)
+                        if !group.modelRemotes.isEmpty {
+                            Section(group.provider) {
+                                ForEach(group.modelRemotes) { target in
+                                    Button((fake.remoteID == target.id ? "✓ " : "") + target.routeLabel) {
+                                        store.setRoute(fakeID: fake.id, remoteID: target.id)
+                                    }
                                 }
                             }
                         }

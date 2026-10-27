@@ -4,18 +4,45 @@ struct UsagePerformance: Codable, Equatable, Sendable {
     var streaming: Bool
     var ttftMS: Double? = nil
     var requestTTFTMS: Double? = nil
+    /// 首分片→流结束的线上到达时间；只作为含 TTFT 速率分母的一部分参与聚合。
     var generationMS: Double? = nil
     var outputDeltaCount: Int = 0
+}
 
-    /// 单条记录的有效吞吐（token/s）：仅在流式、且已观测到有效 TTFT、输出增量与生成时长都足以支撑时给出。
-    /// 有效 TTFT 是本方法的硬前提（与统计口径一致：无 TTFT 的尝试不产生样本）。
-    /// 仅用于 CSV / 原始观测导出；聚合统计不再使用逐请求速率（见 `PerformanceSummary`）。
-    func tps(outputTokens: Int?) -> Double? {
-        guard streaming, let ttftMS, ttftMS.isFinite, ttftMS >= 0, outputDeltaCount >= 2,
+/// 单个请求的请求级性能明细（活动页表格用）。
+/// 缺失或无效一律为 `nil`，由展示层显示「—」，绝不伪造成 0。
+struct RequestPerformanceDetail: Equatable, Sendable {
+    /// 首字等待：优先请求级 `requestTTFTMS`，缺失时回退尝试级 `ttftMS`。
+    var ttftMS: Double
+    /// 输出 tokens × 1000 /（TTFT + 生成时长）。分母覆盖整个响应期，攒批下发也成立。
+    var tpsIncludingTTFT: Double
+}
+
+extension UsagePerformance {
+    /// 合法时长：有限且非负（TTFT 允许 0，表示首个增量立即到达）。
+    static func validDuration(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        return value
+    }
+
+    /// 请求级首字等待：优先 `requestTTFTMS`，缺失 / 无效时回退尝试级 `ttftMS`。
+    var effectiveTTFTMS: Double? {
+        Self.validDuration(requestTTFTMS) ?? Self.validDuration(ttftMS)
+    }
+
+    /// 单请求性能明细：仅流式、有效 TTFT、输出 token ≥ 2、生成时长 > 0、输出增量 ≥ 2 时给出；
+    /// 任一前提缺失即返回 `nil`（展示为「—」），绝不伪造 0。
+    func requestDetail(outputTokens: Int?) -> RequestPerformanceDetail? {
+        guard streaming, outputDeltaCount >= 2,
+              let ttftMS = effectiveTTFTMS,
               let outputTokens, outputTokens >= 2,
-              let generationMS, generationMS.isFinite, generationMS > 0 else { return nil }
-        let value = Double(outputTokens) * 1000 / generationMS
-        return value.isFinite ? value : nil
+              let generation = Self.validDuration(generationMS), generation > 0 else { return nil }
+        let total = ttftMS + generation
+        guard total.isFinite, total > 0 else { return nil }
+        let including = Double(outputTokens) * 1000 / total
+        guard including.isFinite else { return nil }
+        return RequestPerformanceDetail(ttftMS: ttftMS,
+                                        tpsIncludingTTFT: including)
     }
 }
 
@@ -23,11 +50,14 @@ struct UsagePerformance: Codable, Equatable, Sendable {
 /// TTFT 是有效样本的算术平均。缺失 / 无效一律为 `nil`，绝不伪造成 0。
 struct PerformanceSummary: Codable, Sendable {
     var attempts: Int = 0
+    /// 去重后的请求数：同一请求的多次自动回退尝试只计一次（与 `attempts` 同一记录口径）。
+    var requests: Int = 0
     var successfulStreamingAttempts: Int = 0
     var ttftSamples: Int = 0
     /// 请求级与上游尝试级计时可能独立缺失，分别统计有效样本。
     var requestTTFTSamples: Int = 0
-    /// 三个加权吞吐共用同一"TPS 有效队列"的样本数（含尝试 TTFT、请求 TTFT 与合法生成时长）。
+    /// 三个加权速率共用的"TPS 有效队列"样本数（含尝试 TTFT、请求 TTFT 与合法
+    /// 生成时长；分母覆盖整个响应期，攒批一次性下发也不失真）。
     var tpsSamples: Int = 0
     /// 单次尝试首输出（TTFT）有效样本的算术平均。
     var ttftMeanMS: Double? = nil
@@ -37,7 +67,8 @@ struct PerformanceSummary: Codable, Sendable {
     var tpsIncludingTTFT: Double? = nil
     /// 加权速率：Σ输出 / Σ(请求TTFT + 生成时长)。
     var requestTpsIncludingTTFT: Double? = nil
-    /// 加权速率：Σ输出 / Σ生成时长。
+    /// 加权速率：Σ输出 / Σ生成时长（不含首字等待），与含 TTFT 版本共用同一批样本。
+    /// 仅作对照：攒批一次性下发的上游会让生成时长偏小、该值偏高，读的时候要和含 TTFT 一起看。
     var tpsExcludingTTFT: Double? = nil
 }
 

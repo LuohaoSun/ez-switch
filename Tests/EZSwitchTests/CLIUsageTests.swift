@@ -635,7 +635,6 @@ struct CLIUsageTests {
         #expect(summary["requestTTFTMeanMS"] is NSNull)
         #expect(summary["tpsIncludingTTFT"] is NSNull)
         #expect(summary["requestTpsIncludingTTFT"] is NSNull)
-        #expect(summary["tpsExcludingTTFT"] is NSNull)
         // 旧的百分位字段必须已从契约中移除。
         #expect(summary["ttftP50MS"] == nil)
         #expect(summary["ttftP95MS"] == nil)
@@ -713,7 +712,6 @@ struct CLIUsageTests {
         // 加权吞吐 = Σ输出 × 1000 / Σ时长。
         #expect(approx(summary["tpsIncludingTTFT"] as? Double, 400.0 * 1000 / 9000))
         #expect(approx(summary["requestTpsIncludingTTFT"] as? Double, 400.0 * 1000 / 9040))
-        #expect(approx(summary["tpsExcludingTTFT"] as? Double, 400.0 * 1000 / 8000))
     }
 
     /// 非对称 2 样本回归：加权 TPS（总 token / 总时长）绝不等同于逐请求速率的算术平均；
@@ -723,7 +721,7 @@ struct CLIUsageTests {
         let (store, directory) = try makeStore()
         defer { cleanup(directory) }
         let store1 = store.usageStore
-        // 100 token / 1s 与 100 token / 9s：加权（排除 TTFT）= 200000 / 10000 = 20。
+        // 100 token / 1s 与 100 token / 9s：含 TTFT 加权（尝试级）= 200000 / 14000 ≈ 14.29。
         store1.record(record(timestamp: day(2026, 5, 10, hour: 9), output: 100,
                              performance: streamingPerformance(ttftMS: 1000, requestTTFTMS: 2000,
                                                               generationMS: 1000)))
@@ -737,8 +735,7 @@ struct CLIUsageTests {
         let performance = try performancePayload(reply)
         let summary = try performanceSummary(performance)
         #expect(summary["tpsSamples"] as? Int == 2)
-        // 20 tok/s，而不是 (100 + 11.111)/2 ≈ 55.56 的算术平均。
-        #expect(approx(summary["tpsExcludingTTFT"] as? Double, 20))
+        // 14.29 tok/s，而不是逐请求速率的算术平均 (33.33 + 11.11)/2 ≈ 22.2。
         #expect(approx(summary["tpsIncludingTTFT"] as? Double, 200.0 * 1000 / 14000))
         #expect(approx(summary["requestTpsIncludingTTFT"] as? Double, 200.0 * 1000 / 16000))
         #expect(approx(summary["ttftMeanMS"] as? Double, 2000))
@@ -747,7 +744,6 @@ struct CLIUsageTests {
         // 分组级摘要同样使用加权口径。
         let group = try #require(performanceGroups(performance).first)
         let groupSummary = try #require(group["summary"] as? [String: Any])
-        #expect(approx(groupSummary["tpsExcludingTTFT"] as? Double, 20))
         #expect(approx(groupSummary["ttftMeanMS"] as? Double, 2000))
     }
 

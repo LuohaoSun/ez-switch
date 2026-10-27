@@ -392,7 +392,8 @@ final class UsageStore: @unchecked Sendable {
         let sql = """
         SELECT date(ts, 'unixepoch', 'localtime') AS day,
                COALESCE(SUM(input_tokens), 0),
-               COALESCE(SUM(output_tokens), 0)
+               COALESCE(SUM(output_tokens), 0),
+               COUNT(DISTINCT request_id)
         FROM usage_records
         WHERE ts >= ? AND ts < ?
         GROUP BY day
@@ -413,7 +414,8 @@ final class UsageStore: @unchecked Sendable {
             guard let raw = text(statement, 0), let date = parser.date(from: raw) else { continue }
             result.append(UsageDay(date: date,
                                    input: Int(sqlite3_column_int64(statement, 1)),
-                                   output: Int(sqlite3_column_int64(statement, 2))))
+                                   output: Int(sqlite3_column_int64(statement, 2)),
+                                   requests: Int(sqlite3_column_int64(statement, 3))))
         }
         return result
     }
@@ -424,7 +426,7 @@ final class UsageStore: @unchecked Sendable {
     /// 某小时无记录不补桶，求和沿用饱和约定。
     private func hours(_ db: OpaquePointer, lo: Double, hi: Double) throws -> [UsageDay] {
         let sql = """
-        SELECT ts, input_tokens, output_tokens
+        SELECT ts, input_tokens, output_tokens, request_id
         FROM usage_records
         WHERE ts >= ? AND ts < ?
         ORDER BY ts ASC;
@@ -434,7 +436,8 @@ final class UsageStore: @unchecked Sendable {
         sqlite3_bind_double(statement, 1, lo)
         sqlite3_bind_double(statement, 2, hi)
 
-        var buckets: [Date: (input: Int, output: Int)] = [:]
+        // 每个桶单独去重请求：同一请求跨多个小时仍会在每个桶各计一次（按桶口径）。
+        var buckets: [Date: (input: Int, output: Int, requestIDs: Set<String>)] = [:]
         while true {
             let step = sqlite3_step(statement)
             if step == SQLITE_DONE { break }
@@ -448,13 +451,17 @@ final class UsageStore: @unchecked Sendable {
                 ? 0 : Int(sqlite3_column_int64(statement, 1))
             let output = sqlite3_column_type(statement, 2) == SQLITE_NULL
                 ? 0 : Int(sqlite3_column_int64(statement, 2))
-            let existing = buckets[start] ?? (0, 0)
-            buckets[start] = (Self.saturatingAdd(existing.input, input),
-                              Self.saturatingAdd(existing.output, output))
+            let requestID = text(statement, 3) ?? ""
+            var bucket = buckets[start] ?? (0, 0, [])
+            bucket.input = Self.saturatingAdd(bucket.input, input)
+            bucket.output = Self.saturatingAdd(bucket.output, output)
+            bucket.requestIDs.insert(requestID)
+            buckets[start] = bucket
         }
         return buckets.keys.sorted().map {
-            let bucket = buckets[$0] ?? (0, 0)
-            return UsageDay(date: $0, input: bucket.input, output: bucket.output)
+            let bucket = buckets[$0] ?? (0, 0, [])
+            return UsageDay(date: $0, input: bucket.input, output: bucket.output,
+                            requests: bucket.requestIDs.count)
         }
     }
 
@@ -554,17 +561,20 @@ final class UsageStore: @unchecked Sendable {
     /// 单趟扫描区间内所有记录，同时聚合成总览与分组。
     ///
     /// - `attempts` 统计全部记录（含失败 / 取消 / 非流式）。
+    /// - `requests` 统计去重后的 request_id：同一请求的多次回退尝试只计一次，
+    ///   但每次尝试仍按所在分组各自计入该组的去重请求集合。
     /// - `successfulStreamingAttempts` = `outcome=success` 且 HTTP 2xx 且流式的尝试数，
     ///   是 TTFT 的资格分母（无论是否带 usage）。
     /// - TTFT 均值样本：成功流式且有合法 attempt TTFT（`ttftMeanMS`）/ 合法 request TTFT
     ///   （`requestTTFTMeanMS`）；两者独立计数，缺 usage 不影响 TTFT。
-    /// - TPS 有效队列（三个加权速率共用，保证可比）：成功流式 + 有限非负 attempt TTFT +
-    ///   有限非负 request TTFT + 有限正 generation + outputTokens≥2 + deltaCount≥2。
+    /// - TPS 有效队列：成功流式 + 有限非负 attempt TTFT + 有限非负 request TTFT +
+    ///   有限正 generation + outputTokens≥2 + deltaCount≥2。
     ///   三个速率均为 Σ输出 / Σ时长，绝不取逐请求速率的算术平均：
     ///   `tpsIncludingTTFT` = Σ输出×1000 / Σ(ttft+generation)，
     ///   `requestTpsIncludingTTFT` = Σ输出×1000 / Σ(requestttft+generation)，
     ///   `tpsExcludingTTFT` = Σ输出×1000 / Σgeneration。
-    ///   缺 request TTFT 的记录从三者中一并排除，避免不同分母混用。
+    ///   三个速率共用全部有效样本——含 TTFT 版本的分母覆盖整个响应期，攒批一次性下发也不失真；
+    ///   不含 TTFT 版本只换分母、不换样本，便于与含 TTFT 版本直接对照。
     /// - output 求和用 Double 累加避免 Int 溢出；任一求和非有限（上溢）时相应速率为 `nil`。
     /// - 失败 / 取消保留在 `attempts` 中，但不进入任何样本。
     /// - 队列为空或总时长为 0 时速率为 `nil`，不伪造 0。
@@ -573,7 +583,7 @@ final class UsageStore: @unchecked Sendable {
         var snapshot = PerformanceSnapshot()
         guard from < to else { return snapshot }
         let sql = """
-        SELECT route_id, route_name, provider, model, outcome, status, output_tokens,
+        SELECT route_id, route_name, provider, model, outcome, status, output_tokens, request_id,
                streaming, ttft_ms, request_ttft_ms, generation_ms, output_delta_count
         FROM usage_records
         WHERE ts >= ? AND ts < ?
@@ -600,9 +610,11 @@ final class UsageStore: @unchecked Sendable {
             let outcome = text(statement, 4) ?? ""
             let status = optionalInt(statement, 5)
             let outputTokens = optionalInt(statement, 6)
-            let performance = readPerformance(statement, streamingIndex: 7)
+            let requestID = text(statement, 7) ?? ""
+            let performance = readPerformance(statement, streamingIndex: 8)
 
-            overall.add(outcome: outcome, status: status, outputTokens: outputTokens, performance: performance)
+            overall.add(requestID: requestID, outcome: outcome, status: status,
+                        outputTokens: outputTokens, performance: performance)
 
             let key: String
             let title: String
@@ -633,8 +645,8 @@ final class UsageStore: @unchecked Sendable {
                 aggregator = PerformanceAggregator(title: title, subtitle: subtitle)
                 grouped[key] = aggregator
             }
-            aggregator.add(outcome: outcome, status: status, outputTokens: outputTokens,
-                           performance: performance)
+            aggregator.add(requestID: requestID, outcome: outcome, status: status,
+                           outputTokens: outputTokens, performance: performance)
         }
 
         snapshot.summary = overall.summary()
@@ -656,13 +668,15 @@ final class UsageStore: @unchecked Sendable {
         var title: String
         var subtitle: String
         private var attempts = 0
+        /// 该组的去重请求集合；与 `attempts` 同一记录口径（含失败 / 取消 / 非流式）。
+        private var requestIDs: Set<String> = []
         private var successfulStreamingAttempts = 0
         // TTFT 均值样本（独立队列）。
         private var ttftSum = 0.0
         private var ttftCount = 0
         private var requestTTFTSum = 0.0
         private var requestTTFTCount = 0
-        // TPS 有效队列（三个加权速率共用）。
+        // TPS 有效队列：含 / 不含 TTFT 的三个速率共用同一批样本（只换分母，保证可直接对照）。
         private var tpsCount = 0
         private var tpsOutputSum = 0.0
         private var tpsTTFTSum = 0.0
@@ -674,8 +688,10 @@ final class UsageStore: @unchecked Sendable {
             self.subtitle = subtitle
         }
 
-        func add(outcome: String, status: Int?, outputTokens: Int?, performance: UsagePerformance?) {
+        func add(requestID: String, outcome: String, status: Int?, outputTokens: Int?,
+                 performance: UsagePerformance?) {
             attempts += 1
+            requestIDs.insert(requestID)
             guard let performance, performance.streaming,
                   outcome.lowercased() == "success",
                   let status, (200...299).contains(status) else { return }
@@ -691,7 +707,8 @@ final class UsageStore: @unchecked Sendable {
                 requestTTFTSum += requestTTFT
                 requestTTFTCount += 1
             }
-            // TPS 有效队列：三个加权速率共用同一分母口径（含 request TTFT），缺一即整体排除。
+            // TPS 有效队列：成功流式 + 双 TTFT + 合法生成时长 + 输出/增量下限，缺一即不进。
+            // 分母覆盖整个响应期（TTFT + 生成时长），攒批一次性下发的样本也照常计入。
             guard let ttft, let requestTTFT,
                   let generation = performance.generationMS, generation.isFinite, generation > 0,
                   let outputTokens, outputTokens >= 2,
@@ -706,6 +723,7 @@ final class UsageStore: @unchecked Sendable {
         func summary() -> PerformanceSummary {
             var summary = PerformanceSummary()
             summary.attempts = attempts
+            summary.requests = requestIDs.count
             summary.successfulStreamingAttempts = successfulStreamingAttempts
             summary.ttftSamples = ttftCount
             summary.requestTTFTSamples = requestTTFTCount
@@ -794,13 +812,11 @@ final class UsageStore: @unchecked Sendable {
                 optionalInt(statement, 14).map(String.init) ?? "",
                 optionalInt(statement, 15).map(String.init) ?? "",
                 // 性能列：无性能数据（旧记录 / 非流式）留空；无效值也留空，不写成 0。
-                // CSV 是原始观测导出：失败/取消行若确有采样也会保留其 tps，但这些行不进入分位数。
                 performance.map { $0.streaming ? "true" : "false" } ?? "",
                 Self.csvNumber(performance?.ttftMS),
                 Self.csvNumber(performance?.requestTTFTMS),
                 Self.csvNumber(performance?.generationMS),
                 performance.map { String($0.outputDeltaCount) } ?? "",
-                Self.csvNumber(performance?.tps(outputTokens: outputTokens)),
             ]
             lines.append(fields.map(Self.csvField).joined(separator: ","))
         }
@@ -986,7 +1002,7 @@ final class UsageStore: @unchecked Sendable {
         ("output_delta_count", "INTEGER"),
     ]
 
-    private static let csvHeader = "timestamp,requestID,routeID,routeName,provider,model,endpoint,attempt,status,outcome,durationMS,inputTokens,outputTokens,cachedInputTokens,cacheWriteTokens,reasoningTokens,streaming,ttftMS,requestTTFTMS,generationMS,outputDeltaCount,tps"
+    private static let csvHeader = "timestamp,requestID,routeID,routeName,provider,model,endpoint,attempt,status,outcome,durationMS,inputTokens,outputTokens,cachedInputTokens,cacheWriteTokens,reasoningTokens,streaming,ttftMS,requestTTFTMS,generationMS,outputDeltaCount"
 }
 
 // MARK: - 错误

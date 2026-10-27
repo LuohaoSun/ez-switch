@@ -40,20 +40,22 @@ struct PerformanceStoreTests {
     }
 
     private func record(
+        requestID: UUID = UUID(),
         timestamp: Date,
         routeID: String = "route-1",
         routeName: String = "Route One",
         provider: String = "OpenAI",
         model: String = "gpt-4o",
+        attempt: Int = 1,
         status: Int? = 200,
         outcome: String = "success",
         input: Int? = 10,
         output: Int? = 20,
         performance: UsagePerformance? = nil
     ) -> UsageRecord {
-        UsageRecord(requestID: UUID(), timestamp: timestamp, routeID: routeID, routeName: routeName,
+        UsageRecord(requestID: requestID, timestamp: timestamp, routeID: routeID, routeName: routeName,
                     remoteID: "remote-1", provider: provider, model: model, endpoint: "chat",
-                    attempt: 1, status: status, outcome: outcome, durationMS: 100,
+                    attempt: attempt, status: status, outcome: outcome, durationMS: 100,
                     tokens: UsageTokens(input: input, output: output), performance: performance)
     }
 
@@ -111,13 +113,13 @@ struct PerformanceStoreTests {
         #expect(summary.requestTTFTSamples == 2)
         #expect(summary.tpsSamples == 2)
 
-        // 加权（排除 TTFT）：Σ输出 200 × 1000 / Σ生成 10000 = 20 tok/s。
+        // 加权（含尝试 TTFT）：200 × 1000 / (2000 + 12000) = 14.2857；
         // 逐请求速率的算术平均是 (100 + 11.111) / 2 ≈ 55.56 —— 绝不能出现。
-        #expect(approx(summary.tpsExcludingTTFT, 20))
-        // 加权（含尝试 TTFT）：200 × 1000 / (2000 + 12000) = 14.2857。
         #expect(approx(summary.tpsIncludingTTFT, 200.0 * 1000 / 14000))
         // 加权（含请求 TTFT）：200 × 1000 / (3000 + 13000) = 12.5。
         #expect(approx(summary.requestTpsIncludingTTFT, 12.5))
+        // 不含 TTFT：200 × 1000 / (1000 + 9000) = 20；逐请求速率 100 与 11.11 的算术平均是 55.56，绝不能出现。
+        #expect(approx(summary.tpsExcludingTTFT, 20))
         // 含请求级计时的分母显著大于含尝试级，两个速率必须不同（回退请求 vs 单次尝试口径）。
         #expect(summary.requestTpsIncludingTTFT != summary.tpsIncludingTTFT)
 
@@ -151,25 +153,25 @@ struct PerformanceStoreTests {
         #expect(summary.requestTTFTSamples == 4)
         #expect(approx(summary.requestTTFTMeanMS, 125))   // (50+100+150+200)/4
         #expect(summary.tpsSamples == 4)
-        // 生成均为 1000ms：tpsExcludingTTFT = Σ输出 100 × 1000 / Σ生成 4000 = 25。
-        #expect(approx(summary.tpsExcludingTTFT, 25))
         // tpsIncludingTTFT = 100000 / (100+200+300+400 + 4000) = 100000/5000 = 20。
         #expect(approx(summary.tpsIncludingTTFT, 20))
         // requestTpsIncludingTTFT = 100000 / (50+100+150+200 + 4000) = 100000/4500。
         #expect(approx(summary.requestTpsIncludingTTFT, 100000.0 / 4500))
+        // 不含 TTFT：100000 / 4000 = 25。
+        #expect(approx(summary.tpsExcludingTTFT, 25))
     }
 
     // MARK: - TPS 公共队列与 TTFT 独立样本
 
-    /// 缺 requestTTFT 的记录从三个 TPS 中一并排除，但仍计入尝试 TTFT 队列。
+    /// 缺 requestTTFT 的记录从两个含 TTFT 速率中一并排除，但仍计入尝试 TTFT 队列。
     @Test
-    func missingRequestTTFTExcludedFromAllTpsButStillCountsAttemptTTFT() async throws {
+    func missingRequestTTFTExcludedFromTpsButStillCountsAttemptTTFT() async throws {
         let url = try makeDatabaseURL()
         defer { cleanup(url) }
         let start = day(2026, 5, 10)
         let store = UsageStore(url: url)
 
-        // 缺 requestTTFT：计入 ttft 样本，但三个 TPS 都不采纳。
+        // 缺 requestTTFT：计入 ttft 样本，但两个 TPS 速率都不采纳。
         store.record(record(timestamp: start, output: 100,
                             performance: performance(ttft: 100, requestTTFT: nil, generation: 1000)))
         // 完整记录：进入公共 TPS 队列。
@@ -187,6 +189,7 @@ struct PerformanceStoreTests {
         // 只有完整记录参与，分母都是它自己的时长。
         #expect(approx(summary.tpsIncludingTTFT, 100000.0 / 1100))
         #expect(approx(summary.requestTpsIncludingTTFT, 100000.0 / 1200))
+        // 不含 TTFT 与另外两个速率共用同一队列，只换分母。
         #expect(approx(summary.tpsExcludingTTFT, 100))
     }
 
@@ -233,7 +236,6 @@ struct PerformanceStoreTests {
         #expect(summary.tpsSamples == 1)
         #expect(approx(summary.tpsIncludingTTFT, 20000.0 / 1100))
         #expect(approx(summary.requestTpsIncludingTTFT, 20000.0 / 1150))
-        #expect(approx(summary.tpsExcludingTTFT, 20))
     }
 
     @Test
@@ -257,7 +259,6 @@ struct PerformanceStoreTests {
         #expect(summary.tpsSamples == 0)
         #expect(summary.tpsIncludingTTFT == nil)
         #expect(summary.requestTpsIncludingTTFT == nil)
-        #expect(summary.tpsExcludingTTFT == nil)
     }
 
     @Test
@@ -287,7 +288,6 @@ struct PerformanceStoreTests {
         #expect(summary.tpsSamples == 0)
         #expect(summary.tpsIncludingTTFT == nil)
         #expect(summary.requestTpsIncludingTTFT == nil)
-        #expect(summary.tpsExcludingTTFT == nil)
     }
 
     /// 无效时长（负数 / NaN / 无穷）在读写两侧都被归一为缺失：不进入任何样本，也不污染均值。
@@ -311,7 +311,6 @@ struct PerformanceStoreTests {
         #expect(summary.requestTTFTSamples == 0)
         #expect(summary.requestTTFTMeanMS == nil)
         #expect(summary.tpsSamples == 0)
-        #expect(summary.tpsExcludingTTFT == nil)
     }
 
     // MARK: - 分组身份
@@ -379,14 +378,79 @@ struct PerformanceStoreTests {
         #expect(r1.ttftSamples == 2)
         #expect(approx(r1.ttftMeanMS, 200))               // (100+300)/2，不是中位数 100
         #expect(r1.tpsSamples == 2)
-        #expect(approx(r1.tpsExcludingTTFT, 400000.0 / 4000))   // Σ输出 400 / Σ生成 4000
         #expect(approx(r1.tpsIncludingTTFT, 400000.0 / 4400))   // Σ(ttft+gen)=4400
         #expect(approx(r1.requestTpsIncludingTTFT, 400000.0 / 4500))
         let r2 = byRoute.groups[1].summary
         #expect(r2.attempts == 1)
         #expect(r2.successfulStreamingAttempts == 0)
         #expect(r2.ttftSamples == 0)
-        #expect(r2.tpsExcludingTTFT == nil)
+    }
+
+    // MARK: - 去重请求数
+
+    /// 同一请求的两次自动回退尝试只计一个请求，但每次尝试仍计入 `attempts`；
+    /// 总览与各分组使用同一套去重口径。
+    @Test
+    func requestsCountDistinctRequestIDsAcrossFallbackAttempts() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let start = day(2026, 5, 10)
+        let store = UsageStore(url: url)
+        let fallbackRequest = UUID()
+        let otherRequest = UUID()
+
+        // 同一路由 / 供应商 / 模型的两次尝试。
+        store.record(record(requestID: fallbackRequest, timestamp: start, attempt: 1))
+        store.record(record(requestID: fallbackRequest, timestamp: start.addingTimeInterval(1),
+                            attempt: 2))
+        store.record(record(requestID: otherRequest, timestamp: start.addingTimeInterval(2)))
+        try await store.flush()
+
+        let byRoute = try await snapshot(store, from: start, grouping: .route)
+        #expect(byRoute.summary.requests == 2)
+        #expect(byRoute.summary.attempts == 3)
+        #expect(byRoute.groups.count == 1)
+        #expect(byRoute.groups[0].summary.requests == 2)
+        #expect(byRoute.groups[0].summary.attempts == 3)
+
+        // 按供应商 / 模型分组时仍只有一组，去重结果一致。
+        let byProvider = try await snapshot(store, from: start, grouping: .provider)
+        #expect(byProvider.summary.requests == 2)
+        #expect(byProvider.summary.attempts == 3)
+        #expect(byProvider.groups.count == 1)
+        #expect(byProvider.groups[0].summary.requests == 2)
+        #expect(byProvider.groups[0].summary.attempts == 3)
+
+        let byModel = try await snapshot(store, from: start, grouping: .model)
+        #expect(byModel.summary.requests == 2)
+        #expect(byModel.summary.attempts == 3)
+        #expect(byModel.groups.count == 1)
+        #expect(byModel.groups[0].summary.requests == 2)
+        #expect(byModel.groups[0].summary.attempts == 3)
+    }
+
+    /// 跨分组的回退：同一请求的两次尝试落在不同供应商时，总览只计一个请求；
+    /// 每个分组各自只包含该组内的请求，故各组也各计 1。
+    @Test
+    func requestsDeduplicateOverallEvenWhenAttemptsCrossGroups() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let start = day(2026, 5, 10)
+        let store = UsageStore(url: url)
+        let requestID = UUID()
+
+        store.record(record(requestID: requestID, timestamp: start, provider: "OpenAI",
+                            attempt: 1, outcome: "failure"))
+        store.record(record(requestID: requestID, timestamp: start.addingTimeInterval(1),
+                            provider: "Azure", attempt: 2))
+        try await store.flush()
+
+        let byProvider = try await snapshot(store, from: start, grouping: .provider)
+        #expect(byProvider.summary.requests == 1)
+        #expect(byProvider.summary.attempts == 2)
+        #expect(byProvider.groups.count == 2)
+        #expect(byProvider.groups.allSatisfy { $0.summary.requests == 1 })
+        #expect(byProvider.groups.allSatisfy { $0.summary.attempts == 1 })
     }
 
     // MARK: - 区间与持久化
@@ -406,7 +470,6 @@ struct PerformanceStoreTests {
         #expect(snapshot.summary.requestTTFTMeanMS == nil)
         #expect(snapshot.summary.tpsIncludingTTFT == nil)
         #expect(snapshot.summary.requestTpsIncludingTTFT == nil)
-        #expect(snapshot.summary.tpsExcludingTTFT == nil)
         #expect(snapshot.groups.isEmpty)
     }
 
@@ -427,7 +490,6 @@ struct PerformanceStoreTests {
         #expect(summary.attempts == 1)
         #expect(approx(summary.ttftMeanMS, 123.5))
         #expect(approx(summary.requestTTFTMeanMS, 45.5))
-        #expect(approx(summary.tpsExcludingTTFT, 15))       // 30 * 1000 / 2000
         #expect(approx(summary.tpsIncludingTTFT, 30000.0 / 2123.5))
         #expect(approx(summary.requestTpsIncludingTTFT, 30000.0 / 2045.5))
     }
@@ -450,7 +512,6 @@ struct PerformanceStoreTests {
         #expect(snapshot.summary.ttftSamples == 0)
         #expect(snapshot.summary.ttftMeanMS == nil)
         #expect(snapshot.summary.tpsSamples == 0)
-        #expect(snapshot.summary.tpsExcludingTTFT == nil)
         #expect(snapshot.groups.count == 1)
         #expect(snapshot.groups[0].summary.attempts == 3)
     }

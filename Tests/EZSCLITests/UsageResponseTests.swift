@@ -109,7 +109,6 @@ struct UsageResponseTests {
         #expect(report.summary.requestTTFTMeanMS == 1500)
         #expect(report.summary.tpsIncludingTTFT == 42.3)
         #expect(report.summary.requestTpsIncludingTTFT == 38.0)
-        #expect(report.summary.tpsExcludingTTFT == 55.1)
         #expect(report.groups.first?.title == "gpt-4o")
         #expect(report.groups.first?.subtitle == "OpenAI")
         #expect(report.groups.first?.summary.tpsIncludingTTFT == 42.3)
@@ -119,8 +118,7 @@ struct UsageResponseTests {
     @Test func nullAverageMetricsDecodeAsNil() throws {
         let summary = UsageFixture.performanceSummary(ttftSamples: 0, requestTTFTSamples: 0, tpsSamples: 0,
                                                       ttftMeanMS: nil, requestTTFTMeanMS: nil,
-                                                      tpsIncludingTTFT: nil, requestTpsIncludingTTFT: nil,
-                                                      tpsExcludingTTFT: nil)
+                                                      tpsIncludingTTFT: nil, requestTpsIncludingTTFT: nil)
         let performance = UsageFixture.performanceObject(summary: summary)
         // Serialised as JSON null, not omitted.
         let data = UsageFixture.envelope(usage: UsageFixture.usageObject(), performance: performance)
@@ -136,7 +134,6 @@ struct UsageResponseTests {
         #expect(report.summary.requestTTFTMeanMS == nil)
         #expect(report.summary.tpsIncludingTTFT == nil)
         #expect(report.summary.requestTpsIncludingTTFT == nil)
-        #expect(report.summary.tpsExcludingTTFT == nil)
     }
 
     @Test func missingRequestTTFSamplesDecodesAsNilNotUpstreamCount() throws {

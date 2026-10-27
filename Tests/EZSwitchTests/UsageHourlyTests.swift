@@ -64,9 +64,12 @@ struct UsageHourlyTests {
         let base = date(utc, year: 2026, month: 5, day: 10, hour: 14)
         let store = UsageStore(url: url, calendar: utc)
 
-        // 同一小时的两条请求（其中一条缺 output）；另一条进入下一小时。
-        store.record(record(timestamp: base.addingTimeInterval(5 * 60), input: 10, output: 20))
-        store.record(record(timestamp: base.addingTimeInterval(50 * 60), input: 5, output: nil))
+        // 同一小时的两条记录属于同一请求（含一条缺 output）；另一条请求进入下一小时。
+        let firstRequest = UUID()
+        store.record(record(requestID: firstRequest, timestamp: base.addingTimeInterval(5 * 60),
+                            input: 10, output: 20))
+        store.record(record(requestID: firstRequest, timestamp: base.addingTimeInterval(50 * 60),
+                            input: 5, output: nil))
         store.record(record(timestamp: base.addingTimeInterval(70 * 60), input: 1, output: 1))
         try await store.flush()
 
@@ -79,6 +82,10 @@ struct UsageHourlyTests {
         // 缺失 output 与 days 查询的 COALESCE 语义一致：计为 0。
         #expect(snapshot.hours.map(\.input) == [15, 1])
         #expect(snapshot.hours.map(\.output) == [20, 1])
+        // 按桶去重：14 点两条尝试合并为一个请求；15 点另一请求。
+        #expect(snapshot.hours.map(\.requests) == [1, 1])
+        #expect(snapshot.days[0].requests == 2)
+        #expect(snapshot.totals.requests == 2)
 
         // 日聚合与分组在 includeHourly 下保持不变。
         #expect(snapshot.days.count == 1)

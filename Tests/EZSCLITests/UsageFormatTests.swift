@@ -150,10 +150,8 @@ struct UsageFormatTests {
         #expect(text.hasPrefix("Performance (route)\nOverall basis: request scope (includes fallback)\n"))
         #expect(text.contains("  Average TTFT: 1.50 s"))
         #expect(text.contains("  Average TPS (incl TTFT): 38.0 tok/s"))
-        #expect(text.contains("  Average TPS (excl TTFT): 55.1 tok/s"))
         #expect(text.contains("Groups — basis: request (includes fallback)"))
-        #expect(text.contains("    Average TTFT 1.50 s  Average TPS (incl TTFT) 38.0 tok/s  "
-            + "Average TPS (excl TTFT) 55.1 tok/s"))
+        #expect(text.contains("    Average TTFT 1.50 s  Average TPS (incl TTFT) 38.0 tok/s"))
         // The upstream attempt value (1200 ms) is not the request-scope number shown here.
         #expect(!text.contains("1.20 s"))
     }
@@ -166,8 +164,7 @@ struct UsageFormatTests {
         #expect(text.hasPrefix("Performance (model)\nOverall basis: request scope (includes fallback)\n"))
         #expect(text.contains("  Average TTFT: 1.50 s"))
         #expect(text.contains("Groups — basis: upstream attempt"))
-        #expect(text.contains("    Average TTFT 1.20 s  Average TPS (incl TTFT) 42.3 tok/s  "
-            + "Average TPS (excl TTFT) 55.1 tok/s"))
+        #expect(text.contains("    Average TTFT 1.20 s  Average TPS (incl TTFT) 42.3 tok/s"))
     }
 
     @Test func durationAndRateHelpersUseExplicitUnits() {
@@ -188,14 +185,12 @@ struct UsageFormatTests {
         let summary = UsageFixture.performanceSummary(attempts: 0, successfulStreamingAttempts: 0,
                                                       ttftSamples: 0, requestTTFTSamples: 0, tpsSamples: 0,
                                                       ttftMeanMS: nil, requestTTFTMeanMS: nil,
-                                                      tpsIncludingTTFT: nil, requestTpsIncludingTTFT: nil,
-                                                      tpsExcludingTTFT: nil)
+                                                      tpsIncludingTTFT: nil, requestTpsIncludingTTFT: nil)
         let report = try performance(UsageFixture.performanceObject(groupCount: 0, summary: summary, groups: []))
         let text = UsageTextFormatter.renderPerformance(report, options: UsageOptions())
         #expect(text.contains("No performance data recorded."))
         #expect(text.contains("  Average TTFT: —"))
         #expect(text.contains("  Average TPS (incl TTFT): —"))
-        #expect(text.contains("  Average TPS (excl TTFT): —"))
     }
 
     /// The summary always reports request-level samples; the group rows use the

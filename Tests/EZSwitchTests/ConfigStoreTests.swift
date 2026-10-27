@@ -169,6 +169,109 @@ struct ConfigStoreTests {
     }
 
     @Test
+    func addProviderWithoutModelsCreatesSelectableProxyShell() throws {
+        let store = try makeStore(remotes: [], fakes: [])
+        let endpoints = APIEndpointSettings.enabled([.chat, .responses],
+                                                    baseURL: "https://proxy.example/v1")
+
+        let error = store.addProvider(name: "ProxyOnly", modelIDs: [], apiKey: "secret",
+                                      extraHeaders: ["X-Test": "yes"], apiEndpoints: endpoints)
+
+        #expect(error == nil)
+        #expect(store.config.remotes.count == 1)
+        let shell = try #require(store.config.remotes.first)
+        #expect(shell.name == "ProxyOnly · ")
+        #expect(shell.model == "")
+        #expect(shell.isProviderShell)
+        #expect(shell.apiKey == "secret")
+        #expect(shell.extraHeaders == ["X-Test": "yes"])
+        #expect(shell.apiEndpoints == ConfigStore.normalizedEndpoints(endpoints))
+
+        let group = try #require(store.groupedRemotes().first)
+        #expect(group.provider == "ProxyOnly")
+        #expect(group.modelRemotes.isEmpty)
+
+        // 空壳供应商已存在于 groupedRemotes，因此可以在出站代理名单里勾选。
+        #expect(store.setOutboundProxyProvider("ProxyOnly", selected: true) == nil)
+        #expect(store.config.extensions.outboundProxy.providerNames == ["ProxyOnly"])
+
+        let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: store.configURL))
+        #expect(persisted.remotes.map(\.name) == ["ProxyOnly · "])
+        #expect(persisted.remotes.first?.isProviderShell == true)
+    }
+
+    @Test
+    func providerShellIsExcludedFromModelRemotes() throws {
+        let shell = RemoteModel(id: UUID(), name: "P · ", apiKey: "a", model: "  ",
+                                extraHeaders: [:], apiEndpoints: .all(baseURL: "https://p.example"))
+        let real = makeRemote(name: "P · one", model: "one", apiKey: "a",
+                              baseURL: "https://p.example")
+
+        #expect(shell.isProviderShell)
+        #expect(!real.isProviderShell)
+        #expect(RemoteGroup(provider: "P", remotes: [shell, real]).modelRemotes.map(\.id) == [real.id])
+    }
+
+    @Test
+    func addModelReplacesProviderShellUsingItsConnection() throws {
+        let store = try makeStore(remotes: [], fakes: [])
+        let endpoints = APIEndpointSettings.enabled([.chat, .messages],
+                                                    baseURL: "https://proxy.example/v1")
+        #expect(store.addProvider(name: "ProxyOnly", modelIDs: [], apiKey: "secret",
+                                  extraHeaders: ["X-Test": "yes"], apiEndpoints: endpoints) == nil)
+        let shellID = try #require(store.config.remotes.first?.id)
+
+        #expect(store.addModel(provider: "ProxyOnly", model: "m1") == nil)
+
+        #expect(store.config.remotes.map(\.model) == ["m1"])
+        let added = try #require(store.config.remotes.first)
+        #expect(added.id != shellID)
+        #expect(added.name == "ProxyOnly · m1")
+        #expect(added.apiKey == "secret")
+        #expect(added.extraHeaders == ["X-Test": "yes"])
+        #expect(added.apiEndpoints == ConfigStore.normalizedEndpoints(endpoints))
+        #expect(!added.isProviderShell)
+        #expect(store.groupedRemotes().first?.modelRemotes.map(\.model) == ["m1"])
+    }
+
+    @Test
+    func catalogSelectionOnProviderShellAddsModelsAndDropsShell() throws {
+        let store = try makeStore(remotes: [], fakes: [])
+        let endpoints = APIEndpointSettings.enabled([.chat], baseURL: "https://proxy.example/v1")
+        #expect(store.addProvider(name: "ProxyOnly", modelIDs: [], apiKey: "secret",
+                                  extraHeaders: ["X-Test": "yes"], apiEndpoints: endpoints) == nil)
+
+        let error = store.applyModelCatalogSelection(provider: "ProxyOnly",
+                                                     choices: ["one", "two"], selected: ["two"])
+
+        #expect(error == nil)
+        #expect(store.config.remotes.map(\.model) == ["two"])
+        let added = try #require(store.config.remotes.first)
+        #expect(added.apiKey == "secret")
+        #expect(added.extraHeaders == ["X-Test": "yes"])
+        #expect(added.apiEndpoints == ConfigStore.normalizedEndpoints(endpoints))
+        #expect(!added.isProviderShell)
+    }
+
+    @Test
+    func catalogSelectionKeepsProviderShellWhenOnlyExistingModelsChange() throws {
+        let shell = RemoteModel(id: UUID(), name: "Alpha · ", apiKey: "a", model: "",
+                                extraHeaders: [:], apiEndpoints: .all(baseURL: "https://alpha.example"))
+        let one = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let two = makeRemote(name: "Alpha · two", model: "two", apiKey: "a",
+                             baseURL: "https://alpha.example")
+        let store = try makeStore(remotes: [shell, one, two], fakes: [])
+
+        let error = store.applyModelCatalogSelection(provider: "Alpha",
+                                                     choices: ["one", "two"], selected: ["one"])
+
+        #expect(error == nil)
+        #expect(store.config.remotes.map(\.id) == [shell.id, one.id])
+        #expect(store.config.remotes.first?.isProviderShell == true)
+    }
+
+    @Test
     func addRemoteRejectsExistingProviderName() throws {
         let existing = makeRemote(name: "Alpha · one", model: "one", apiKey: "a",
                                   baseURL: "https://alpha.example")

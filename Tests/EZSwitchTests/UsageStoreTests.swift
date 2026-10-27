@@ -316,9 +316,12 @@ struct UsageStoreTests {
         let to = calendar.date(byAdding: .day, value: 3, to: from)!
 
         let store = UsageStore(url: url)
+        // 第二天的两条记录属于同一请求的两次回退尝试（一次请求、两条尝试）。
+        let fallbackRequest = UUID()
         store.record(record(timestamp: first, input: 100, output: 10))
-        store.record(record(timestamp: second, input: 200, output: 20))
-        store.record(record(timestamp: second.addingTimeInterval(120), input: 50, output: 5))
+        store.record(record(requestID: fallbackRequest, timestamp: second, input: 200, output: 20))
+        store.record(record(requestID: fallbackRequest, timestamp: second.addingTimeInterval(120),
+                            attempt: 2, input: 50, output: 5))
         store.record(record(timestamp: third, input: 0, output: 0))
         try await store.flush()
 
@@ -329,6 +332,8 @@ struct UsageStoreTests {
                                               calendar.startOfDay(for: third)])
         #expect(snapshot.days.map(\.input) == [100, 250, 0])
         #expect(snapshot.days.map(\.output) == [10, 25, 0])
+        // 每天去重后的请求数：第二天两次回退尝试合并为一个请求。
+        #expect(snapshot.days.map(\.requests) == [1, 1, 1])
     }
 
     @Test
@@ -401,7 +406,7 @@ struct UsageStoreTests {
         let store = UsageStore(url: url)
         // 旧记录：无性能数据 → 新列留空（不写成 0）。
         store.record(record(timestamp: start))
-        // 流式记录：带性能数据，tps = 20 * 1000 / 2000 = 10。
+        // 流式记录：带性能原始观测列。
         store.record(record(timestamp: start.addingTimeInterval(1), output: 20,
                             performance: UsagePerformance(streaming: true, ttftMS: 120.5,
                                                           requestTTFTMS: 40.25, generationMS: 2000,
@@ -412,15 +417,15 @@ struct UsageStoreTests {
                                             to: start.addingTimeInterval(3600))
         let lines = csv.components(separatedBy: "\r\n").filter { !$0.isEmpty }
         #expect(lines.count == 3) // header + 2 rows
-        #expect(lines[0].hasSuffix("reasoningTokens,streaming,ttftMS,requestTTFTMS,generationMS,outputDeltaCount,tps"))
+        #expect(lines[0].hasSuffix("reasoningTokens,streaming,ttftMS,requestTTFTMS,generationMS,outputDeltaCount"))
 
         let legacy = lines[1].components(separatedBy: ",")
-        #expect(legacy.count == 22)
-        #expect(legacy.suffix(6).allSatisfy { $0.isEmpty })
+        #expect(legacy.count == 21)
+        #expect(legacy.suffix(5).allSatisfy { $0.isEmpty })
 
         let streaming = lines[2].components(separatedBy: ",")
-        #expect(streaming.count == 22)
-        #expect(Array(streaming.suffix(6)) == ["true", "120.500", "40.250", "2000.000", "8", "10.000"])
+        #expect(streaming.count == 21)
+        #expect(Array(streaming.suffix(5)) == ["true", "120.500", "40.250", "2000.000", "8"])
     }
 
     // MARK: - 清理

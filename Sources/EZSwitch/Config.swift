@@ -170,6 +170,9 @@ struct RemoteModel: Codable, Identifiable, Equatable, Hashable {
         self.source = source
     }
 
+    /// 供应商空壳：只承载连接配置、尚无模型的占位记录；首个真实模型添加后由 addModel 收起。
+    var isProviderShell: Bool { model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
     private enum CodingKeys: String, CodingKey {
         case id, name, apiKey, model, extraHeaders, apiEndpoints, source
         case legacyBaseURL = "baseURL"
@@ -443,6 +446,9 @@ struct RemoteGroup: Identifiable {
     let provider: String
     var id: String { provider }
     let remotes: [RemoteModel]
+
+    /// 非空壳的真实模型条目；空壳只承载供应商连接配置，不进任何模型列表。
+    var modelRemotes: [RemoteModel] { remotes.filter { !$0.isProviderShell } }
 }
 
 // MARK: - 默认配置
@@ -1302,10 +1308,19 @@ final class ConfigStore: ObservableObject {
         guard !config.remotes.contains(where: { splitProviderModel($0.name).provider == name })
         else { return "该供应商名称已存在" }
         let models = modelIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard !models.isEmpty, models.allSatisfy({ !$0.isEmpty }) else { return "请选择至少一个模型" }
+        guard models.allSatisfy({ !$0.isEmpty }) else { return "模型 ID 不能为空" }
         guard Set(models).count == models.count else { return "模型 ID 重复" }
         let endpoints = Self.normalizedEndpoints(apiEndpoints)
         if let error = Self.validateEndpoints(endpoints) { return error }
+        if models.isEmpty {
+            config.remotes.append(
+                RemoteModel(id: UUID(), name: "\(name) · ", apiKey: apiKey, model: "",
+                            extraHeaders: extraHeaders, apiEndpoints: endpoints))
+            router.update(config)
+            save()
+            Log.shared.log("provider: 新增 \(name)（暂无模型，连接配置已保存）")
+            return nil
+        }
         config.remotes.append(contentsOf: models.map {
             RemoteModel(id: UUID(), name: "\(name) · \($0)", apiKey: apiKey, model: $0,
                         extraHeaders: extraHeaders, apiEndpoints: endpoints)
@@ -1345,6 +1360,10 @@ final class ConfigStore: ObservableObject {
                                  apiKey: first.apiKey, model: model, extraHeaders: first.extraHeaders,
                                  apiEndpoints: first.apiEndpoints, source: first.source)
         config.remotes.append(remote)
+        // 首个真实模型接管连接配置后，供应商空壳不再需要。
+        config.remotes.removeAll {
+            splitProviderModel($0.name).provider == provider && $0.isProviderShell
+        }
         router.update(config)
         save()
         Log.shared.log("remote: 新增 \(remote.name) → \(remote.endpointSummary)")

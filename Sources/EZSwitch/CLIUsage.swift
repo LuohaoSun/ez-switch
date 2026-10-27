@@ -259,7 +259,6 @@ enum CLIUsage {
             "requestTTFTMeanMS": finiteNumber(summary.requestTTFTMeanMS),
             "tpsIncludingTTFT": finiteNumber(summary.tpsIncludingTTFT),
             "requestTpsIncludingTTFT": finiteNumber(summary.requestTpsIncludingTTFT),
-            "tpsExcludingTTFT": finiteNumber(summary.tpsExcludingTTFT),
         ]
     }
 

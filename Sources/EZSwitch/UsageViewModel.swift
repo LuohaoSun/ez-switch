@@ -246,7 +246,7 @@ enum UsagePhase: Equatable {
     case failed(String)
 }
 
-// MARK: - 视图切换与性能排序
+// MARK: - 视图切换与表格排序
 
 /// 用量页内部的两个视图：Token 用量与请求性能。共用同一套时间筛选。
 enum UsageSection: String, CaseIterable, Identifiable {
@@ -257,20 +257,24 @@ enum UsageSection: String, CaseIterable, Identifiable {
     var title: String { self == .usage ? "用量" : "性能" }
 }
 
-/// 性能比较表的排序字段，与三张平均指标一一对应：
-/// 平均 TTFT、平均 TPS（含 TTFT）、平均 TPS（不含 TTFT）。
+/// 性能比较表的排序字段：名称、请求数与三张平均指标
+/// （平均 TTFT、平均 TPS（含 TTFT）、平均 TPS（不含 TTFT））。
 /// 路由维度取含自动回退的 request 级指标，其余维度取单次上游尝试指标；
-/// 不含 TTFT 的 TPS 两个维度共用同一字段。
+/// 不含 TTFT 的吞吐两维度共用同一口径（只算生成时长）。
 enum PerformanceSortKey: String, CaseIterable, Identifiable {
+    case name
+    case requests
     case ttftMean
     case tpsIncludingTTFT
     case tpsExcludingTTFT
 
     var id: String { rawValue }
 
-    /// 指标名称：三张卡与表头使用同一组名称；路由 / 尝试口径差异只放在 tooltip。
+    /// 指标名称：卡片与表头使用同一组名称；路由 / 尝试口径差异只放在 tooltip。
     func title(for grouping: UsageGrouping) -> String {
         switch self {
+        case .name: return "名称"
+        case .requests: return "请求"
         case .ttftMean: return "平均TTFT"
         case .tpsIncludingTTFT: return "平均TPS(含TTFT)"
         case .tpsExcludingTTFT: return "平均TPS(不含TTFT)"
@@ -281,22 +285,30 @@ enum PerformanceSortKey: String, CaseIterable, Identifiable {
     func columnTitle(for grouping: UsageGrouping) -> String { title(for: grouping) }
 
     /// 首次点击该列时的默认方向：按"越好越靠前"取值——
-    /// 延迟类（TTFT）越小越好，用升序；吞吐类（TPS）越大越好，用降序。
+    /// 延迟类（TTFT）越小越好，用升序；吞吐类（TPS）越大越好，用降序；
+    /// 名称按自然序升序；请求数越多越靠前，用降序。
     var defaultAscending: Bool {
         switch self {
-        case .ttftMean: return true
-        case .tpsIncludingTTFT, .tpsExcludingTTFT: return false
+        case .name, .ttftMean: return true
+        case .requests, .tpsIncludingTTFT, .tpsExcludingTTFT: return false
         }
     }
 }
 
 /// 排序取值与比较：nil（未测/未知）恒定排在最后，与升降序无关；同值时按标题稳定排序。
+/// 名称列按自然序比较（「路由 2」排在「路由 10」前），不走数值路径。
 enum PerformanceSort {
     static func value(_ key: PerformanceSortKey,
                       row: PerformanceGroupRow,
                       grouping: UsageGrouping) -> Double? {
         let summary = row.summary
         switch key {
+        case .name:
+            // 名称由 `sorted` 单独按自然序处理，不参与数值比较。
+            return nil
+        case .requests:
+            // 去重请求数恒有值（0 也是已知值），因此不存在「未知置后」。
+            return Double(summary.requests)
         case .ttftMean:
             return grouping == .route ? summary.requestTTFTMeanMS : summary.ttftMeanMS
         case .tpsIncludingTTFT:
@@ -315,14 +327,106 @@ enum PerformanceSort {
         return value
     }
 
-    /// 按列与方向排序：nil（含非有限值）恒定置后；同值按标题、再按 id 稳定 tie-break。
+    /// 按列与方向排序：名称按自然序，nil（含非有限值）恒定置后；
+    /// 同值按标题、再按 id 稳定 tie-break（与方向无关，反复点列头不会抖动）。
     static func sorted(_ rows: [PerformanceGroupRow],
                        by key: PerformanceSortKey,
                        grouping: UsageGrouping,
                        ascending: Bool) -> [PerformanceGroupRow] {
         rows.sorted { lhs, rhs in
+            if key == .name {
+                let order = lhs.title.localizedStandardCompare(rhs.title)
+                if order != .orderedSame {
+                    return ascending ? order == .orderedAscending : order == .orderedDescending
+                }
+                return lhs.id < rhs.id
+            }
             let a = sortableValue(key, row: lhs, grouping: grouping)
             let b = sortableValue(key, row: rhs, grouping: grouping)
+            switch (a, b) {
+            case let (x?, y?):
+                if x != y { return ascending ? x < y : x > y }
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            case (nil, nil):
+                break
+            }
+            if lhs.title != rhs.title { return lhs.title < rhs.title }
+            return lhs.id < rhs.id
+        }
+    }
+}
+
+/// 用量表（使用明细）的排序列。nil 表示未排序——保持后端默认顺序（总 Token 降序）。
+enum UsageSortKey: String, CaseIterable, Identifiable {
+    case name
+    case input
+    case output
+    case cached
+    case cacheRate
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .name: return "名称"
+        case .input: return "输入"
+        case .output: return "输出"
+        case .cached: return "缓存"
+        case .cacheRate: return "缓存率"
+        }
+    }
+
+    /// 首次点击的默认方向：名称按自然序升序，数值列越大越靠前（降序）。
+    var defaultAscending: Bool {
+        switch self {
+        case .name: return true
+        case .input, .output, .cached, .cacheRate: return false
+        }
+    }
+}
+
+/// 用量表排序取值与比较：未上报（attempts 计数为 0）视为未知、恒定置后，
+/// 与单元格「—」口径一致；名称列按自然序单独处理。
+enum UsageSort {
+    static func value(_ key: UsageSortKey, row: UsageGroupRow) -> Double? {
+        let totals = row.totals
+        switch key {
+        case .name:
+            return nil
+        case .input:
+            return totals.inputAttempts > 0 ? Double(totals.input) : nil
+        case .output:
+            return totals.outputAttempts > 0 ? Double(totals.output) : nil
+        case .cached:
+            return totals.cachedInputAttempts > 0 ? Double(totals.cachedInput) : nil
+        case .cacheRate:
+            return UsageCacheRate.value(for: totals)
+        }
+    }
+
+    private static func sortableValue(_ key: UsageSortKey, row: UsageGroupRow) -> Double? {
+        guard let value = value(key, row: row), value.isFinite else { return nil }
+        return value
+    }
+
+    /// 与 `PerformanceSort.sorted` 同构：名称按自然序，nil（未上报/未知）恒定置后，
+    /// 同值按标题、再按 id 稳定 tie-break。
+    static func sorted(_ rows: [UsageGroupRow],
+                       by key: UsageSortKey,
+                       ascending: Bool) -> [UsageGroupRow] {
+        rows.sorted { lhs, rhs in
+            if key == .name {
+                let order = lhs.title.localizedStandardCompare(rhs.title)
+                if order != .orderedSame {
+                    return ascending ? order == .orderedAscending : order == .orderedDescending
+                }
+                return lhs.id < rhs.id
+            }
+            let a = sortableValue(key, row: lhs)
+            let b = sortableValue(key, row: rhs)
             switch (a, b) {
             case let (x?, y?):
                 if x != y { return ascending ? x < y : x > y }
@@ -376,12 +480,19 @@ final class UsageViewModel: ObservableObject {
     @Published var performanceSortKey: PerformanceSortKey = .ttftMean
     @Published var performanceSortAscending: Bool = true
 
+    /// 用量表排序：nil 表示未排序，保持后端默认顺序（总 Token 降序）。
+    /// 排序只影响本地派生行序，不进入 `reloadKey`，因此不会触发重新查询。
+    @Published var usageSortKey: UsageSortKey?
+    @Published var usageSortAscending: Bool = false
+
     @Published private(set) var snapshot = UsageSnapshot()
     @Published private(set) var phase: UsagePhase = .idle
     /// 最近一次刷新失败（有旧数据时以横幅提示，不覆盖已显示内容）。
     @Published private(set) var lastError: String?
     /// 图表中选中的柱及其数据。整体一次赋值，避免 bucket 与 snapshot 分步更新产生空档。
     @Published private(set) var selection = UsageSelectionState.empty
+    /// 性能页的图表选中态；与用量页的 `selection` 相互独立。
+    @Published private(set) var performanceSelection = PerformanceSelectionState.empty
     @Published private(set) var performanceSnapshot = PerformanceSnapshot()
     @Published private(set) var performancePhase: UsagePhase = .idle
     @Published private(set) var performanceLastError: String?
@@ -402,12 +513,16 @@ final class UsageViewModel: ObservableObject {
     private var selectionGrouping: UsageGrouping?
     /// 选择上下文（视图、区间预设、自定义天数、图表粒度）的上一次取值。
     private var currentSelectionContext: String = ""
+    /// 性能页选中柱的请求令牌；与用量页独立。
+    private var performanceSelectionRequest = UUID()
+    private var currentPerformanceSelectionContext: String = ""
 
     /// 入口决定初始视图：用量入口默认用量，性能入口直达性能。
     /// 侧栏两个入口各自持有一个实例（配合稳定视图身份），互不复用，避免导航到性能时仍显示用量。
     init(section: UsageSection = .usage) {
         self.section = section
         currentSelectionContext = selectionContext
+        currentPerformanceSelectionContext = performanceSelectionContext
     }
 
     /// `.task(id:)` 键：区间/分组/视图变化即重启刷新；近 N 天只在自定义预设下计入。
@@ -461,8 +576,15 @@ final class UsageViewModel: ObservableObject {
     /// 图表粒度：今天按小时，其余区间按天。
     var chartUnit: Calendar.Component { preset == .today ? .hour : .day }
 
-    /// 是否需要小时分桶（仅用量页的「今天」）。
-    var usesHourlyBuckets: Bool { section == .usage && preset == .today }
+    /// 是否需要小时分桶：「今天」的用量与性能页都要画小时柱状图。
+    var usesHourlyBuckets: Bool { preset == .today }
+
+    /// 图表序列：今天按小时，其余区间按天。用量 Token 图与性能请求数图共用。
+    var chartPoints: [UsageDay] { chartUnit == .hour ? snapshot.hours : snapshot.days }
+
+    /// 图表 X 轴刻度：只标当前区间内的自然日 / 小时。
+    var chartDates: [Date] { UsageAxisTicks.days(from: range.from, to: range.to) }
+    var chartHours: [Date] { UsageAxisTicks.hours(from: range.from, to: range.to) }
 
     /// 卡片与明细的数据源：有已提交的柱时用其快照，否则是整个区间。
     /// 取数中的新选择不参与，上一个 scope 保持到原子提交。
@@ -605,6 +727,158 @@ final class UsageViewModel: ObservableObject {
         return "\(section.rawValue)|\(preset.rawValue)|\(custom)|\(chartUnit == .hour ? "hour" : "day")"
     }
 
+    // MARK: 性能图表选中
+
+    /// 已提交的性能选中柱；nil 表示指标卡与明细展示整个区间。
+    var performanceSelectedBucket: UsageChartSelection? { performanceSelection.bucket }
+    var performancePendingBucket: UsageChartSelection? { performanceSelection.pending }
+    var performanceActiveBucket: UsageChartSelection? { performanceSelection.activeBucket }
+    var performanceSelectionError: String? { performanceSelection.error }
+    var performanceSelectionIsLoading: Bool { performanceSelection.isLoading }
+    var performanceSelectionSnapshot: PerformanceSnapshot? { performanceSelection.snapshot }
+
+    /// 指标卡与性能明细的数据源：已提交所选柱时用其性能快照，否则整个区间。
+    /// 取数中的新选择不参与，上一个 scope 保持到原子提交。
+    var scopedPerformanceSnapshot: PerformanceSnapshot {
+        performanceSelection.bucket == nil ? performanceSnapshot : (performanceSelection.snapshot ?? performanceSnapshot)
+    }
+
+    var scopedPerformanceSummary: PerformanceSummary { scopedPerformanceSnapshot.summary }
+
+    /// 顶部状态 chip 的 section 分派：用量页看 `selection`，性能页看 `performanceSelection`。
+    var shownPendingBucket: UsageChartSelection? {
+        section == .performance ? performanceSelection.pending : selection.pending
+    }
+
+    var shownSelectedBucket: UsageChartSelection? {
+        section == .performance ? performanceSelection.bucket : selection.bucket
+    }
+
+    var shownSelectionError: String? {
+        section == .performance ? performanceSelection.error : selection.error
+    }
+
+    /// 清除当前页面的选中柱（用量页与性能页各自回到整个区间）。
+    func clearShownSelection() {
+        if section == .performance {
+            clearPerformanceSelection()
+        } else {
+            clearSelection()
+        }
+    }
+
+    /// 点选性能柱状图：只收敛指标卡与性能明细，图表始终保留整个区间。
+    /// 请求数为 0 的柱不可选；再次点击同一根柱取消；再点取数中的柱放弃本次取数。
+    func togglePerformanceSelection(
+        at date: Date, points: [UsageDay], unit: Calendar.Component,
+        calendar: Calendar = .current,
+        load: @escaping @Sendable (Date, Date, UsageGrouping) async throws -> PerformanceSnapshot
+    ) {
+        guard let point = UsageChartSelection.point(at: date, points: points, unit: unit, calendar: calendar),
+              point.requests > 0 else {
+            clearPerformanceSelection()
+            return
+        }
+        if let bucket = performanceSelection.bucket, bucket.date == point.date, bucket.unit == unit {
+            clearPerformanceSelection()
+            return
+        }
+        if let pending = performanceSelection.pending, pending.date == point.date, pending.unit == unit {
+            cancelPendingPerformanceSelection()
+            return
+        }
+        guard let bucket = UsageChartSelection.bucket(for: point, unit: unit, calendar: calendar) else {
+            clearPerformanceSelection()
+            return
+        }
+        startPerformanceSelectionLoad(bucket, load: load)
+    }
+
+    /// 取消性能选中，回到整个区间；同时作废在途的选中请求。
+    func clearPerformanceSelection() {
+        performanceSelectionRequest = UUID()
+        performanceSelection = .empty
+    }
+
+    /// 放弃取数中的性能目标，保留已提交的 scope。
+    private func cancelPendingPerformanceSelection() {
+        guard performanceSelection.pending != nil else { return }
+        performanceSelectionRequest = UUID()
+        performanceSelection = PerformanceSelectionState(bucket: performanceSelection.bucket,
+                                                          snapshot: performanceSelection.snapshot,
+                                                          error: performanceSelection.error,
+                                                          pending: nil)
+    }
+
+    /// 标记性能取数目标并异步加载；不改动已提交的 bucket/snapshot。
+    private func startPerformanceSelectionLoad(
+        _ bucket: UsageChartSelection,
+        load: @escaping @Sendable (Date, Date, UsageGrouping) async throws -> PerformanceSnapshot
+    ) {
+        let token = UUID()
+        performanceSelectionRequest = token
+        let grouping = performanceGrouping
+        performanceSelection = PerformanceSelectionState(bucket: performanceSelection.bucket,
+                                                          snapshot: performanceSelection.snapshot,
+                                                          error: nil, pending: bucket)
+        Task { [weak self] in
+            await self?.loadPerformanceSelection(bucket: bucket, token: token,
+                                                 grouping: grouping, load: load)
+        }
+    }
+
+    /// 竞态安全：请求令牌 + 当前性能分组 + 待提交目标，避免旧响应覆盖新状态。
+    private func loadPerformanceSelection(
+        bucket: UsageChartSelection, token: UUID, grouping: UsageGrouping,
+        load: @escaping @Sendable (Date, Date, UsageGrouping) async throws -> PerformanceSnapshot
+    ) async {
+        do {
+            let fresh = try await load(bucket.range.from, bucket.range.to, grouping)
+            guard isCurrentPerformanceSelectionLoad(token: token, bucket: bucket, grouping: grouping) else { return }
+            performanceSelection = PerformanceSelectionState(bucket: bucket, snapshot: fresh,
+                                                              error: nil, pending: nil)
+        } catch {
+            guard isCurrentPerformanceSelectionLoad(token: token, bucket: bucket, grouping: grouping) else { return }
+            performanceSelection = PerformanceSelectionState(bucket: performanceSelection.bucket,
+                                                              snapshot: performanceSelection.snapshot,
+                                                              error: error.localizedDescription, pending: nil)
+        }
+    }
+
+    private func isCurrentPerformanceSelectionLoad(token: UUID, bucket: UsageChartSelection,
+                                                   grouping: UsageGrouping) -> Bool {
+        guard !Task.isCancelled, performanceSelectionRequest == token,
+              performanceGrouping == grouping else { return false }
+        return performanceSelection.pending?.date == bucket.date
+            && performanceSelection.pending?.unit == bucket.unit
+    }
+
+    /// 已提交性能柱的静默重取：轮询/分组变化后更新数据，不进入加载态，失败也不覆盖已显示内容。
+    private func refreshCommittedPerformanceSelection(
+        _ bucket: UsageChartSelection, grouping: UsageGrouping,
+        load: (Date, Date, UsageGrouping) async throws -> PerformanceSnapshot
+    ) async {
+        let token = performanceSelectionRequest
+        let requestedKey = reloadKey
+        do {
+            let fresh = try await load(bucket.range.from, bucket.range.to, grouping)
+            guard !Task.isCancelled, performanceSelectionRequest == token, reloadKey == requestedKey,
+                  performanceSelection.pending == nil,
+                  performanceSelection.bucket?.date == bucket.date,
+                  performanceSelection.bucket?.unit == bucket.unit else { return }
+            performanceSelection = PerformanceSelectionState(bucket: bucket, snapshot: fresh,
+                                                              error: nil, pending: nil)
+        } catch {
+            // 静默刷新失败保留已显示数据；整体刷新错误由横幅提示。
+        }
+    }
+
+    /// 性能选择上下文：区间预设、自定义天数、图表粒度与性能分组。
+    private var performanceSelectionContext: String {
+        let custom = preset == .custom ? "\(customLastNDays)" : ""
+        return "\(preset.rawValue)|\(custom)|\(chartUnit == .hour ? "hour" : "day")|\(performanceGrouping.rawValue)"
+    }
+
     /// 已选的柱是否仍落在当前区间内（例如「今天」跨过午夜后旧小时桶已出界）。
     private func isBucketInCurrentRange(_ bucket: UsageChartSelection) -> Bool {
         let current = range
@@ -616,8 +890,9 @@ final class UsageViewModel: ObservableObject {
     }
 
     /// 性能表按当前排序字段/方向排列后的行（nil 恒排在最后）。
+    /// 有已提交的选中柱时按该时段的性能快照派生。
     var sortedPerformanceGroups: [PerformanceGroupRow] {
-        PerformanceSort.sorted(performanceSnapshot.groups,
+        PerformanceSort.sorted(scopedPerformanceSnapshot.groups,
                                by: performanceSortKey,
                                grouping: performanceGrouping,
                                ascending: performanceSortAscending)
@@ -638,23 +913,51 @@ final class UsageViewModel: ObservableObject {
         performanceSortKey == key
     }
 
+    /// 用量表按当前排序列/方向排列后的行；未选择排序列时保持后端默认顺序。
+    /// 有已提交的选中柱时按该时段的用量快照派生。
+    var sortedUsageGroups: [UsageGroupRow] {
+        let rows = scopedSnapshot?.groups ?? []
+        guard let key = usageSortKey else { return rows }
+        return UsageSort.sorted(rows, by: key, ascending: usageSortAscending)
+    }
+
+    /// 点表头排序：同一列再次点击反向；切换到新列时用该列的默认方向。
+    func toggleUsageSort(_ key: UsageSortKey) {
+        guard usageSortKey == key else {
+            usageSortKey = key
+            usageSortAscending = key.defaultAscending
+            return
+        }
+        usageSortAscending.toggle()
+    }
+
+    /// 该列当前是否正被用于排序（用于表头箭头显隐）。
+    func isUsageSortActive(_ key: UsageSortKey) -> Bool {
+        usageSortKey == key
+    }
+
     /// 区间内完全没有转发尝试记录（与"有历史但无性能样本"区分开）。
     var performanceIsEmpty: Bool { performanceSnapshot.summary.attempts == 0 }
 
     /// 当前性能分组对应的有效 TTFT 样本数：路由维度用含自动回退的 requestTTFT 样本，
     /// 其余维度用单次尝试 TTFT 样本。旧历史没有 requestTTFT 时不会虚报尝试样本。
     var performanceActiveTTFTSamples: Int {
-        performanceGrouping == .route
-            ? performanceSnapshot.summary.requestTTFTSamples
-            : performanceSnapshot.summary.ttftSamples
+        activeTTFTSamples(in: performanceSnapshot.summary)
+    }
+
+    /// 按当前分组口径取一份摘要的有效 TTFT 样本数。
+    private func activeTTFTSamples(in summary: PerformanceSummary) -> Int {
+        performanceGrouping == .route ? summary.requestTTFTSamples : summary.ttftSamples
     }
 
     /// 有转发尝试，但在当前分组下既没有有效 TTFT 样本、也没有 TPS 样本。
     /// 只要 TPS 仍有可用样本就不进入空态，避免隐藏可用数据。
+    /// 选中柱后按该时段判断：整段有样本、但所选的这一小时没有样本时也要提示。
     var performanceHasNoSamples: Bool {
-        performanceSnapshot.summary.attempts > 0
-            && performanceActiveTTFTSamples == 0
-            && performanceSnapshot.summary.tpsSamples == 0
+        let summary = scopedPerformanceSummary
+        return summary.attempts > 0
+            && activeTTFTSamples(in: summary) == 0
+            && summary.tpsSamples == 0
     }
 
     var isInitialLoadingPerformance: Bool {
@@ -702,7 +1005,7 @@ final class UsageViewModel: ObservableObject {
         } else if let bucket = selection.activeBucket, !isBucketInCurrentRange(bucket) {
             clearSelection()
         }
-        // 仅用量页的「今天」需要小时级分桶作图；其余区间与性能页不查小时数据。
+        // 仅「今天」需要小时级分桶作图；其余区间不查小时数据。
         let includeHourly = usesHourlyBuckets
 
         do {
@@ -741,6 +1044,15 @@ final class UsageViewModel: ObservableObject {
         let current = range
         let grouping = performanceGrouping
 
+        // 区间/粒度/性能分组变化后，已选的柱不再有意义：先重置，再取数。
+        let context = performanceSelectionContext
+        if context != currentPerformanceSelectionContext {
+            currentPerformanceSelectionContext = context
+            clearPerformanceSelection()
+        } else if let bucket = performanceSelection.activeBucket, !isBucketInCurrentRange(bucket) {
+            clearPerformanceSelection()
+        }
+
         do {
             let fresh = try await load(current.from, current.to, grouping)
             guard !Task.isCancelled, currentPerformanceRequest == token, requestedKey == reloadKey else { return }
@@ -753,6 +1065,11 @@ final class UsageViewModel: ObservableObject {
             let message = error.localizedDescription
             performanceLastError = message
             performancePhase = hasLoadedPerformance ? .loaded : .failed(message)
+        }
+
+        // 已提交的性能柱随轮询静默重取；取数中的目标由上下文变化统一重置。
+        if performanceSelection.pending == nil, let bucket = performanceSelection.bucket {
+            await refreshCommittedPerformanceSelection(bucket, grouping: grouping, load: load)
         }
     }
 
