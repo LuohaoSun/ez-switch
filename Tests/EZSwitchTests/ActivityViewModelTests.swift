@@ -42,25 +42,78 @@ struct ActivityViewModelTests {
                      tokens: UsageTokens = UsageTokens(),
                      performance: UsagePerformance? = nil,
                      failureReason: String? = nil,
-                     elapsedMS: Int = 1000) -> ActivityRowModel {
+                     elapsedMS: Int = 1000,
+                     statusCode: Int? = nil,
+                     attemptResult: ActivityAttemptResult? = nil) -> ActivityRowModel {
         ActivityRowModel(id: id, shortID: shortID, startedAt: startedAt, endedAt: endedAt,
                          protocolKind: protocolKind, routeName: routeName, phase: phase,
                          upstreamProvider: upstream?.0, upstreamModel: upstream?.1,
                          selectedAttempt: selectedAttempt, attempts: attempts,
                          didFallback: didFallback, tokens: tokens, performance: performance,
-                         failureReason: failureReason, elapsedMS: elapsedMS)
+                         failureReason: failureReason, statusCode: statusCode,
+                         elapsedMS: elapsedMS, attemptResult: attemptResult)
     }
 
     /// 后端 `ActivityRequest` 夹具：用于覆盖 `apply(_:)` 快照接入缝（含 `generatedAt` 计时）。
     private func request(id: UUID,
                          status: ActivityStatus,
                          startedAt: Date,
-                         endedAt: Date?) -> ActivityRequest {
+                         endedAt: Date?,
+                         attempts: [ActivityAttempt] = [],
+                         selectedAttempt: Int? = nil,
+                         tokens: UsageTokens = UsageTokens(),
+                         performance: UsagePerformance? = nil,
+                         failureReason: String? = nil,
+                         elapsedMS: Int = 1_200) -> ActivityRequest {
         ActivityRequest(id: id, route: "main", routeName: "main", endpoint: "chat", method: "POST",
-                        startedAt: startedAt, endedAt: endedAt, status: status, elapsedMS: 1_200,
-                        outcome: nil, statusCode: 200, failureReason: nil, firstResponseAt: nil,
-                        selectedAttempt: nil, attempts: [], fallbacks: [],
-                        tokens: UsageTokens(), performance: nil)
+                        startedAt: startedAt, endedAt: endedAt, status: status, elapsedMS: elapsedMS,
+                        outcome: nil, statusCode: 200, failureReason: failureReason,
+                        firstResponseAt: nil, selectedAttempt: selectedAttempt,
+                        attempts: attempts, fallbacks: [],
+                        tokens: tokens, performance: performance)
+    }
+
+    private func storedAttempt(_ n: Int,
+                               provider: String = "OpenAI",
+                               model: String = "gpt-5",
+                               startedAt: Date,
+                               endedAt: Date?,
+                               durationMS: Int?,
+                               statusCode: Int?,
+                               outcome: ActivityAttemptOutcome,
+                               tokens: UsageTokens = UsageTokens(),
+                               performance: UsagePerformance? = nil,
+                               reason: String? = nil) -> ActivityAttempt {
+        ActivityAttempt(id: n, remoteID: "remote-\(n)", provider: provider, model: model,
+                        label: "\(provider) · \(model)", source: "api", endpoint: "chat",
+                        startedAt: startedAt, endedAt: endedAt, durationMS: durationMS,
+                        outcome: outcome, statusCode: statusCode, reason: reason,
+                        tokens: tokens, performance: performance)
+    }
+
+    /// 两次尝试的回退请求：第一次 429，第二次成功。
+    private func makeFallbackModel() -> (ActivityViewModel, UUID) {
+        let model = ActivityViewModel()
+        let id = UUID()
+        let t0 = Date(timeIntervalSince1970: 90_000)
+        let first = storedAttempt(1, provider: "OpenAI", model: "gpt-5", startedAt: t0,
+                                  endedAt: t0.addingTimeInterval(0.8), durationMS: 800,
+                                  statusCode: 429, outcome: .httpError, reason: "HTTP 429")
+        let second = storedAttempt(2, provider: "DeepSeek", model: "deepseek-chat",
+                                   startedAt: t0.addingTimeInterval(0.8),
+                                   endedAt: t0.addingTimeInterval(2.0), durationMS: 1_200,
+                                   statusCode: 200, outcome: .success,
+                                   tokens: UsageTokens(input: 10, output: 20),
+                                   performance: performance(ttft: 100, requestTTFT: 999, generation: 400))
+        let entry = request(id: id, status: .succeeded, startedAt: t0,
+                            endedAt: t0.addingTimeInterval(2.0),
+                            attempts: [first, second], selectedAttempt: 2,
+                            tokens: UsageTokens(input: 10, output: 20),
+                            performance: performance(ttft: 100, requestTTFT: 999, generation: 400),
+                            elapsedMS: 2_000)
+        model.apply(ActivitySnapshot(generatedAt: t0.addingTimeInterval(2.0), activeCount: 0,
+                                     capacity: 300, evictedCount: 0, requests: [entry]))
+        return (model, id)
     }
 
     // MARK: - 状态文案与色调
@@ -84,6 +137,12 @@ struct ActivityViewModelTests {
 
         #expect(row(phase: .cancelled).statusText == "已取消")
         #expect(row(phase: .cancelled).tone == .neutral)
+
+        // 逐次尝试行：旧尝试保留并标记为已回退，能带出 HTTP 状态码。
+        #expect(row(phase: .fallenBack, statusCode: 429).statusText == "429 已回退")
+        #expect(row(phase: .fallenBack).statusText == "↩ 已回退")
+        #expect(row(phase: .fallenBack, attemptResult: .networkError).statusText == "↩ 连接失败")
+        #expect(row(phase: .fallenBack).tone == .warn)
     }
 
     @Test("receiving 视为进行中，终态不再活跃")
@@ -93,6 +152,7 @@ struct ActivityViewModelTests {
         #expect(!row(phase: .succeeded).isActive)
         #expect(!row(phase: .failed).isActive)
         #expect(!row(phase: .cancelled).isActive)
+        #expect(!row(phase: .fallenBack).isActive)
     }
 
     // MARK: - 流向图请求节点：状态 + 耗时
@@ -331,6 +391,8 @@ struct ActivityViewModelTests {
         // 路由列定宽：更宽的窗口只把多余空间给上游模型，不把路由列撑大。
         let extraWide = ActivityColumns(width: 1400)
         #expect(extraWide.routeWidth == wide.routeWidth)
+        #expect(narrow.attemptsWidth > 0)
+        #expect(wide.attemptsWidth >= narrow.attemptsWidth)
     }
 
     // MARK: - 请求级性能明细
@@ -673,5 +735,198 @@ struct ActivityViewModelTests {
                                      capacity: 300, evictedCount: 0, requests: [entry]))
         #expect(model.graphRows.isEmpty)
         #expect(model.rows.map(\.id) == [id])
+    }
+
+    // MARK: - 回退逐条展开
+
+    @Test("每次回退生成新条目：旧尝试标记已回退，新尝试独立成行")
+    func fallbackSplitsIntoAttemptRows() {
+        let (model, id) = makeFallbackModel()
+
+        #expect(model.rows.count == 2)
+        let newest = model.rows[0]
+        let older = model.rows[1]
+
+        #expect(newest.attemptIndex == 2)
+        #expect(newest.attemptCount == 2)
+        #expect(newest.attemptProgressText == "2/2")
+        #expect(newest.phase == .succeeded)
+        #expect(newest.statusText == "✓ 已完成")
+        #expect(newest.identityModelText == "DeepSeek · deepseek-chat")
+        #expect(newest.tokens.output == 20)
+        #expect(newest.elapsedMS == 1_200)
+        // 逐尝试口径：TTFT 用该次尝试自身（100ms），不是请求级 999ms。
+        #expect(newest.ttftText == "100 ms")
+        #expect(newest.tpsIncludingTTFTText == "40.0")
+
+        #expect(older.attemptIndex == 1)
+        #expect(older.attemptCount == 2)
+        #expect(older.attemptProgressText == "1/2")
+        #expect(older.phase == .fallenBack)
+        #expect(older.statusText == "429 已回退")
+        #expect(older.identityModelText == "OpenAI · gpt-5")
+        #expect(older.elapsedMS == 800)
+        #expect(older.ttftText == "—")
+        #expect(older.groupID == id)
+        #expect(newest.groupID == id)
+        #expect(older.detailLines.contains(where: { $0.contains("已切换到 DeepSeek · deepseek-chat") }))
+        #expect(older.detailLines.contains(where: { $0.contains("限流") }))
+        #expect(newest.detailLines.contains(where: { $0.contains("第 2/2 次尝试成功完成") }))
+        #expect(older.detailFooterText.contains("第 1/2 次尝试"))
+        #expect(older.detailFooterText.contains("请求总耗时 2.0 s"))
+        #expect(model.copyText().contains("1/2"))
+
+        // 图仍是一请求一个节点；选中请求会同时高亮它的所有尝试行。
+        #expect(model.requestRows.count == 1)
+        #expect(model.graphRows.map(\.id) == [id])
+        model.toggle(request: id)
+        #expect(model.isRowHighlighted(newest))
+        #expect(model.isRowHighlighted(older))
+        #expect(model.statusSummary.contains("2 条尝试记录"))
+    }
+
+    @Test("多次回退全部保留：同请求尝试相邻且按新→旧排列")
+    func multipleFallbacksKeepGrouping() {
+        let model = ActivityViewModel()
+        let a = UUID()
+        let b = UUID()
+        let t0 = Date(timeIntervalSince1970: 100_000)
+        let a1 = storedAttempt(1, provider: "OpenAI", model: "gpt-5", startedAt: t0,
+                               endedAt: t0.addingTimeInterval(0.8), durationMS: 800,
+                               statusCode: 429, outcome: .httpError, reason: "HTTP 429")
+        let a2 = storedAttempt(2, provider: "Krill", model: "gpt-6.1-sol",
+                               startedAt: t0.addingTimeInterval(10),
+                               endedAt: t0.addingTimeInterval(11.2), durationMS: 1_200,
+                               statusCode: 503, outcome: .httpError, reason: "HTTP 503")
+        let a3 = storedAttempt(3, provider: "Antigravity", model: "gemini-3-pro",
+                               startedAt: t0.addingTimeInterval(20),
+                               endedAt: t0.addingTimeInterval(22.4), durationMS: 2_400,
+                               statusCode: 200, outcome: .success,
+                               tokens: UsageTokens(input: 5, output: 8),
+                               performance: performance(ttft: 900, requestTTFT: 12_000, generation: 1_500))
+        let aEntry = request(id: a, status: .succeeded, startedAt: t0,
+                             endedAt: t0.addingTimeInterval(22.4),
+                             attempts: [a1, a2, a3], selectedAttempt: 3,
+                             tokens: UsageTokens(input: 5, output: 8),
+                             performance: performance(ttft: 900, requestTTFT: 12_000, generation: 1_500),
+                             elapsedMS: 22_400)
+        let b1 = storedAttempt(1, provider: "OpenRouter", model: "other-model",
+                               startedAt: t0.addingTimeInterval(25), endedAt: nil,
+                               durationMS: nil, statusCode: nil, outcome: .pending)
+        let bEntry = request(id: b, status: .receiving, startedAt: t0.addingTimeInterval(25),
+                             endedAt: nil, attempts: [b1], selectedAttempt: nil,
+                             elapsedMS: 5_000)
+        model.apply(ActivitySnapshot(generatedAt: t0.addingTimeInterval(30), activeCount: 1,
+                                     capacity: 300, evictedCount: 0,
+                                     requests: [aEntry, bEntry]))
+
+        // 请求仍按开始时间排序；A 的三次尝试必须相邻，不能与 B 穿插。
+        #expect(model.rows.map(\.attemptIndex) == [1, 3, 2, 1])
+        #expect(Array(model.rows[1...3]).map(\.groupID) == [a, a, a])
+        let aRows = model.rows.filter { $0.groupID == a }
+        #expect(aRows.map(\.attemptIndex) == [3, 2, 1])
+        #expect(aRows.map(\.statusText) == ["✓ 已完成", "503 已回退", "429 已回退"])
+        #expect(aRows.allSatisfy { $0.attemptCount == 3 })
+        #expect(aRows[1].detailLines.contains(where: { $0.contains("已切换到 Antigravity · gemini-3-pro") }))
+        #expect(model.requestRows.count == 2)
+        #expect(model.activeRows.map(\.id) == [b])
+    }
+
+    @Test("回退进行中：旧尝试已回退，新尝试显示当前阶段")
+    func inFlightFallbackShowsLatestAttemptAsActive() {
+        let model = ActivityViewModel()
+        let id = UUID()
+        let t0 = Date(timeIntervalSince1970: 95_000)
+        let first = storedAttempt(1, provider: "OpenAI", model: "gpt-5", startedAt: t0,
+                                  endedAt: t0.addingTimeInterval(0.8), durationMS: 800,
+                                  statusCode: 429, outcome: .httpError, reason: "HTTP 429")
+        let second = storedAttempt(2, provider: "DeepSeek", model: "deepseek-chat",
+                                   startedAt: t0.addingTimeInterval(0.8), endedAt: nil,
+                                   durationMS: nil, statusCode: nil, outcome: .pending)
+        let entry = request(id: id, status: .receiving, startedAt: t0, endedAt: nil,
+                            attempts: [first, second], elapsedMS: 3_600)
+        model.apply(ActivitySnapshot(generatedAt: t0.addingTimeInterval(2.8), activeCount: 1,
+                                     capacity: 300, evictedCount: 0, requests: [entry]))
+
+        #expect(model.rows.count == 2)
+        #expect(model.rows[0].attemptIndex == 2)
+        #expect(model.rows[0].phase == .receiving)
+        #expect(model.rows[0].statusText == "接收响应")
+        #expect(model.rows[0].isActive)
+        #expect(model.rows[0].elapsedMS == 2_000)
+        #expect(model.rows[1].phase == .fallenBack)
+        #expect(!model.rows[1].isActive)
+        #expect(model.activeRows.map(\.id) == [id])
+        #expect(model.requestRows.count == 1)
+    }
+
+    @Test("搜索能命中只出现在旧尝试里的模型与回退状态")
+    func searchMatchesFallbackRows() {
+        let (model, _) = makeFallbackModel()
+
+        model.query = "gpt-5"
+        #expect(model.visibleRows.map(\.attemptIndex) == [1])
+        model.query = "429"
+        #expect(model.visibleRows.map(\.attemptIndex) == [1])
+        model.query = "deepseek"
+        #expect(model.visibleRows.map(\.attemptIndex) == [2])
+        model.query = "已完成"
+        #expect(model.visibleRows.map(\.attemptIndex) == [2])
+    }
+
+    @Test("尝试行 ID 跨刷新稳定，新增回退不丢展开状态")
+    func attemptRowIDsStableAcrossRefresh() {
+        let model = ActivityViewModel()
+        let id = UUID()
+        let t0 = Date(timeIntervalSince1970: 110_000)
+        let first = storedAttempt(1, provider: "OpenAI", model: "gpt-5", startedAt: t0,
+                                  endedAt: t0.addingTimeInterval(0.8), durationMS: 800,
+                                  statusCode: 429, outcome: .httpError, reason: "HTTP 429")
+        let single = request(id: id, status: .inFlight, startedAt: t0, endedAt: nil,
+                             attempts: [first], elapsedMS: 1_000)
+        model.apply(ActivitySnapshot(generatedAt: t0.addingTimeInterval(1), activeCount: 1,
+                                     capacity: 300, evictedCount: 0, requests: [single]))
+        let firstRowID = model.rows[0].id
+        #expect(model.rows[0].attemptProgressText == nil)
+        model.toggleExpanded(firstRowID)
+
+        // 回退发生后：旧尝试变成「已回退」行，但 ID 不变，展开状态保留。
+        let second = storedAttempt(2, provider: "DeepSeek", model: "deepseek-chat",
+                                   startedAt: t0.addingTimeInterval(1),
+                                   endedAt: t0.addingTimeInterval(2), durationMS: 1_000,
+                                   statusCode: 200, outcome: .success,
+                                   tokens: UsageTokens(input: 3, output: 4))
+        let updated = request(id: id, status: .succeeded, startedAt: t0,
+                              endedAt: t0.addingTimeInterval(2),
+                              attempts: [first, second], selectedAttempt: 2, elapsedMS: 2_000)
+        model.apply(ActivitySnapshot(generatedAt: t0.addingTimeInterval(2), activeCount: 0,
+                                     capacity: 300, evictedCount: 0, requests: [updated]))
+
+        #expect(model.rows.count == 2)
+        #expect(model.rows[1].id == firstRowID)
+        #expect(model.rows[1].phase == .fallenBack)
+        #expect(model.isExpanded(firstRowID))
+        #expect(model.rows[0].attemptProgressText == "2/2")
+        #expect(model.rows[1].attemptProgressText == "1/2")
+    }
+
+    @Test("没有任何上游尝试的请求仍保留一条请求级记录")
+    func requestWithoutAttemptsKeepsRow() {
+        let model = ActivityViewModel()
+        let id = UUID()
+        let t0 = Date(timeIntervalSince1970: 120_000)
+        let entry = request(id: id, status: .failed, startedAt: t0,
+                            endedAt: t0.addingTimeInterval(0.2),
+                            failureReason: "没有可用候选", elapsedMS: 200)
+        model.apply(ActivitySnapshot(generatedAt: t0.addingTimeInterval(0.2), activeCount: 0,
+                                     capacity: 300, evictedCount: 0, requests: [entry]))
+
+        #expect(model.rows.count == 1)
+        #expect(!model.rows[0].isAttemptRow)
+        #expect(model.rows[0].phase == .failed)
+        #expect(model.rows[0].statusText == "! 失败")
+        #expect(model.rows[0].detailLines.contains(where: { $0.contains("没有可用候选") }))
+        #expect(model.requestRows.count == 1)
+        #expect(model.graphRows.map(\.id) == [id])
     }
 }

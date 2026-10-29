@@ -148,3 +148,12 @@ struct TableRowLayout: Layout {
         return widths
     }
 }
+
+extension TableRowLayout {
+    /// 用量 / 性能明细共用同一份列规格：名称列 3 份，四个数值列各 1 份。
+    /// 最小宽度按列序覆盖两类表（名称 / 输入或 TTFT / 输出或 TPS / 缓存或 TPS / 缓存率或请求），
+    /// 避免两张表在窗口收窄时各锁各的宽度、列分布又漂开。
+    static let statsDetail = TableRowLayout(minWidths: [120, 96, 112, 112, 72],
+                                            weights: [3, 1, 1, 1, 1],
+                                            spacing: 12)
+}

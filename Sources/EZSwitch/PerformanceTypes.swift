@@ -44,6 +44,21 @@ extension UsagePerformance {
         return RequestPerformanceDetail(ttftMS: ttftMS,
                                         tpsIncludingTTFT: including)
     }
+
+    /// 单次上游尝试的性能明细（活动页逐次尝试行用）：TTFT 取该次尝试自身，
+    /// 不含回退前的等待；其余有效性与请求级口径一致。
+    func attemptDetail(outputTokens: Int?) -> RequestPerformanceDetail? {
+        guard streaming, outputDeltaCount >= 2,
+              let ttftMS = Self.validDuration(ttftMS),
+              let outputTokens, outputTokens >= 2,
+              let generation = Self.validDuration(generationMS), generation > 0 else { return nil }
+        let total = ttftMS + generation
+        guard total.isFinite, total > 0 else { return nil }
+        let including = Double(outputTokens) * 1000 / total
+        guard including.isFinite else { return nil }
+        return RequestPerformanceDetail(ttftMS: ttftMS,
+                                        tpsIncludingTTFT: including)
+    }
 }
 
 /// 区间性能摘要。吞吐一律是"总输出 token / 总时长"的加权速率，绝不取逐请求速率的算术平均；

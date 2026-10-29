@@ -16,6 +16,7 @@ struct ActivityColumns {
     let routeWidth: CGFloat
     let upstreamMinWidth: CGFloat
     let statusWidth: CGFloat
+    let attemptsWidth: CGFloat
     let tokenWidth: CGFloat
     let elapsedWidth: CGFloat
     let ttftWidth: CGFloat
@@ -38,6 +39,7 @@ struct ActivityColumns {
         self.tpsIncludingWidth = self.showTPS ? 84 : 0
         self.apiWidth = narrow ? 60 : 68
         self.statusWidth = narrow ? 66 : 74
+        self.attemptsWidth = narrow ? 44 : 52
         self.tokenWidth = narrow ? 48 : 54
         // 路由定宽（长名字中间截断、悬停看全称）；上游模型列吃掉剩余宽度，且有下限。
         self.routeWidth = narrow ? 64 : 96
@@ -47,9 +49,9 @@ struct ActivityColumns {
 
 /// 性能列的 help / accessibility 口径说明（表头与数据行共用，避免两处口径漂移）。
 enum ActivityPerformanceHelp {
-    static let ttft = "TTFT（首字等待）：优先 requestTTFTMS，缺失时回退尝试级 ttftMS。"
-    static let tpsIncluding = "TPS（含 TTFT）= 输出 tokens × 1000 /（TTFT + 生成时长）；分母覆盖整个响应期，攒批下发也成立。"
-    static let validity = "仅流式、有效 TTFT、输出 tokens ≥ 2、生成时长 > 0 且输出增量 ≥ 2 时显示最终值；进行中、非流式、失败或数据不足显示 —。"
+    static let ttft = "TTFT（首字等待）：本次上游尝试从开始到首个有效输出片段，不含之前的回退等待。"
+    static let tpsIncluding = "TPS（含 TTFT）= 本次尝试输出 tokens × 1000 /（本次尝试 TTFT + 生成时长）；分母覆盖该次尝试的整个响应期。"
+    static let validity = "仅成功完成的流式尝试显示最终值；已回退、进行中、非流式、失败或数据不足显示 —。"
 }
 
 /// 表头：与请求行同列宽。
@@ -72,6 +74,11 @@ struct ActivityListHeader: View {
                 .lineLimit(1)
                 .frame(minWidth: columns.upstreamMinWidth, maxWidth: .infinity, alignment: .leading)
             Text("状态").frame(width: columns.statusWidth, alignment: .leading)
+            Text("尝试")
+                .lineLimit(1)
+                .frame(width: columns.attemptsWidth, alignment: .leading)
+                .help("尝试序号：显示第 N/M 次尝试；已回退的旧尝试会保留为独立条目。")
+                .accessibilityLabel("尝试序号")
             Text("输入").frame(width: columns.tokenWidth, alignment: .trailing)
             Text("输出").frame(width: columns.tokenWidth, alignment: .trailing)
             if columns.showElapsed {
@@ -149,6 +156,22 @@ struct ActivityRequestRow: View {
                 .font(.system(size: 11)).foregroundStyle(row.tone.color)
                 .lineLimit(1)
                 .frame(width: columns.statusWidth, alignment: .leading)
+
+            Group {
+                if let progress = row.attemptProgressText {
+                    Text(progress)
+                        .font(.system(size: 10.5)).monospacedDigit()
+                        .foregroundStyle(row.phase == .fallenBack ? ActivityPalette.warn : Color.secondary)
+                        .help("第 \(row.attemptIndex)/\(row.attemptCount) 次尝试；同一请求的尝试按时间倒序排列。")
+                        .accessibilityLabel("第 \(row.attemptIndex) 次，共 \(row.attemptCount) 次尝试")
+                } else {
+                    Text("—")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(width: columns.attemptsWidth, alignment: .leading)
 
             Text(ActivityFormat.tokenCell(row.tokens.input))
                 .font(.system(size: 12)).monospacedDigit()
@@ -240,7 +263,7 @@ struct ActivityRequestRow: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text("#\(row.shortID) · 耗时 \(row.durationText)")
+            Text(row.detailFooterText)
                 .font(.system(size: 11)).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

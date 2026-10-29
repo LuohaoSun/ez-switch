@@ -81,7 +81,7 @@ struct LogWindowView: View {
 
     private var listHeader: some View {
         HStack(spacing: 10) {
-            Text("最近请求").font(.system(size: 12, weight: .medium))
+            Text("最近请求与尝试").font(.system(size: 12, weight: .medium))
             if let highlight = model.highlightLabel {
                 Text(highlight).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
@@ -106,7 +106,7 @@ struct LogWindowView: View {
             } else {
                 ForEach(model.visibleRows) { row in
                     ActivityRequestRow(row: row, columns: columns,
-                                       accent: model.color(for: row.id),
+                                       accent: model.color(for: row.groupID),
                                        isHighlighted: model.isRowHighlighted(row),
                                        isExpanded: model.isExpanded(row.id),
                                        onToggleExpand: { model.toggleExpanded(row.id) })
@@ -143,9 +143,9 @@ struct LogWindowView: View {
 
     private var footText: String {
         var parts: [String] = []
-        parts.append(model.paused ? "显示已暂停 · 恢复后继续更新" : "每秒刷新 · 点击请求查看缓存、首字与回退过程")
-        if model.capacity > 0 { parts.append("保留最近 \(model.capacity) 条") }
-        if model.evictedCount > 0 { parts.append("已超出保留上限 \(model.evictedCount) 条") }
+        parts.append(model.paused ? "显示已暂停 · 恢复后继续更新" : "每秒刷新 · 点击条目查看缓存、首字与回退过程")
+        if model.capacity > 0 { parts.append("保留最近 \(model.capacity) 个请求") }
+        if model.evictedCount > 0 { parts.append("已超出保留上限 \(model.evictedCount) 个请求") }
         return parts.joined(separator: "　·　")
     }
 }

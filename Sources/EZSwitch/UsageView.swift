@@ -8,11 +8,9 @@ struct UsageView: View {
 
     @StateObject private var model: UsageViewModel
 
-    /// 列宽规格：名称列权重最高、其余数值列按权重铺开；表头与数据行共用同一份规格，
-    /// 因此逐列严格对齐，且列不会全挤在右侧。
-    private let columnLayout = TableRowLayout(minWidths: [120, 72, 72, 72, 72],
-                                              weights: [3, 1, 1, 1, 1],
-                                              spacing: 12)
+    /// 列宽规格：与性能明细共用 `TableRowLayout.statsDetail`；
+    /// 名称列权重最高、四个数值列等宽，表头与数据行逐列严格对齐。
+    private let columnLayout = TableRowLayout.statsDetail
 
     /// `initialSection` 由侧栏入口决定：用量入口传 .usage，性能入口传 .performance。
     /// 在 init 里写入 ViewModel，配合调用方的稳定视图身份，不依赖 onAppear 重置。

@@ -29,12 +29,14 @@ enum ActivityProtocolKind: String, Identifiable, CaseIterable {
 
 /// 请求级状态，镜像后端 `ActivityStatus`。
 /// `.receiving` 表示已开始收到并转发上游响应字节，**不代表首字内容已到**。
+/// `.fallenBack` 是展示层状态：该次尝试已被后续候选取代，旧条目保留并标记为「已回退」。
 enum ActivityPhase: Equatable {
     case inFlight
     case receiving
     case succeeded
     case failed
     case cancelled
+    case fallenBack
 
     var isActive: Bool { self == .inFlight || self == .receiving }
 }
@@ -209,8 +211,33 @@ struct ActivityRowModel: Identifiable, Equatable {
     var statusCode: Int? = nil
     var outcome: String? = nil
     var elapsedMS: Int = 0
+    /// 逐次尝试行专用：所属请求与请求级起始时刻；为 nil 时本行就是请求级行（流向图用）。
+    var requestID: UUID? = nil
+    var requestStartedAt: Date? = nil
+    /// 1-based 尝试序号与当前已观测到的尝试总数。
+    var attemptIndex: Int = 1
+    var attemptCount: Int = 1
+    /// 请求总耗时；逐次尝试行的 `elapsedMS` 只覆盖该次尝试。
+    var requestElapsedMS: Int = 0
+    /// 该次尝试被回退时，下一跳的 `provider · model`。
+    var fallbackTo: String? = nil
+    /// 尝试结局，用于把状态码翻译成「限流 / 连接失败」等短语。
+    var attemptResult: ActivityAttemptResult? = nil
 
     var isActive: Bool { phase.isActive }
+
+    /// 尝试行归属于哪个请求；请求级行就是自身 ID。
+    var groupID: UUID { requestID ?? id }
+
+    /// 同一请求内的尝试按请求起始时刻分组排序，避免被其它并发请求穿插。
+    var groupStartedAt: Date { requestStartedAt ?? startedAt }
+
+    var isAttemptRow: Bool { requestID != nil }
+
+    /// 表格「尝试」列：只有发生过回退的请求才显示序号，单次尝试保持安静。
+    var attemptProgressText: String? {
+        attemptCount > 1 ? "\(attemptIndex)/\(attemptCount)" : nil
+    }
 
     /// 是否仍在图上驻留的终态：已完成/失败/取消，且 `endedAt` 距参考时刻不足 `window`。
     /// 参考时刻取快照 `generatedAt`，因此驻留时长依真实 `endedAt` 起算、不随刷新延长；
@@ -237,6 +264,14 @@ struct ActivityRowModel: Identifiable, Equatable {
         case .succeeded: return didFallback ? "✓ 回退成功" : "✓ 已完成"
         case .failed: return "! 失败"
         case .cancelled: return "已取消"
+        case .fallenBack:
+            // 能一眼看出回退原因时直接带上状态码；连接类失败用短语兜底。
+            if let statusCode { return "\(statusCode) 已回退" }
+            switch attemptResult {
+            case .networkError: return "↩ 连接失败"
+            case .streamError: return "↩ 传输中断"
+            default: return "↩ 已回退"
+            }
         }
     }
 
@@ -247,6 +282,7 @@ struct ActivityRowModel: Identifiable, Equatable {
         case .succeeded: return didFallback ? .warn : .ok
         case .failed: return .fail
         case .cancelled: return .neutral
+        case .fallenBack: return .warn
         }
     }
 
@@ -259,10 +295,13 @@ struct ActivityRowModel: Identifiable, Equatable {
 
     var durationText: String { ActivityFormat.elapsed(ms: elapsedMS) }
 
-    /// 请求级性能明细：只有成功完成的请求才展示最终值。
-    /// 进行中、失败、取消、非流式或数据不足一律为 nil（表格显示「—」）。
+    /// 性能明细：逐次尝试行用该次尝试自身的 TTFT；请求级行保留请求口径（含回退等待）。
+    /// 只有成功完成的尝试/请求才展示最终值；进行中、失败、取消、非流式或数据不足一律为 nil。
     var requestPerformanceDetail: RequestPerformanceDetail? {
         guard phase == .succeeded else { return nil }
+        if isAttemptRow {
+            return performance?.attemptDetail(outputTokens: tokens.output)
+        }
         return performance?.requestDetail(outputTokens: tokens.output)
     }
 
@@ -278,6 +317,7 @@ struct ActivityRowModel: Identifiable, Equatable {
         case .succeeded: return didFallback ? "回退成功" : "已完成"
         case .failed: return "失败"
         case .cancelled: return "已取消"
+        case .fallenBack: return "已回退"
         }
     }
 
@@ -301,6 +341,7 @@ struct ActivityRowModel: Identifiable, Equatable {
 
     /// 展开详情文本行；只陈述已观测字段，未报告的不出现。
     var detailLines: [String] {
+        if isAttemptRow { return attemptDetailLines }
         var lines: [String] = []
         switch phase {
         case .inFlight:
@@ -321,6 +362,8 @@ struct ActivityRowModel: Identifiable, Equatable {
             }
         case .cancelled:
             lines.append("请求已取消。")
+        case .fallenBack:
+            lines.append("该次尝试已回退，请求仍由后续尝试继续。")
         }
 
         var metrics: [String] = []
@@ -347,12 +390,73 @@ struct ActivityRowModel: Identifiable, Equatable {
         return lines
     }
 
+    /// 逐次尝试详情：这一次为什么结束、切到哪、用量与首字。
+    private var attemptDetailLines: [String] {
+        var lines: [String] = []
+        let ordinal = attemptCount > 1 ? "第 \(attemptIndex)/\(attemptCount) 次尝试" : "本次尝试"
+        switch phase {
+        case .fallenBack:
+            lines.append("\(ordinal)\(attemptFailurePhrase)，已切换到 \(fallbackTo ?? "下一个候选")。")
+        case .inFlight:
+            lines.append("\(ordinal)已发送 · 正在等待上游响应。")
+        case .receiving:
+            lines.append("\(ordinal)已开始返回响应，正在转发（可能仍是心跳 / 非正文帧）。")
+        case .succeeded:
+            lines.append(attemptCount > 1 ? "\(ordinal)成功完成。" : "本次尝试成功完成。")
+        case .failed:
+            lines.append("\(ordinal)\(attemptFailurePhrase)，候选耗尽。")
+        case .cancelled:
+            lines.append("请求已取消（\(ordinal)）。")
+        }
+
+        var metrics: [String] = []
+        if let cached = tokens.cachedInput, cached > 0 {
+            metrics.append("输入中缓存命中 \(ActivityFormat.tokens(cached))")
+        }
+        if let write = tokens.cacheWrite, write > 0 {
+            metrics.append("缓存写入 \(ActivityFormat.tokens(write))")
+        }
+        if let reasoning = tokens.reasoning, reasoning > 0 {
+            metrics.append("输出中 reasoning \(ActivityFormat.tokens(reasoning))")
+        }
+        // 逐次尝试行只在该次尝试成功时展示首字；失败尝试的残缺计时不作为最终值。
+        if phase == .succeeded, let ttft = performance?.ttftMS {
+            metrics.append("首字 \(ActivityFormat.seconds(ttft / 1000))")
+        }
+        if !metrics.isEmpty { lines.append(metrics.joined(separator: " · ")) }
+
+        if tokens.input == nil, tokens.output == nil, !phase.isActive {
+            lines.append("本次尝试未收到上游用量报告。")
+        }
+        return lines
+    }
+
+    /// 失败短语：状态码翻译 + 原始短原因（如 HTTP 429 / NSURLErrorDomain(-1004)）。
+    private var attemptFailurePhrase: String {
+        let result = attemptResult ?? .httpError
+        let phrase = ActivityStatusPhrase.phrase(statusCode: statusCode, outcome: result)
+        guard let reason = failureReason?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !reason.isEmpty, reason != phrase else { return phrase }
+        return "\(phrase)（\(reason)）"
+    }
+
+    /// 展开区底部：尝试行点明第几次与请求总耗时，请求级行保持原样。
+    var detailFooterText: String {
+        guard isAttemptRow else { return "#\(shortID) · 耗时 \(durationText)" }
+        let total = ActivityFormat.elapsed(ms: requestElapsedMS > 0 ? requestElapsedMS : elapsedMS)
+        if attemptCount > 1 {
+            return "#\(shortID) · 第 \(attemptIndex)/\(attemptCount) 次尝试 · 本次 \(durationText) · 请求总耗时 \(total)"
+        }
+        return "#\(shortID) · 耗时 \(durationText)"
+    }
+
     func matches(_ query: String) -> Bool {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else { return true }
         if shortID.localizedCaseInsensitiveContains(needle) { return true }
         if routeName.localizedCaseInsensitiveContains(needle) { return true }
         if protocolKind.badgeTitle.localizedCaseInsensitiveContains(needle) { return true }
+        if statusText.localizedCaseInsensitiveContains(needle) { return true }
         if let provider = upstreamProvider, provider.localizedCaseInsensitiveContains(needle) { return true }
         if let model = upstreamModel, model.localizedCaseInsensitiveContains(needle) { return true }
         return false
@@ -438,6 +542,8 @@ struct ActivityColorAssigner {
 @MainActor
 final class ActivityViewModel: ObservableObject {
     @Published private(set) var rows: [ActivityRowModel] = []
+    /// 流向图与请求级统计用：每个请求一行（取最终尝试）；`rows` 则是逐次尝试展开后的表格行。
+    @Published private(set) var requestRows: [ActivityRowModel] = []
     @Published var query: String = ""
     @Published var paused: Bool = false
     @Published private(set) var selection: ActivitySelection?
@@ -481,39 +587,48 @@ final class ActivityViewModel: ObservableObject {
         if !paused { refresh() }
     }
 
-    func ingest(rows: [ActivityRowModel], activeCount: Int,
-                capacity: Int = 0, evictedCount: Int = 0,
+    func ingest(rows: [ActivityRowModel], requestRows: [ActivityRowModel]? = nil,
+                activeCount: Int, capacity: Int = 0, evictedCount: Int = 0,
                 generatedAt: Date = Date()) {
         let sorted = rows.sorted(by: Self.newestFirst)
         self.rows = sorted
+        self.requestRows = (requestRows ?? rows).sorted(by: Self.newestFirst)
         self.activeCount = activeCount
         self.capacity = capacity
         self.evictedCount = evictedCount
         self.generatedAt = generatedAt
         // 槽位覆盖 active + 驻留终态：请求完成驻留时 ID 不变，颜色不跳变。
-        colorSlots = assigner.assign(ids: graphCandidateRows.map(\.id))
+        // 同一请求的多次尝试共用请求颜色，方便在列表里认出它们属于同一条链。
+        colorSlots = assigner.assign(ids: graphCandidateRows.map(\.groupID))
     }
 
+    /// 列表排序：请求仍按开始时间最新在前；同一请求内按尝试倒序（最新一次在最上面）。
+    /// 这样一次请求的旧尝试不会被其它并发请求插开，回退链在列表里保持相邻。
     private static func newestFirst(_ a: ActivityRowModel, _ b: ActivityRowModel) -> Bool {
-        if a.startedAt != b.startedAt { return a.startedAt > b.startedAt }
+        if a.groupStartedAt != b.groupStartedAt { return a.groupStartedAt > b.groupStartedAt }
+        if a.groupID != b.groupID { return a.groupID.uuidString > b.groupID.uuidString }
+        if a.attemptIndex != b.attemptIndex { return a.attemptIndex > b.attemptIndex }
         return a.id.uuidString > b.id.uuidString
     }
 
     /// 流向图用：进行中请求按开始时间升序（旧 → 新），新请求追加在下方，位置稳定不抖动。
     var activeRows: [ActivityRowModel] {
-        rows.filter { $0.isActive }.sorted(by: Self.oldestFirst)
+        requestRows.filter { $0.isActive }.sorted(by: Self.oldestFirst)
     }
 
     private static func oldestFirst(_ a: ActivityRowModel, _ b: ActivityRowModel) -> Bool {
-        if a.startedAt != b.startedAt { return a.startedAt < b.startedAt }
+        if a.groupStartedAt != b.groupStartedAt { return a.groupStartedAt < b.groupStartedAt }
+        if a.groupID != b.groupID { return a.groupID.uuidString < b.groupID.uuidString }
+        if a.attemptIndex != b.attemptIndex { return a.attemptIndex < b.attemptIndex }
         return a.id.uuidString < b.id.uuidString
     }
 
     /// 图上候选：进行中请求 + 驻留中的终态（`endedAt` 距快照时刻不足 `residentDuration`）。
     /// 统一按开始时间升序，因此请求 active → terminal 时位置不跳变（同一请求开始时间不变）。
+    /// 使用请求级行：一次请求在图上只占一个节点，回退不复制节点。
     private var graphCandidateRows: [ActivityRowModel] {
         let now = generatedAt
-        return rows
+        return requestRows
             .filter { $0.isActive || $0.isResidentTerminal(asOf: now, within: ActivityLimits.residentDuration) }
             .sorted(by: Self.oldestFirst)
     }
@@ -561,7 +676,9 @@ final class ActivityViewModel: ObservableObject {
     var statusSummary: String {
         if paused { return "显示已暂停" }
         let head = activeCount > 0 ? "\(activeCount) 个请求进行中" : "当前没有进行中的请求"
-        return "\(head) · 最近 \(rows.count) 条"
+        let requests = requestRows.count
+        guard rows.count != requests else { return "\(head) · 最近 \(requests) 条" }
+        return "\(head) · 最近 \(requests) 个请求 · \(rows.count) 条尝试记录"
     }
 
     /// 当前高亮对象说明（仅提示，不改动列表内容）。
@@ -570,7 +687,9 @@ final class ActivityViewModel: ObservableObject {
         case .none:
             return nil
         case .request(let id):
-            let short = rows.first(where: { $0.id == id })?.shortID ?? ActivityRowModel.shortID(for: id)
+            let short = requestRows.first(where: { $0.id == id })?.shortID
+                ?? rows.first(where: { $0.groupID == id })?.shortID
+                ?? ActivityRowModel.shortID(for: id)
             return "· 已高亮 请求 #\(short)"
         case .upstream(let key):
             let row = rows.first(where: { $0.upstreamKey == key })
@@ -602,11 +721,11 @@ final class ActivityViewModel: ObservableObject {
         if expandedIDs.contains(id) { expandedIDs.remove(id) } else { expandedIDs.insert(id) }
     }
 
-    /// 某请求是否与当前选择相关（不被灰化）。
+    /// 某请求是否与当前选择相关（不被灰化）。逐次尝试行按所属请求匹配。
     func isRequestRelated(_ row: ActivityRowModel) -> Bool {
         switch selection {
         case .none: return true
-        case .request(let id): return row.id == id
+        case .request(let id): return row.groupID == id
         case .upstream(let key): return row.upstreamKey == key
         }
     }
@@ -622,7 +741,9 @@ final class ActivityViewModel: ObservableObject {
         switch selection {
         case .none: return true
         case .upstream(let selected): return selected == key
-        case .request(let id): return rows.first(where: { $0.id == id })?.upstreamKey == key
+        case .request(let id):
+            // 图上节点代表请求的最终上游，因此按请求级行比对。
+            return requestRows.first(where: { $0.id == id })?.upstreamKey == key
         }
     }
 
@@ -635,9 +756,12 @@ final class ActivityViewModel: ObservableObject {
                 row.routeName,
                 row.identityModelText,
                 row.statusText,
+                row.attemptProgressText ?? "",
                 "\(ActivityFormat.tokenCell(row.tokens.input))/\(ActivityFormat.tokenCell(row.tokens.output))",
                 row.durationText,
-            ].joined(separator: "  ")
+            ]
+            .filter { !$0.isEmpty }
+            .joined(separator: "  ")
         }.joined(separator: "\n")
     }
 }
@@ -650,7 +774,11 @@ extension ActivityViewModel {
     }
 
     func apply(_ snapshot: ActivitySnapshot) {
-        ingest(rows: snapshot.requests.map(ActivityRowModel.init(request:)),
+        let requestRows = snapshot.requests.map(ActivityRowModel.init(request:))
+        let attemptRows = snapshot.requests.flatMap {
+            ActivityRowModel.attemptRows(for: $0, asOf: snapshot.generatedAt)
+        }
+        ingest(rows: attemptRows, requestRows: requestRows,
                activeCount: snapshot.activeCount,
                capacity: snapshot.capacity,
                evictedCount: snapshot.evictedCount,
@@ -683,6 +811,72 @@ extension ActivityRowModel {
             outcome: request.outcome,
             elapsedMS: request.elapsedMS
         )
+    }
+
+    /// 把一次请求展开成逐次尝试行：最新尝试在最上，旧尝试在下并标记为「已回退」。
+    /// 同一次请求的所有行共享 `requestID` 与短 ID，排序时保持相邻，不会被并发请求插开。
+    static func attemptRows(for request: ActivityRequest, asOf: Date) -> [ActivityRowModel] {
+        let attempts = request.attempts
+        guard !attempts.isEmpty else {
+            // 还没观测到上游尝试（例如路由前失败）：保留一条请求级行，避免记录消失。
+            return [ActivityRowModel(request: request)]
+        }
+        let total = attempts.count
+        let protocolKind = ActivityProtocolKind(rawValue: request.endpoint) ?? .chat
+        let routeName = request.routeName.isEmpty ? request.route : request.routeName
+        let shortID = shortID(for: request.id)
+        let requestPhase = ActivityPhase(request.status)
+        return (0..<total).reversed().map { index in
+            let attempt = attempts[index]
+            let isLatest = index == total - 1
+            let phase: ActivityPhase = isLatest ? requestPhase : .fallenBack
+            let endedAt = attempt.endedAt ?? (isLatest ? request.endedAt : nil)
+            // 已终结的尝试用后端单调时钟；仍在途的最新尝试按快照时刻估算。
+            let elapsed: Int
+            if let duration = attempt.durationMS {
+                elapsed = duration
+            } else {
+                let end = endedAt ?? asOf
+                elapsed = max(0, Int(end.timeIntervalSince(attempt.startedAt) * 1000))
+            }
+            let next = index + 1 < total ? attempts[index + 1] : nil
+            return ActivityRowModel(
+                id: attemptRowID(requestID: request.id, attempt: attempt.id),
+                shortID: shortID,
+                startedAt: attempt.startedAt,
+                endedAt: endedAt,
+                protocolKind: protocolKind,
+                routeName: routeName,
+                phase: phase,
+                upstreamProvider: attempt.provider,
+                upstreamModel: attempt.model,
+                selectedAttempt: isLatest ? request.selectedAttempt : attempt.id,
+                attempts: [],
+                didFallback: false,
+                tokens: attempt.tokens,
+                performance: attempt.performance,
+                failureReason: attempt.reason,
+                statusCode: attempt.statusCode,
+                outcome: attempt.outcome.rawValue,
+                elapsedMS: elapsed,
+                requestID: request.id,
+                requestStartedAt: request.startedAt,
+                attemptIndex: attempt.id,
+                attemptCount: total,
+                requestElapsedMS: request.elapsedMS,
+                fallbackTo: next?.label,
+                attemptResult: ActivityAttemptResult(attempt.outcome)
+            )
+        }
+    }
+
+    /// 尝试行 ID：保留请求 ID 的前 14 字节，尾部写入尝试序号。
+    /// 跨刷新稳定（展开状态不丢），且同一请求内不同尝试互不相同。
+    static func attemptRowID(requestID: UUID, attempt: Int) -> UUID {
+        var bytes = requestID.uuid
+        bytes.14 = 0xE1
+        bytes.15 = UInt8(truncatingIfNeeded: attempt)
+        return UUID(uuid: bytes)
     }
 }
 
