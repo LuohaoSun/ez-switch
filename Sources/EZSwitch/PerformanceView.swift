@@ -16,14 +16,9 @@ struct PerformanceView: View {
     @ObservedObject var model: UsageViewModel
     let store: UsageStore
 
-    /// 列宽：名称列定宽、指标列贴合内容；剩余空间由列间等距留白吸收，
-    /// 避免数值列内部出现大片空白（数值列不多时按权重平分会显得松散）。
-    /// 表头与数据行使用同一组宽度与间距，逐列严格对齐。
-    private let nameColumnWidth: CGFloat = 200
-    private let ttftColumnWidth: CGFloat = 96
-    private let tpsColumnWidth: CGFloat = 112
-    private let requestsColumnWidth: CGFloat = 60
-    private let columnGap: CGFloat = 16
+    /// 列宽规格：与用量明细共用 `TableRowLayout.statsDetail`，
+    /// 名称列 3 份、四个数值列各 1 份；表头与数据行逐列严格对齐。
+    private let columnLayout = TableRowLayout.statsDetail
 
     var body: some View {
         content
@@ -244,21 +239,12 @@ struct PerformanceView: View {
     }
 
     private var tableHeader: some View {
-        HStack(spacing: 0) {
+        columnLayout {
             headerCell(.name)
-                .frame(width: nameColumnWidth, alignment: .leading)
-            Spacer(minLength: columnGap)
             headerCell(.ttftMean)
-                .frame(width: ttftColumnWidth)
-            Spacer(minLength: columnGap)
             headerCell(.tpsIncludingTTFT)
-                .frame(width: tpsColumnWidth)
-            Spacer(minLength: columnGap)
             headerCell(.tpsExcludingTTFT)
-                .frame(width: tpsColumnWidth)
-            Spacer(minLength: columnGap)
             headerCell(.requests)
-                .frame(width: requestsColumnWidth)
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -285,7 +271,7 @@ struct PerformanceView: View {
 
     /// 列头文字与箭头：名称列左对齐、箭头在文字后（文字左边缘不动）；
     /// 数值列右对齐、箭头在文字前——文字右边缘与下方数值严格齐平，
-    /// 箭头显隐都不改变任何文字的位置。宽度由上方列宽常量统一约定。
+    /// 箭头显隐都不改变任何文字的位置。宽度由 `TableRowLayout.statsDetail` 统一分配。
     private func columnLabel(title: String, arrow: some View, leading: Bool) -> some View {
         let text = Text(title)
             .lineLimit(1)
@@ -367,7 +353,7 @@ struct PerformanceView: View {
         let tpsExcluding = PerformanceFormat.tps(s.tpsExcludingTTFT)
         let sampleCount = ttftSampleCount(s)
 
-        return HStack(spacing: 0) {
+        return columnLayout {
             VStack(alignment: .leading, spacing: 2) {
                 Text(row.title)
                     .font(.callout)
@@ -383,20 +369,11 @@ struct PerformanceView: View {
             }
             .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             .help(row.subtitle.isEmpty ? row.title : "\(row.title)\n\(row.subtitle)")
-            .frame(width: nameColumnWidth, alignment: .leading)
 
-            Spacer(minLength: columnGap)
             valueCell(ttft, help: "\(PerformanceSortKey.ttftMean.columnTitle(for: model.performanceGrouping))：\(sampleCount) 个 TTFT 样本")
-                .frame(width: ttftColumnWidth)
-            Spacer(minLength: columnGap)
             valueCell(tpsIncluding, help: "\(PerformanceSortKey.tpsIncludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
-                .frame(width: tpsColumnWidth)
-            Spacer(minLength: columnGap)
             valueCell(tpsExcluding, help: "\(PerformanceSortKey.tpsExcludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
-                .frame(width: tpsColumnWidth)
-            Spacer(minLength: columnGap)
             requestsCell(s)
-                .frame(width: requestsColumnWidth)
         }
         .padding(.vertical, 7)
     }
