@@ -158,12 +158,18 @@ struct SettingsView: View {
             get: { nav.section },
             set: { if let section = $0 { nav.section = section } }
         )) {
-            Label("供应商与路由", systemImage: "arrow.triangle.branch").tag(SettingsSection.models)
-            Label("用量", systemImage: "chart.bar.xaxis").tag(SettingsSection.usage)
-            Label("性能", systemImage: "speedometer").tag(SettingsSection.performance)
-            Label("活动", systemImage: "waveform.path.ecg").tag(SettingsSection.activity)
-            Label("扩展", systemImage: "puzzlepiece.extension").tag(SettingsSection.extensions)
-            Label("通用", systemImage: "gearshape").tag(SettingsSection.general)
+            Section("工作区") {
+                Label("供应商与路由", systemImage: "arrow.triangle.branch").tag(SettingsSection.models)
+                Label("活动", systemImage: "waveform.path.ecg").tag(SettingsSection.activity)
+            }
+            Section("统计") {
+                Label("用量", systemImage: "chart.bar.xaxis").tag(SettingsSection.usage)
+                Label("性能", systemImage: "speedometer").tag(SettingsSection.performance)
+            }
+            Section("系统") {
+                Label("扩展", systemImage: "puzzlepiece.extension").tag(SettingsSection.extensions)
+                Label("通用", systemImage: "gearshape").tag(SettingsSection.general)
+            }
         }
         .listStyle(.sidebar)
     }
@@ -177,6 +183,7 @@ struct SettingsView: View {
             }
             detailContent
         }
+        .animation(.easeInOut(duration: 0.12), value: nav.section)
     }
 
     /// 配置读取失败时的简洁提示；修正文件后经“通用”页重新加载即可恢复保存。
@@ -192,7 +199,14 @@ struct SettingsView: View {
             Spacer()
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(Color.orange.opacity(0.10))
+        .background(Color.orange.opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.18), lineWidth: 1)
+        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 
     @ViewBuilder
@@ -396,7 +410,13 @@ struct FakeEditSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(source == nil ? "添加路由" : "编辑路由")
+                .font(.title3.bold())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .padding(.bottom, 12)
             Form {
                 Section("客户端模型") {
                     TextField("对外模型 ID", text: $draft.modelID)

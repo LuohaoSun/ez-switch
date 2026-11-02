@@ -533,6 +533,49 @@ struct NativeRouteCandidateTableTests {
         #expect(setup.coordinator.tableView(setup.table, shouldSelectRow: 0) == false)
         #expect(setup.coordinator.handleClick(row: 0) == false)
     }
+
+    /// 路由卡片内部排序拖动时，“拖入模型”占位行不高亮；仅外部（供应商/其他卡片）拖入时高亮。
+    @Test func placeholderHighlightsOnlyForExternalDragNotInternalReorder() throws {
+        let remotes = (0..<2).map { index in
+            RemoteModel(id: UUID(), name: "P · m\(index)", apiKey: "k", model: "m\(index)",
+                        extraHeaders: [:], apiEndpoints: .all(baseURL: "https://example.test"))
+        }
+        let route = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                              remoteID: remotes[0].id, fallbackRemoteIDs: [remotes[1].id])
+        let directory = try TempConfigDirectory(name: "placeholder-highlight")
+        try JSONEncoder().encode(AppConfig(port: 8788, remotes: remotes, fakes: [route])).write(to: directory.url)
+        let store = ConfigStore(configURL: directory.url)
+        let items = store.config.fakes[0].orderedRemoteIDs.map { RouteCandidateItem(id: $0, label: "P · m") }
+        let list = NativeRouteCandidateList(items: items, activeRemoteID: nil, store: store, fakeID: route.id)
+        let coordinator = list.makeCoordinator()
+        let container = CandidateTableContainer(rowHeight: NativeRouteCandidateList.defaultRowHeight)
+        list.wire(container.tableView, coordinator: coordinator)
+        coordinator.apply(items: items, active: nil)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = container
+        container.layoutSubtreeIfNeeded()
+        let placeholderRow = items.count
+        let placeholder = try #require(
+            container.tableView.view(atColumn: 0, row: placeholderRow, makeIfNecessary: true) as? RouteCandidatePlaceholderCell
+        )
+        #expect(placeholder.isTargeted == false)
+
+        // 本卡片内部发起排序拖动（即使中途触发 draggingEntered）：占位行保持不高亮。
+        coordinator.sourceDragWillBegin()
+        #expect(placeholder.isTargeted == false)
+        coordinator.draggingActiveChanged(true)
+        #expect(placeholder.isTargeted == false)
+        coordinator.sourceDragDidEnd()
+        #expect(placeholder.isTargeted == false)
+
+        // 外部拖入（未经过本表 sourceDragWillBegin）：占位行高亮，离开后复原。
+        coordinator.draggingActiveChanged(true)
+        #expect(placeholder.isTargeted == true)
+        coordinator.draggingActiveChanged(false)
+        #expect(placeholder.isTargeted == false)
+        _ = window
+    }
 }
 
 @Suite("Supplier model reorder rules")

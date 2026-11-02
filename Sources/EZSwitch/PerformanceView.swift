@@ -3,22 +3,23 @@ import Charts
 
 /// 性能统计视图，嵌在「用量」页内，与用量共用时间区间筛选。
 ///
-/// 顶部四张指标卡（请求数、平均 TTFT、平均 TPS 含 / 不含 TTFT，各带独立样本数），
+/// 顶部五张指标卡（请求数、尝试失败率、平均 TTFT、平均 TPS 含 / 不含 TTFT，各带独立样本数），
 /// 其下是请求数柱状图（今天按小时、其余区间按天）；点击柱子会把指标卡与性能明细收敛到该时段，
 /// 图表本身保留整个区间，再次点击同一根柱或点清除按钮回到整段。
 /// 再往下是可切换分组（路由 / 供应商 / 模型）的比较表；
-/// 全部五列（名称、三个指标、请求）都可排序，排序不占控件，直接点击列头：
+/// 全部六列（名称、失败率、三个指标、请求）都可排序，排序不占控件，直接点击列头：
 /// 点击某列按其默认方向排序，再次点击同一列反向，当前排序列显示方向箭头。
 /// 路由维度的 TTFT / 含 TTFT 的 TPS 是含自动回退的请求口径；供应商 / 模型维度是单次上游尝试口径。
+/// 失败率始终是上游尝试口径：失败尝试 / 全部尝试，取消也计入。
 /// 不含 TTFT 的 TPS 只算生成时长，两维度共用，仅作对照。
 /// 顶部总览固定为请求口径（与旧的 overall requestTTFT 一致）。
 struct PerformanceView: View {
     @ObservedObject var model: UsageViewModel
     let store: UsageStore
 
-    /// 列宽规格：与用量明细共用 `TableRowLayout.statsDetail`，
-    /// 名称列 3 份、四个数值列各 1 份；表头与数据行逐列严格对齐。
-    private let columnLayout = TableRowLayout.statsDetail
+    /// 列宽规格：与用量明细共用同一套权重和间距，性能表多一列失败率；
+    /// 名称列 3 份、五个数值列各 1 份，表头与数据行逐列严格对齐。
+    private let columnLayout = TableRowLayout.performanceDetail
 
     var body: some View {
         content
@@ -88,11 +89,15 @@ struct PerformanceView: View {
     // MARK: - 顶部指标
 
     private var metricsCard: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             StatTile(title: "请求数",
                      value: UsageFormat.compact(summary.requests),
                      caption: "次 · 尝试 \(PerformanceFormat.samples(summary.attempts))",
                      help: requestCountHelp)
+            StatTile(title: "尝试失败率",
+                     value: PerformanceFormat.failureRate(summary.failureRate),
+                     caption: "失败 \(UsageFormat.compact(summary.failedAttempts)) / \(UsageFormat.compact(summary.attempts)) 次",
+                     help: attemptFailureHelp)
             metricTile(title: "平均TTFT",
                        value: PerformanceFormat.milliseconds(summaryTTFTValue),
                        unit: "总等待",
@@ -116,6 +121,16 @@ struct PerformanceView: View {
     private var requestCountHelp: String {
         "请求数：按 request_id 去重，同一请求的多次自动回退尝试只计一次。\n" +
         "区间内共 \(summary.attempts) 次转发尝试（含失败 / 取消 / 非流式，均计入请求数）。"
+    }
+
+    /// 尝试失败率口径：分母是尝试数，不是请求数；取消也计入失败。
+    private var attemptFailureHelp: String {
+        guard summary.attempts > 0 else {
+            return "区间内没有上游尝试，因此失败率未知。"
+        }
+        return "尝试失败率 = 失败尝试 ÷ 全部上游尝试。\n" +
+        "失败 = outcome 不是 success，取消也计入（本区间取消 \(UsageFormat.exact(summary.cancelledAttempts)) 次）。\n" +
+        "自动回退的每次尝试各自计入；路由前失败的请求没有写入 usage.sqlite，因此不计入。"
     }
 
     private func metricTile(title: String, value: String, unit: String,
@@ -160,7 +175,7 @@ struct PerformanceView: View {
                 y: .value("请求数", point.requests)
             )
             .foregroundStyle(Color.accentColor)
-            .cornerRadius(3)
+            .cornerRadius(4)
             .opacity(model.performanceActiveBucket == nil
                      || model.performanceActiveBucket?.date == point.date ? 1 : 0.35)
         }
@@ -221,9 +236,11 @@ struct PerformanceView: View {
             Divider()
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(rows) { row in
-                    groupRow(row)
+                    HoverableTableRow {
+                        groupRow(row)
+                    }
                     if row.id != rows.last?.id {
-                        Divider().opacity(0.5)
+                        Divider().opacity(0.65)
                     }
                 }
             }
@@ -241,6 +258,7 @@ struct PerformanceView: View {
     private var tableHeader: some View {
         columnLayout {
             headerCell(.name)
+            headerCell(.failureRate)
             headerCell(.ttftMean)
             headerCell(.tpsIncludingTTFT)
             headerCell(.tpsExcludingTTFT)
@@ -257,9 +275,10 @@ struct PerformanceView: View {
         return Button {
             model.togglePerformanceSort(key)
         } label: {
-            columnLabel(title: key.columnTitle(for: model.performanceGrouping),
-                        arrow: sortArrow(for: key),
-                        leading: key == .name)
+            SortHeaderLabel(title: key.columnTitle(for: model.performanceGrouping),
+                            leading: key == .name,
+                            isActive: isActive,
+                            ascending: model.performanceSortAscending)
         }
         .buttonStyle(.plain)
         .help(headerHelp(key))
@@ -269,49 +288,16 @@ struct PerformanceView: View {
                             : "未排序")
     }
 
-    /// 列头文字与箭头：名称列左对齐、箭头在文字后（文字左边缘不动）；
-    /// 数值列右对齐、箭头在文字前——文字右边缘与下方数值严格齐平，
-    /// 箭头显隐都不改变任何文字的位置。宽度由 `TableRowLayout.statsDetail` 统一分配。
-    private func columnLabel(title: String, arrow: some View, leading: Bool) -> some View {
-        let text = Text(title)
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
-        return Group {
-            if leading {
-                HStack(spacing: 4) {
-                    text
-                    arrow
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                HStack(spacing: 4) {
-                    arrow
-                    text
-                }
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-        }
-        .contentShape(Rectangle())
-    }
-
-    /// 简洁排序箭头：只标当前排序列；隐藏时保留同宽占位，避免列表横向跳动。
-    private func sortArrow(for key: PerformanceSortKey) -> some View {
-        let isActive = model.isPerformanceSortActive(key)
-        return Image(systemName: model.performanceSortAscending ? "arrow.up" : "arrow.down")
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(isActive ? Color.primary : Color.clear)
-            .frame(width: 9)
-            .accessibilityHidden(true)
-    }
-
     /// 列口径 + 点击排序提示（当前方向 / 新列默认方向）合成一个 tooltip。
-    /// 「未测/未知恒定置后」只对三个指标列有意义：名称总有值，请求数恒为已知值。
+    /// 「未测/未知恒定置后」只对指标列与失败率列有意义：名称总有值，请求数恒为已知值。
     private func headerHelp(_ key: PerformanceSortKey) -> String {
         let sortHint: String
         if model.isPerformanceSortActive(key) {
             sortHint = model.performanceSortAscending
                 ? "当前升序（小值在前），点击改为降序"
                 : "当前降序（大值在前），点击改为升序"
+        } else if key == .failureRate {
+            sortHint = "点击排序，默认降序（失败率高的在前）"
         } else {
             sortHint = key.defaultAscending
                 ? "点击排序，默认升序（小值在前）"
@@ -319,7 +305,7 @@ struct PerformanceView: View {
         }
         let base = "\(columnHelp(key))\n\(sortHint)"
         switch key {
-        case .ttftMean, .tpsIncludingTTFT, .tpsExcludingTTFT:
+        case .failureRate, .ttftMean, .tpsIncludingTTFT, .tpsExcludingTTFT:
             return "\(base)；未测/未知恒定置后。"
         case .name, .requests:
             return "\(base)。"
@@ -331,6 +317,8 @@ struct PerformanceView: View {
         switch key {
         case .name:
             return "名称：当前分组（路由/供应商/模型）的显示名。"
+        case .failureRate:
+            return "失败率：失败尝试 ÷ 全部上游尝试；失败 = outcome 不是 success，取消也计入。自动回退的每次尝试各自计入，分母不是请求数；路由前失败未入库，不计入。"
         case .requests:
             return "请求数：按 request_id 去重；同一请求的自动回退尝试只计一次。"
         case .ttftMean:
@@ -370,6 +358,7 @@ struct PerformanceView: View {
             .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             .help(row.subtitle.isEmpty ? row.title : "\(row.title)\n\(row.subtitle)")
 
+            failureRateCell(s)
             valueCell(ttft, help: "\(PerformanceSortKey.ttftMean.columnTitle(for: model.performanceGrouping))：\(sampleCount) 个 TTFT 样本")
             valueCell(tpsIncluding, help: "\(PerformanceSortKey.tpsIncludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
             valueCell(tpsExcluding, help: "\(PerformanceSortKey.tpsExcludingTTFT.columnTitle(for: model.performanceGrouping))：\(s.tpsSamples) 个 TPS 样本")
@@ -384,6 +373,18 @@ struct PerformanceView: View {
             .monospacedDigit()
             .frame(maxWidth: .infinity, alignment: .trailing)
             .help(text == "—" ? "未测或样本不足\n\(help)" : help)
+    }
+
+    /// 尝试失败率：分母是该分组的上游尝试数，不是请求数；取消也计入失败。
+    private func failureRateCell(_ s: PerformanceSummary) -> some View {
+        let help = s.attempts > 0
+            ? "失败 \(UsageFormat.exact(s.failedAttempts)) / \(UsageFormat.exact(s.attempts)) 次尝试，其中取消 \(UsageFormat.exact(s.cancelledAttempts)) 次。\n失败 = outcome 不是 success；自动回退的每次尝试各自计入。"
+            : "该分组没有上游尝试，失败率未知。"
+        return Text(PerformanceFormat.failureRate(s.failureRate))
+            .font(.system(.callout, design: .rounded))
+            .monospacedDigit()
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .help(help)
     }
 
     private func requestsCell(_ s: PerformanceSummary) -> some View {
@@ -411,17 +412,9 @@ struct PerformanceView: View {
 
     /// 有转发记录但无 TTFT / TPS 样本：请求数与图表照常展示，仅提示延迟 / 吞吐不可用。
     private var noSamplesBanner: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "info.circle")
-            Text(noSamplesBannerText)
-            Spacer(minLength: 0)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
-        .accessibilityElement(children: .combine)
+        StatusBanner(tone: .info,
+                     systemImage: "info.circle",
+                     message: noSamplesBannerText)
     }
 
     /// 选中柱时点名所选时段，避免把「这一小时没样本」误读成「整个区间没样本」。
@@ -464,15 +457,8 @@ struct PerformanceView: View {
     }
 
     private func warningBanner(_ message: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-            Text("刷新失败：\(message)（显示上次成功的数据；转发不受影响。）")
-            Spacer(minLength: 0)
-        }
-        .font(.caption)
-        .foregroundStyle(.orange)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+        StatusBanner(tone: .warning,
+                     systemImage: "exclamationmark.triangle.fill",
+                     message: "刷新失败：\(message)（显示上次成功的数据；转发不受影响。）")
     }
 }

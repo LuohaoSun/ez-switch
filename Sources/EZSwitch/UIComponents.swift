@@ -100,9 +100,47 @@ struct StatusLabel: View {
     }
 }
 
+/// 统一的原生卡片表面：控制背景 + 连续圆角 + 细描边 + 极轻投影（不投影内容文字）。
+extension View {
+    func ezsCardSurface(cornerRadius: CGFloat = 12, padding: CGFloat? = nil) -> some View {
+        modifier(EZSCardSurface(cornerRadius: cornerRadius, padding: padding))
+    }
+}
+
+private struct EZSCardSurface: ViewModifier {
+    let cornerRadius: CGFloat
+    let padding: CGFloat?
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        return content
+            .padding(padding ?? 0)
+            .clipShape(shape)
+            .background(
+                shape
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .shadow(color: Color.black.opacity(0.04), radius: 3, y: 1)
+            )
+            .overlay(shape.strokeBorder(Color.primary.opacity(0.09), lineWidth: 1))
+    }
+}
+
 struct ServiceSummary: View {
     @ObservedObject var store: ConfigStore
+    /// 嵌在 `.formStyle(.grouped)` 的 Form 行里时不再套独立卡片，避免“框中框”。
+    var embeddedInForm = false
+
     var body: some View {
+        if embeddedInForm {
+            content
+        } else {
+            content
+                .padding(16)
+                .ezsCardSurface()
+        }
+    }
+
+    private var content: some View {
         HStack(spacing: 12) {
             Image(systemName: store.serverError == nil && store.runningPort != nil ? "network" : "exclamationmark.triangle")
                 .font(.title2)
@@ -119,10 +157,6 @@ struct ServiceSummary: View {
             }
             .disabled(store.runningPort == nil)
         }
-        .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
     }
 }
 
@@ -139,11 +173,20 @@ struct EmptyState: View {
     let title: String
     let detail: String
     let symbol: String
+    /// 空状态里的就地操作（例如“添加供应商”），避免用户再去工具栏找加号。
+    var actionTitle: String?
+    var action: (() -> Void)?
+
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: symbol).font(.system(size: 32)).foregroundStyle(.secondary)
             Text(title).font(.headline)
             Text(detail).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .controlSize(.small)
+                    .padding(.top, 2)
+            }
         }
         .frame(maxWidth: .infinity).padding(32)
     }

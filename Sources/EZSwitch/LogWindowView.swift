@@ -10,37 +10,21 @@ struct LogWindowView: View {
         GeometryReader { geo in
             let hPad: CGFloat = geo.size.width < 620 ? 12 : 20
             let columns = ActivityColumns(width: max(geo.size.width - hPad * 2, 320))
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    statusLine
-                    ActivityRouteGraph(
-                        rows: model.graphRows,
-                        activeCount: model.activeCount,
-                        selection: model.selection,
-                        colorFor: { model.color(for: $0) },
-                        isRequestRelated: { model.isRequestRelated($0) },
-                        isUpstreamRelated: { model.isUpstreamRelated($0) },
-                        onToggleRequest: { model.toggle(request: $0) },
-                        onToggleUpstream: { model.toggle(upstream: $0) },
-                        onClear: { model.clearSelection() }
-                    )
-                    .padding(.top, 8)
+            VStack(spacing: 0) {
+                // 实时流向图固定在顶部：请求表单独滚动，图不会跟着滚出视野。
+                graphSection
+                    .padding(.horizontal, hPad)
+                    .padding(.top, 12)
+                    .padding(.bottom, 10)
 
-                    if let overflow = model.graphOverflowText {
-                        Text(overflow)
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                            .padding(.top, 6)
-                    }
+                requestTable(columns: columns)
+                    .padding(.horizontal, hPad)
 
-                    Divider().padding(.top, 10)
-                    listHeader
-                    requestTable(columns: columns)
-                    foot
-                }
-                .padding(.horizontal, hPad)
-                .padding(.vertical, 14)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                foot
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 8)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .navigationTitle("活动")
         .searchable(text: $model.query, prompt: "搜索路由、上游模型或 #ID")
@@ -62,6 +46,32 @@ struct LogWindowView: View {
         }
         .onAppear { model.start() }
         .onDisappear { model.stop() }
+    }
+
+    /// 顶部仪表卡：状态行 + 实时流向拓扑 + 溢出说明。
+    private var graphSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            statusLine
+            ActivityRouteGraph(
+                rows: model.graphRows,
+                activeCount: model.activeCount,
+                selection: model.selection,
+                colorFor: { model.color(for: $0) },
+                isRequestRelated: { model.isRequestRelated($0) },
+                isUpstreamRelated: { model.isUpstreamRelated($0) },
+                onToggleRequest: { model.toggle(request: $0) },
+                onToggleUpstream: { model.toggle(upstream: $0) },
+                onClear: { model.clearSelection() }
+            )
+            .padding(.top, 8)
+
+            if let overflow = model.graphOverflowText {
+                Text(overflow)
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .padding(.top, 6)
+            }
+        }
+        .cardSurface(padding: 12)
     }
 
     private var statusLine: some View {
@@ -93,30 +103,41 @@ struct LogWindowView: View {
                     .foregroundStyle(Color.accentColor)
             }
         }
-        .padding(.top, 10)
-        .padding(.bottom, 8)
     }
 
+    /// 请求卡：标题与表头固定，只有数据行在卡内滚动。
     private func requestTable(columns: ActivityColumns) -> some View {
         VStack(spacing: 0) {
+            listHeader
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .padding(.bottom, 6)
+
             ActivityListHeader(columns: columns)
             Divider()
-            if model.visibleRows.isEmpty {
-                emptyState
-            } else {
-                ForEach(model.visibleRows) { row in
-                    ActivityRequestRow(row: row, columns: columns,
-                                       accent: model.color(for: row.groupID),
-                                       isHighlighted: model.isRowHighlighted(row),
-                                       isExpanded: model.isExpanded(row.id),
-                                       onToggleExpand: { model.toggleExpanded(row.id) })
-                    Divider().opacity(0.5)
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    if model.visibleRows.isEmpty {
+                        emptyState
+                    } else {
+                        ForEach(model.visibleRows) { row in
+                            ActivityRequestRow(row: row, columns: columns,
+                                               accent: model.color(for: row.groupID),
+                                               isHighlighted: model.isRowHighlighted(row),
+                                               isExpanded: model.isExpanded(row.id),
+                                               onToggleExpand: { model.toggleExpanded(row.id) })
+                            Divider().opacity(0.65)
+                        }
+                    }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.08)))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(Color.primary.opacity(0.09)))
     }
 
     private var emptyState: some View {
@@ -138,7 +159,6 @@ struct LogWindowView: View {
         Text(footText)
             .font(.system(size: 11)).foregroundStyle(.tertiary)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.top, 10)
     }
 
     private var footText: String {

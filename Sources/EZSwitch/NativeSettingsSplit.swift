@@ -48,8 +48,8 @@ final class SettingsSplitContainerViewController<Sidebar: View, Detail: View>: N
         self.detailHost = detailHost
 
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarHost)
-        sidebarItem.minimumThickness = 170
-        sidebarItem.maximumThickness = 240
+        sidebarItem.minimumThickness = 185
+        sidebarItem.maximumThickness = 250
         sidebarItem.canCollapse = true
         sidebarItem.canCollapseFromWindowResize = false
         sidebarItem.collapseBehavior = .preferResizingSiblingsWithFixedSplitView  // 折叠时保持 split 固定几何
@@ -112,7 +112,7 @@ final class SettingsSplitContainerViewController<Sidebar: View, Detail: View>: N
         let required = sidebarItem.minimumThickness + detailItem.minimumThickness + divider
         guard splitView.bounds.width >= required else { return }
         didPlaceInitialPosition = true
-        let ideal = min(190, splitView.bounds.width - detailItem.minimumThickness - divider)
+        let ideal = min(205, splitView.bounds.width - detailItem.minimumThickness - divider)
         splitView.setPosition(ideal, ofDividerAt: 0)
     }
 

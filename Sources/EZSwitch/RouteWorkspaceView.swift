@@ -120,14 +120,24 @@ struct RouteWorkspaceView: View {
 
     private var supplierPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("供应商与模型").font(.headline)
                 Spacer()
+                Text("\(store.config.remotes.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.06), in: Capsule())
+                    .help("\(store.config.remotes.count) 个模型")
             }
             TextField("搜索供应商或模型", text: $ui.query)
                 .textFieldStyle(.roundedBorder)
             if store.config.remotes.isEmpty {
-                EmptyState(title: "添加第一个供应商", detail: "先配置地址、凭据和模型，再拖到右侧路由。", symbol: "server.rack")
+                EmptyState(title: "添加第一个供应商",
+                           detail: "先配置地址、凭据和模型，再拖到右侧路由。",
+                           symbol: "server.rack",
+                           actionTitle: "添加供应商") { ui.sheet = .newProvider }
                 Spacer()
             } else {
                 NativeReorderableCards(items: groups, spacing: 10, enabled: ui.query.isEmpty,
@@ -136,7 +146,9 @@ struct RouteWorkspaceView: View {
                 }
             }
         }
-        .padding(16)
+        .padding(.horizontal, 20)
+        .padding(.top, 18)
+        .padding(.bottom, 20)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -231,9 +243,7 @@ struct RouteWorkspaceView: View {
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+        .ezsCardSurface()
     }
 
     @ViewBuilder
@@ -279,13 +289,23 @@ struct RouteWorkspaceView: View {
     private var routePanel: some View {
         let modelsByID = remoteByID
         return VStack(alignment: .leading, spacing: 12) {
-            ServiceSummary(store: store)
-            HStack {
-                Text("路由 ID").font(.title2.bold())
+            HStack(spacing: 8) {
+                Text("路由 ID").font(.headline)
                 Spacer()
+                Text("\(store.config.fakes.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.06), in: Capsule())
+                    .help("\(store.config.fakes.count) 条路由")
             }
+            ServiceSummary(store: store)
             if store.config.fakes.isEmpty {
-                EmptyState(title: "添加第一条路由", detail: "创建客户端模型 ID，然后从左侧拖入模型。", symbol: "arrow.triangle.branch")
+                EmptyState(title: "添加第一条路由",
+                           detail: "创建客户端模型 ID，然后从左侧拖入模型。",
+                           symbol: "arrow.triangle.branch",
+                           actionTitle: "添加路由") { ui.sheet = .route(nil) }
                 Spacer()
             } else {
                 NativeReorderableCards(items: store.config.fakes, spacing: 14,
@@ -293,7 +313,10 @@ struct RouteWorkspaceView: View {
                     routeCard(fake, modelsByID: modelsByID)
                 }
             }
-        }.padding(20)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 18)
+        .padding(.bottom, 20)
     }
 
     private func routeCard(_ fake: FakeModel, modelsByID: [UUID: RemoteModel]) -> some View {
@@ -333,7 +356,8 @@ struct RouteWorkspaceView: View {
             .padding(.top, 10)
             CollapsibleBody(isExpanded: expanded,
                             expandedHeight: CollapsibleMetrics.routeBodyHeight(
-                                candidateCount: fake.orderedRemoteIDs.count),
+                                candidateCount: fake.orderedRemoteIDs.count,
+                                rowHeight: NativeRouteCandidateList.defaultRowHeight),
                             collapsedHeight: CollapsibleMetrics.routeSummaryHeight) {
                 Divider().padding(.top, CollapsibleMetrics.routeSeparatorTop).padding(.horizontal, 14)
                 RouteCandidateList(store: store, fake: fake, modelsByID: modelsByID, isInteractive: expanded)
@@ -352,9 +376,7 @@ struct RouteWorkspaceView: View {
                 .padding(.bottom, CollapsibleMetrics.routeSummaryBottom)
             }
         }
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+        .ezsCardSurface()
     }
 
 }

@@ -201,7 +201,7 @@ struct GeneralPane: View {
     var body: some View {
         Form {
             Section("本地服务") {
-                ServiceSummary(store: store)
+                ServiceSummary(store: store, embeddedInForm: true)
                 if let error = store.serverError {
                     Text(error).font(.callout).foregroundStyle(.orange).textSelection(.enabled)
                 }
@@ -241,7 +241,12 @@ struct GeneralPane: View {
                             .textSelection(.enabled)
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                            .background(Color(nsColor: .controlBackgroundColor),
+                                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                            )
                     }
                     Button {
                         copyText(promptText)

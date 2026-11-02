@@ -67,6 +67,11 @@ struct PerformanceSummary: Codable, Sendable {
     var attempts: Int = 0
     /// 去重后的请求数：同一请求的多次自动回退尝试只计一次（与 `attempts` 同一记录口径）。
     var requests: Int = 0
+    /// 失败的上游尝试数：`outcome != success`，取消也计入。
+    /// 与 TTFT / TPS 的「成功流式」样本不同，这是单独的尝试失败率口径。
+    var failedAttempts: Int = 0
+    /// 失败尝试中 outcome = cancelled 的次数，仅用于提示里说明失败率包含多少取消。
+    var cancelledAttempts: Int = 0
     var successfulStreamingAttempts: Int = 0
     var ttftSamples: Int = 0
     /// 请求级与上游尝试级计时可能独立缺失，分别统计有效样本。
@@ -85,6 +90,12 @@ struct PerformanceSummary: Codable, Sendable {
     /// 加权速率：Σ输出 / Σ生成时长（不含首字等待），与含 TTFT 版本共用同一批样本。
     /// 仅作对照：攒批一次性下发的上游会让生成时长偏小、该值偏高，读的时候要和含 TTFT 一起看。
     var tpsExcludingTTFT: Double? = nil
+
+    /// 尝试失败率：失败尝试 / 全部上游尝试；含取消。没有尝试时未知（nil）。
+    var failureRate: Double? {
+        guard attempts > 0 else { return nil }
+        return min(1, max(0, Double(failedAttempts) / Double(attempts)))
+    }
 }
 
 struct PerformanceGroupRow: Identifiable, Codable, Sendable {

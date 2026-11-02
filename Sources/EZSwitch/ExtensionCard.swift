@@ -33,12 +33,7 @@ struct ExtensionCard<Content: View>: View {
                     .padding(.vertical, 14)
             }
         }
-        .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .ezsCardSurface()
         .onChange(of: isEnabled) { enabled in
             withAnimation(expandAnimation) { state.expanded = enabled }
         }

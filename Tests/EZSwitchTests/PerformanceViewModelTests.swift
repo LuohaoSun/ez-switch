@@ -50,10 +50,13 @@ struct PerformanceViewModelTests {
                          tpsExcluding: Double? = nil,
                          ttftSamples: Int = 0, tpsSamples: Int = 0,
                          requestSamples: Int = 0,
-                         attempts: Int = 0, requests: Int = 0) -> PerformanceGroupRow {
+                         attempts: Int = 0, requests: Int = 0,
+                         failedAttempts: Int = 0, cancelledAttempts: Int = 0) -> PerformanceGroupRow {
         var summary = PerformanceSummary()
         summary.attempts = attempts
         summary.requests = requests
+        summary.failedAttempts = failedAttempts
+        summary.cancelledAttempts = cancelledAttempts
         summary.ttftSamples = ttftSamples
         summary.tpsSamples = tpsSamples
         summary.requestTTFTSamples = requestSamples
@@ -189,6 +192,7 @@ struct PerformanceViewModelTests {
     }
 
     @Test func sortKeyTitlesUseTheMetricNames() {
+        #expect(PerformanceSortKey.failureRate.title(for: .model) == "失败率")
         #expect(PerformanceSortKey.ttftMean.title(for: .model) == "平均TTFT")
         #expect(PerformanceSortKey.tpsIncludingTTFT.title(for: .route) == "平均TPS(含TTFT)")
         #expect(PerformanceSortKey.tpsExcludingTTFT.title(for: .route) == "平均TPS(不含TTFT)")
@@ -229,11 +233,29 @@ struct PerformanceViewModelTests {
         #expect(ascending.map(\.title) == ["none", "few", "many"])
     }
 
+    /// 失败率按尝试口径排序：0 失败是已知的 0%，没有尝试才是未知并恒定置后。
+    @Test func sortByFailureRateUsesAttemptRatioAndKeepsUnknownLast() {
+        let rows = [
+            makeRow("bad", attempts: 10, failedAttempts: 5),
+            makeRow("good", attempts: 10, failedAttempts: 1),
+            makeRow("clean", attempts: 10, failedAttempts: 0),
+            makeRow("unknown", attempts: 0),
+        ]
+
+        let ascending = PerformanceSort.sorted(rows, by: .failureRate, grouping: .model, ascending: true)
+        #expect(ascending.map(\.title) == ["clean", "good", "bad", "unknown"])
+
+        let descending = PerformanceSort.sorted(rows, by: .failureRate, grouping: .model, ascending: false)
+        #expect(descending.map(\.title) == ["bad", "good", "clean", "unknown"])
+    }
+
     @Test func nameAndRequestColumnsHaveExpectedDefaultsAndTitles() {
         #expect(PerformanceSortKey.name.defaultAscending)
         #expect(!PerformanceSortKey.requests.defaultAscending)
+        #expect(!PerformanceSortKey.failureRate.defaultAscending)
         #expect(PerformanceSortKey.name.title(for: .model) == "名称")
         #expect(PerformanceSortKey.requests.columnTitle(for: .route) == "请求")
+        #expect(PerformanceSortKey.failureRate.columnTitle(for: .route) == "失败率")
     }
 
     /// 同值 tie-break 与方向无关：先按标题，再按 id；点列头反复切换也不会抖动。
@@ -278,9 +300,11 @@ struct PerformanceViewModelTests {
 
     // MARK: - 列头点击排序
 
-    /// 首次点击某列用该列默认方向：延迟类越小越好（升序），吞吐类越大越好（降序）。
-    @Test func columnDefaultsPutTheBetterValueFirst() {
+    /// 首次点击某列用该列默认方向：延迟类越小越好（升序），吞吐类越大越好（降序），
+    /// 失败率作为排查指标把高失败率排在前面（降序）。
+    @Test func columnDefaultsPutTheMostUsefulValueFirst() {
         #expect(PerformanceSortKey.ttftMean.defaultAscending)
+        #expect(!PerformanceSortKey.failureRate.defaultAscending)
         #expect(!PerformanceSortKey.tpsIncludingTTFT.defaultAscending)
         #expect(!PerformanceSortKey.tpsExcludingTTFT.defaultAscending)
     }
@@ -389,6 +413,14 @@ struct PerformanceViewModelTests {
         #expect(PerformanceFormat.tps(nil) == "—")
         #expect(PerformanceFormat.tps(-0.1) == "—")
         #expect(PerformanceFormat.tps(12.34) == "12.3")
+    }
+
+    @Test func failureRateFormattingUsesTwoDecimalsAndDashForUnknown() {
+        #expect(PerformanceFormat.failureRate(nil) == "—")
+        #expect(PerformanceFormat.failureRate(.nan) == "—")
+        #expect(PerformanceFormat.failureRate(-0.1) == "—")
+        #expect(PerformanceFormat.failureRate(0) == "0.00%")
+        #expect(PerformanceFormat.failureRate(0.0298) == "2.98%")
     }
 
     @Test func samplesFormattingShowsZero() {
