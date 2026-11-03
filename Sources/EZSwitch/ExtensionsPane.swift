@@ -27,7 +27,7 @@ struct ExtensionsPane: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: AppDesign.Space.section) {
                 chatToResponsesCard
                 ForEach(BuiltinExtensions.panes) { entry in
                     entry.makeView(store) { onOpenSuppliers?() }
@@ -35,11 +35,19 @@ struct ExtensionsPane: View {
             }
             .frame(maxWidth: 760)
             .frame(maxWidth: .infinity)
-            .padding(.horizontal, 24)
-            .padding(.vertical, 20)
+            .padding(.horizontal, AppDesign.Space.page)
+            .padding(.bottom, AppDesign.Space.page)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .navigationTitle("扩展")
+        .background(AppDesign.canvas)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            AppPageHeader(title: "扩展", subtitle: "把 Responses 请求转到 Chat，并管理随附的连接器")
+                .frame(maxWidth: 760, alignment: .leading)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, AppDesign.Space.page)
+                .padding(.top, AppDesign.Space.page)
+                .padding(.bottom, AppDesign.Space.section)
+                .background(AppDesign.canvas)
+        }
     }
 
     // MARK: Chat → Responses
@@ -58,7 +66,7 @@ struct ExtensionsPane: View {
             VStack(alignment: .leading, spacing: 14) {
                 providerList
                 if let error = draft.error {
-                    Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    Text(error).font(.caption).foregroundStyle(AppDesign.danger).textSelection(.enabled)
                 }
                 chatCompatibilityDisclosure
             }
@@ -97,7 +105,7 @@ struct ExtensionsPane: View {
             if let reason {
                 Text(reason)
                     .font(.caption)
-                    .foregroundStyle(selected ? Color.orange : Color.secondary)
+                    .foregroundStyle(selected ? AppDesign.warning : Color.secondary)
             }
         }
     }

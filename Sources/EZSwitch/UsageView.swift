@@ -30,31 +30,40 @@ struct UsageView: View {
                     Text(model.actionError ?? "")
                 }
         }
-        .navigationTitle(model.section == .usage ? "用量" : "性能")
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
+            // 主操作保持单个按钮；CSV 与清除放进「更多」，确认弹窗与禁用条件不变。
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { await model.refresh(store: store) }
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
                 }
                 .help("立即刷新统计")
+                .accessibilityLabel("刷新统计")
+            }
 
-                Button {
-                    Task { await model.exportCSV(store: store) }
-                } label: {
-                    Label("导出 CSV", systemImage: "square.and.arrow.up")
-                }
-                .disabled(model.isEmpty || model.isExporting)
-                .help("导出当前区间为 CSV")
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button {
+                        Task { await model.exportCSV(store: store) }
+                    } label: {
+                        Label("导出 CSV", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(model.isEmpty || model.isExporting)
 
-                Button {
-                    model.confirmClear = true
+                    Divider()
+
+                    Button(role: .destructive) {
+                        model.confirmClear = true
+                    } label: {
+                        Label("清除历史", systemImage: "trash")
+                    }
+                    .disabled(model.isEmpty || model.isClearing)
                 } label: {
-                    Label("清除历史", systemImage: "trash")
+                    Label("更多", systemImage: "ellipsis.circle")
                 }
-                .disabled(model.isEmpty || model.isClearing)
-                .help("清除本机用量历史（不可恢复）")
+                .help("导出 CSV 或清除本机用量历史")
+                .accessibilityLabel("更多操作")
             }
         }
         .alert("清除用量历史？", isPresented: $model.confirmClear) {
@@ -72,26 +81,52 @@ struct UsageView: View {
 
     // MARK: - 顶部区间控制
 
+    /// 紧凑页头：标题 + 一句口径说明，下面紧接区间筛选，不铺大块留白。
+    /// 页面标题由这里提供，避免窗口标题与内容标题两处抢层级。
     private var header: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(sectionTitle).font(.title2.bold())
-                if let pending = model.shownPendingBucket {
-                    selectionLoadingIndicator(pending)
-                } else if let error = model.shownSelectionError {
-                    selectionErrorIndicator(error)
-                } else if let bucket = model.shownSelectedBucket {
-                    selectionIndicator(bucket)
-                }
+                AppPageHeader(title: pageTitle, subtitle: pageSubtitle)
                 Spacer(minLength: 8)
-                if model.isExporting || model.isClearing {
-                    ProgressView().controlSize(.small)
-                }
+                headerStatus
             }
-            // 状态 chip 的出现/消失不改变标题行高度。
-            .frame(minHeight: 28, alignment: .leading)
+            rangeBar
+        }
+        .padding(.horizontal, AppDesign.Space.page)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+    }
 
-            // 单行只放区间选择器；自定义天数输入另起一行，避免在最小宽度下撑宽布局。
+    private var pageTitle: String {
+        model.section == .usage ? "用量" : "性能"
+    }
+
+    private var pageSubtitle: String {
+        model.section == .usage
+            ? "本机转发的 Token 用量与缓存命中，按所选区间汇总。"
+            : "请求数、失败率、首字延迟与吞吐，跟随所选区间汇总。"
+    }
+
+    /// 右侧状态：导出 / 清除进度与图表选择 chip，宽度固定，不参与标题换行。
+    private var headerStatus: some View {
+        HStack(spacing: 8) {
+            if model.isExporting || model.isClearing {
+                ProgressView().controlSize(.small)
+            }
+            if let pending = model.shownPendingBucket {
+                selectionLoadingIndicator(pending)
+            } else if let error = model.shownSelectionError {
+                selectionErrorIndicator(error)
+            } else if let bucket = model.shownSelectedBucket {
+                selectionIndicator(bucket)
+            }
+        }
+        .fixedSize()
+    }
+
+    /// 区间筛选条：与页头同宽，窄窗口下由日期说明让出空间。
+    private var rangeBar: some View {
+        HStack(spacing: 10) {
             Picker("时间区间", selection: $model.preset) {
                 ForEach(UsageRangePreset.pagePresets) { preset in
                     Text(preset.title).tag(preset)
@@ -100,38 +135,41 @@ struct UsageView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .fixedSize()
-            .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityLabel("时间区间")
 
             if model.preset == .custom {
-                HStack(spacing: 6) {
-                    Text("近")
-                    TextField("", text: customDaysBinding, onEditingChanged: { editing in
-                        if !editing { model.commitCustomLastNDaysInput() }
-                    })
-                    .textFieldStyle(.roundedBorder)
-                    .controlSize(.small)
-                    .frame(width: 52)
-                    .multilineTextAlignment(.center)
-                    .onSubmit { model.commitCustomLastNDaysInput() }
-                    .accessibilityLabel("最近天数")
-                    .help("输入正整数天数，回车或失焦生效")
-                    Text("天")
-                }
+                customDaysControl
             }
 
             Text(rangeSummary)
-                .font(.caption)
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.85)
+
+            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 20)
-        .padding(.bottom, 14)
     }
 
-    private var sectionTitle: String {
-        model.section == .usage ? "用量统计" : "性能统计"
+    /// 自定义「近 N 天」输入：与区间选择器同一行，窄窗口下由日期说明让出空间。
+    private var customDaysControl: some View {
+        HStack(spacing: 4) {
+            Text("近")
+            TextField("", text: customDaysBinding, onEditingChanged: { editing in
+                if !editing { model.commitCustomLastNDaysInput() }
+            })
+            .textFieldStyle(.roundedBorder)
+            .controlSize(.small)
+            .frame(width: 48)
+            .multilineTextAlignment(.center)
+            .onSubmit { model.commitCustomLastNDaysInput() }
+            .accessibilityLabel("最近天数")
+            .help("输入正整数天数，回车或失焦生效")
+            Text("天")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 
     private var rangeSummary: String {
@@ -154,7 +192,8 @@ struct UsageView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(Color.primary.opacity(0.06), in: Capsule())
+        .background(AppDesign.inset, in: Capsule())
+        .overlay(Capsule().strokeBorder(AppDesign.border, lineWidth: 1))
         .accessibilityElement(children: .contain)
     }
 
@@ -168,7 +207,8 @@ struct UsageView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(Color.primary.opacity(0.06), in: Capsule())
+        .background(AppDesign.inset, in: Capsule())
+        .overlay(Capsule().strokeBorder(AppDesign.border, lineWidth: 1))
         .accessibilityElement(children: .combine)
     }
 
@@ -179,10 +219,11 @@ struct UsageView: View {
             Text("所选时段加载失败")
         }
         .font(.caption)
-        .foregroundStyle(.orange)
+        .foregroundStyle(AppDesign.warning)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(Color.orange.opacity(0.1), in: Capsule())
+        .background(AppDesign.warning.opacity(0.10), in: Capsule())
+        .overlay(Capsule().strokeBorder(AppDesign.warning.opacity(0.22), lineWidth: 1))
         .help(message)
         .accessibilityElement(children: .combine)
     }
@@ -263,18 +304,50 @@ struct UsageView: View {
 
     /// 卡片与明细都跟随图表选择；取数期间保持上一个 scope 的结构与数据，
     /// 由标题旁的 chip 标明当前状态。
+    ///
+    /// 主指标（输入）用品牌色放大；四个指标在常规宽度同排，
+    /// 窄到放不下时回落成 2×2，避免数值被压到截断。
     private var overviewCard: some View {
-        let totals = model.scopedTotals
-        return HStack(spacing: 12) {
-            metricTile(title: "输入", value: totals.input, reported: totals.inputAttempts,
-                       attempts: totals.attempts, unit: "Tokens", helpNote: coverageSummary)
-            metricTile(title: "输出", value: totals.output, reported: totals.outputAttempts,
-                       attempts: totals.attempts, unit: "Tokens")
-            metricTile(title: "缓存命中", value: totals.cachedInput, reported: totals.cachedInputAttempts,
-                       attempts: totals.attempts, unit: "Tokens", helpNote: "输入的子集")
-            cacheRateTile
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                inputTile.frame(minWidth: 150)
+                outputTile.frame(minWidth: 150)
+                cachedTile.frame(minWidth: 150)
+                cacheRateTile.frame(minWidth: 150)
+            }
+            VStack(spacing: 10) {
+                HStack(spacing: 10) {
+                    inputTile
+                    outputTile
+                }
+                HStack(spacing: 10) {
+                    cachedTile
+                    cacheRateTile
+                }
+            }
         }
         .cardSurface()
+    }
+
+    private var overviewTotals: UsageTotals { model.scopedTotals }
+
+    private var inputTile: some View {
+        metricTile(title: "输入", value: overviewTotals.input,
+                   reported: overviewTotals.inputAttempts,
+                   attempts: overviewTotals.attempts, unit: "Tokens",
+                   helpNote: coverageSummary, primary: true)
+    }
+
+    private var outputTile: some View {
+        metricTile(title: "输出", value: overviewTotals.output,
+                   reported: overviewTotals.outputAttempts,
+                   attempts: overviewTotals.attempts, unit: "Tokens")
+    }
+
+    private var cachedTile: some View {
+        metricTile(title: "缓存命中", value: overviewTotals.cachedInput,
+                   reported: overviewTotals.cachedInputAttempts,
+                   attempts: overviewTotals.attempts, unit: "Tokens", helpNote: "输入的子集")
     }
 
     /// 缓存命中率卡：上游没上报缓存/输入或输入为 0 时显示「—」，不用精确的 0% 冒充缺失。
@@ -286,14 +359,15 @@ struct UsageView: View {
     }
 
     private func metricTile(title: String, value: Int, reported: Int, attempts: Int, unit: String,
-                            helpNote: String? = nil) -> some View {
+                            helpNote: String? = nil, primary: Bool = false) -> some View {
         let missing = attempts > 0 && reported == 0
         let base = missing ? "\(title)：本区间未上报（—）"
                            : "\(title)：\(UsageFormat.exact(value)) \(unit)"
         return StatTile(title: title,
                         value: missing ? "—" : UsageFormat.compact(value),
                         caption: missing ? "未上报" : unit,
-                        help: [base, helpNote].compactMap { $0 }.joined(separator: "\n"))
+                        help: [base, helpNote].compactMap { $0 }.joined(separator: "\n"),
+                        primary: primary)
     }
 
     /// 上游尝试用量的覆盖情况；仅在存在尝试时有意义，作为输入指标卡的 tooltip 补充。
@@ -323,7 +397,7 @@ struct UsageView: View {
                 y: .value("输入", point.input)
             )
             .foregroundStyle(by: .value("类型", "输入"))
-            .cornerRadius(3)
+            .cornerRadius(4)
             .opacity(model.activeBucket == nil || model.activeBucket?.date == point.date ? 1 : 0.35)
 
             BarMark(
@@ -331,10 +405,10 @@ struct UsageView: View {
                 y: .value("输出", point.output)
             )
             .foregroundStyle(by: .value("类型", "输出"))
-            .cornerRadius(3)
+            .cornerRadius(4)
             .opacity(model.activeBucket == nil || model.activeBucket?.date == point.date ? 1 : 0.35)
         }
-        .chartForegroundStyleScale(["输入": Color.accentColor, "输出": Color.teal])
+        .chartForegroundStyleScale(["输入": AppDesign.chartInput, "输出": AppDesign.chartOutput])
         .chartLegend(position: .top, alignment: .trailing)
         .statsChartAxes(isHourly: isHourlyChart,
                         dates: isHourlyChart ? model.chartHours : model.chartDates)
@@ -365,7 +439,10 @@ struct UsageView: View {
         let groups = model.sortedUsageGroups
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
-                Text("使用明细").font(.headline)
+                HStack(spacing: 8) {
+                    Text("使用明细").font(.headline)
+                    CountBadge(count: groups.count)
+                }
                 Picker("分组", selection: $model.grouping) {
                     ForEach(UsageGrouping.allCases) { grouping in
                         Text(grouping.title).tag(grouping)
@@ -377,9 +454,6 @@ struct UsageView: View {
                 .accessibilityLabel("按分组查看用量")
 
                 Spacer(minLength: 8)
-                Text("\(groups.count) 项")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             .padding(.bottom, 10)
 
@@ -387,9 +461,11 @@ struct UsageView: View {
             Divider()
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(groups) { row in
-                    groupRow(row)
+                    HoverableTableRow {
+                        groupRow(row)
+                    }
                     if row.id != groups.last?.id {
-                        Divider().opacity(0.5)
+                        Divider().opacity(0.65)
                     }
                 }
             }
@@ -417,7 +493,10 @@ struct UsageView: View {
         return Button {
             model.toggleUsageSort(key)
         } label: {
-            columnLabel(title: key.title, arrow: sortArrow(for: key), leading: key == .name)
+            SortHeaderLabel(title: key.title,
+                            leading: key == .name,
+                            isActive: isActive,
+                            ascending: model.usageSortAscending)
         }
         .buttonStyle(.plain)
         .help(headerHelp(key))
@@ -425,41 +504,6 @@ struct UsageView: View {
         .accessibilityValue(isActive
                             ? (model.usageSortAscending ? "已按升序排列" : "已按降序排列")
                             : "未排序")
-    }
-
-    /// 列头文字与箭头：名称列左对齐、箭头在文字后（文字左边缘不动）；
-    /// 数值列右对齐、箭头在文字前——文字右边缘与下方数值严格齐平，
-    /// 箭头显隐都不改变任何文字的位置。宽度由 `TableRowLayout` 统一分配。
-    private func columnLabel(title: String, arrow: some View, leading: Bool) -> some View {
-        let text = Text(title)
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
-        return Group {
-            if leading {
-                HStack(spacing: 4) {
-                    text
-                    arrow
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                HStack(spacing: 4) {
-                    arrow
-                    text
-                }
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-        }
-        .contentShape(Rectangle())
-    }
-
-    /// 排序箭头只标当前排序列；未排序时方向值无意义，箭头保持透明的同宽占位。
-    private func sortArrow(for key: UsageSortKey) -> some View {
-        let isActive = model.isUsageSortActive(key)
-        return Image(systemName: model.usageSortAscending ? "arrow.up" : "arrow.down")
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(isActive ? Color.primary : Color.clear)
-            .frame(width: 9)
-            .accessibilityHidden(true)
     }
 
     /// 列口径 + 点击排序提示合成一个 tooltip；「未上报/未知恒定置后」只对数值列有意义。
@@ -567,31 +611,19 @@ struct UsageView: View {
     // MARK: - 空 / 错误 / 加载
 
     private var emptyState: some View {
-        VStack(spacing: 14) {
-            EmptyState(title: "当前区间暂无记录",
-                       detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史用量；这里会按天汇总 Token 用量。",
-                       symbol: "chart.bar.xaxis")
-            Text("转发本身不受影响。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
+        VStack(spacing: 0) {
+            AppPageState(title: "当前区间暂无记录",
+                         detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史用量；这里会按天汇总 Token 用量。转发本身不受影响。",
+                         symbol: "chart.bar.xaxis")
+            Spacer(minLength: 0)
         }
-        .padding(.top, 40)
     }
 
     private func errorState(_ message: String) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 32))
-                .foregroundStyle(.orange)
-            Text("统计不可用").font(.headline)
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Text("请求转发不受影响；统计恢复后会继续记录。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        VStack(spacing: 16) {
+            AppPageState(title: "统计不可用",
+                         detail: "\(message)\n请求转发不受影响；统计恢复后会继续记录。",
+                         symbol: "exclamationmark.triangle")
             Button {
                 Task { await model.refresh(store: store) }
             } label: {
@@ -599,7 +631,6 @@ struct UsageView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(32)
     }
 
     private var loadingState: some View {
@@ -613,15 +644,8 @@ struct UsageView: View {
     }
 
     private func warningBanner(_ message: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-            Text("刷新失败：\(message)（显示上次成功的数据；转发不受影响。）")
-            Spacer(minLength: 0)
-        }
-        .font(.caption)
-        .foregroundStyle(.orange)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+        StatusBanner(tone: .warning,
+                     systemImage: "exclamationmark.triangle.fill",
+                     message: "刷新失败：\(message)（显示上次成功的数据；转发不受影响。）")
     }
 }

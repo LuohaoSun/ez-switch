@@ -48,9 +48,13 @@ struct RouteWorkspaceView: View {
     }
 
     var body: some View {
-        NativeWorkspaceSplit(suppliers: supplierPanel, routes: routePanel)
-            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-        .navigationTitle("供应商与路由")
+        VStack(spacing: 0) {
+            pageHeader
+            Divider()
+            NativeWorkspaceSplit(suppliers: supplierPanel, routes: routePanel)
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+        }
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
@@ -118,16 +122,70 @@ struct RouteWorkspaceView: View {
         }
     }
 
+    /// 页面头 + 轻量配置摘要：供应商 / 模型 / 待凭据。
+    /// 只读现有配置，不新增状态；服务运行状态由右侧 `ServiceSummary` 单独负责，这里不重复。
+    private var pageHeader: some View {
+        let counts = configurationCounts
+        return HStack(alignment: .top, spacing: AppDesign.Space.section) {
+            AppPageHeader(title: "供应商与路由",
+                          subtitle: "先添加供应商与模型，再拖入右侧路由；客户端只需配置路由 ID。")
+            Spacer(minLength: 8)
+            HStack(spacing: 10) {
+                summaryItem("供应商", count: counts.providers, help: "已配置的供应商数量")
+                summaryItem("模型", count: counts.models, help: "所有供应商下的模型总数")
+                if counts.pendingCredentials > 0 {
+                    summaryItem("待凭据", count: counts.pendingCredentials,
+                                help: "仍使用占位密钥 sk-REPLACE-ME 的模型数量",
+                                warning: true)
+                }
+            }
+            .fixedSize()
+        }
+        .padding(.horizontal, AppDesign.Space.page)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+    }
+
+    private var configurationCounts: (providers: Int, models: Int, pendingCredentials: Int) {
+        let remotes = store.config.remotes
+        let providers = Set(remotes.map { splitProviderModel($0.name).provider }).count
+        let models = remotes.filter { !$0.isProviderShell }
+        return (providers, models.count, models.filter(\.needsCredentials).count)
+    }
+
+    /// 真实模型数：供应商空壳只承载连接配置，不计入「模型」。与供应商卡片内的行数一致。
+    private var configuredModelCount: Int {
+        store.config.remotes.filter { !$0.isProviderShell }.count
+    }
+
+    private func summaryItem(_ title: String, count: Int, help: String,
+                             warning: Bool = false) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(warning ? AppDesign.warning : Color.secondary)
+            CountBadge(count: count)
+        }
+        .help(help)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title) \(count)")
+    }
+
     private var supplierPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("供应商与模型").font(.headline)
-                Spacer()
+                CountBadge(count: configuredModelCount)
+                    .help("共 \(configuredModelCount) 个模型")
+                Spacer(minLength: 0)
             }
             TextField("搜索供应商或模型", text: $ui.query)
                 .textFieldStyle(.roundedBorder)
             if store.config.remotes.isEmpty {
-                EmptyState(title: "添加第一个供应商", detail: "先配置地址、凭据和模型，再拖到右侧路由。", symbol: "server.rack")
+                EmptyState(title: "添加第一个供应商",
+                           detail: "先配置地址、凭据和模型，再拖到右侧路由。",
+                           symbol: "server.rack",
+                           actionTitle: "添加供应商") { ui.sheet = .newProvider }
                 Spacer()
             } else {
                 NativeReorderableCards(items: groups, spacing: 10, enabled: ui.query.isEmpty,
@@ -136,8 +194,10 @@ struct RouteWorkspaceView: View {
                 }
             }
         }
-        .padding(16)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding(.horizontal, AppDesign.Space.section)
+        .padding(.top, AppDesign.Space.section)
+        .padding(.bottom, AppDesign.Space.page)
+        .background(AppDesign.canvas)
     }
 
     private func supplierGroup(_ group: RemoteGroup) -> some View {
@@ -231,9 +291,7 @@ struct RouteWorkspaceView: View {
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+        .ezsCardSurface()
     }
 
     @ViewBuilder
@@ -279,13 +337,18 @@ struct RouteWorkspaceView: View {
     private var routePanel: some View {
         let modelsByID = remoteByID
         return VStack(alignment: .leading, spacing: 12) {
-            ServiceSummary(store: store)
-            HStack {
-                Text("路由 ID").font(.title2.bold())
-                Spacer()
+            HStack(spacing: 8) {
+                Text("路由 ID").font(.headline)
+                CountBadge(count: store.config.fakes.count)
+                    .help("共 \(store.config.fakes.count) 条路由")
+                Spacer(minLength: 0)
             }
+            ServiceSummary(store: store)
             if store.config.fakes.isEmpty {
-                EmptyState(title: "添加第一条路由", detail: "创建客户端模型 ID，然后从左侧拖入模型。", symbol: "arrow.triangle.branch")
+                EmptyState(title: "添加第一条路由",
+                           detail: "创建客户端模型 ID，然后从左侧拖入模型。",
+                           symbol: "arrow.triangle.branch",
+                           actionTitle: "添加路由") { ui.sheet = .route(nil) }
                 Spacer()
             } else {
                 NativeReorderableCards(items: store.config.fakes, spacing: 14,
@@ -293,7 +356,10 @@ struct RouteWorkspaceView: View {
                     routeCard(fake, modelsByID: modelsByID)
                 }
             }
-        }.padding(20)
+        }
+        .padding(.horizontal, AppDesign.Space.section)
+        .padding(.top, AppDesign.Space.section)
+        .padding(.bottom, AppDesign.Space.page)
     }
 
     private func routeCard(_ fake: FakeModel, modelsByID: [UUID: RemoteModel]) -> some View {
@@ -333,7 +399,8 @@ struct RouteWorkspaceView: View {
             .padding(.top, 10)
             CollapsibleBody(isExpanded: expanded,
                             expandedHeight: CollapsibleMetrics.routeBodyHeight(
-                                candidateCount: fake.orderedRemoteIDs.count),
+                                candidateCount: fake.orderedRemoteIDs.count,
+                                rowHeight: NativeRouteCandidateList.defaultRowHeight),
                             collapsedHeight: CollapsibleMetrics.routeSummaryHeight) {
                 Divider().padding(.top, CollapsibleMetrics.routeSeparatorTop).padding(.horizontal, 14)
                 RouteCandidateList(store: store, fake: fake, modelsByID: modelsByID, isInteractive: expanded)
@@ -352,9 +419,7 @@ struct RouteWorkspaceView: View {
                 .padding(.bottom, CollapsibleMetrics.routeSummaryBottom)
             }
         }
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
+        .ezsCardSurface()
     }
 
 }

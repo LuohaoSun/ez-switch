@@ -16,17 +16,18 @@ struct CollapsibleCardHeader<DragID: Hashable & Codable & Sendable, Title: View,
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 9) {
             Button(action: toggle) {
-                HStack(spacing: 8) {
+                HStack(spacing: 9) {
                     Image(systemName: "chevron.right")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 10, alignment: .center)
                         .accessibilityHidden(true)
                     title()
                 }
-                .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
+                .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)

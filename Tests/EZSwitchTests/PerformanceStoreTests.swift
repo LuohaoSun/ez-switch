@@ -409,6 +409,9 @@ struct PerformanceStoreTests {
         let byRoute = try await snapshot(store, from: start, grouping: .route)
         #expect(byRoute.summary.requests == 2)
         #expect(byRoute.summary.attempts == 3)
+        #expect(byRoute.summary.failedAttempts == 0)
+        #expect(byRoute.summary.failureRate == 0)
+        #expect(byRoute.summary.cancelledAttempts == 0)
         #expect(byRoute.groups.count == 1)
         #expect(byRoute.groups[0].summary.requests == 2)
         #expect(byRoute.groups[0].summary.attempts == 3)
@@ -448,9 +451,57 @@ struct PerformanceStoreTests {
         let byProvider = try await snapshot(store, from: start, grouping: .provider)
         #expect(byProvider.summary.requests == 1)
         #expect(byProvider.summary.attempts == 2)
+        #expect(byProvider.summary.failedAttempts == 1)
+        #expect(byProvider.summary.failureRate == 0.5)
+        #expect(byProvider.summary.cancelledAttempts == 0)
         #expect(byProvider.groups.count == 2)
         #expect(byProvider.groups.allSatisfy { $0.summary.requests == 1 })
         #expect(byProvider.groups.allSatisfy { $0.summary.attempts == 1 })
+
+        let openAI = try #require(byProvider.groups.first { $0.title == "OpenAI" })
+        #expect(openAI.summary.failedAttempts == 1)
+        #expect(openAI.summary.failureRate == 1)
+        let azure = try #require(byProvider.groups.first { $0.title == "Azure" })
+        #expect(azure.summary.failedAttempts == 0)
+        #expect(azure.summary.failureRate == 0)
+    }
+
+    /// 失败率是尝试口径：非 success 全部计入，取消也计入；分母是尝试数而不是请求数。
+    @Test
+    func attemptFailureRateCountsAllNonSuccessAttemptsIncludingCancelled() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let start = day(2026, 5, 10)
+        let store = UsageStore(url: url)
+
+        store.record(record(timestamp: start, provider: "OpenAI", model: "gpt-4o"))
+        store.record(record(timestamp: start.addingTimeInterval(1), provider: "Azure",
+                            model: "gpt-4o-mini", attempt: 1, status: 429, outcome: "httpError"))
+        store.record(record(timestamp: start.addingTimeInterval(2), provider: "Azure",
+                            model: "gpt-4o-mini", attempt: 2, status: nil, outcome: "networkError"))
+        store.record(record(timestamp: start.addingTimeInterval(3), provider: "Azure",
+                            model: "gpt-4o-mini", attempt: 3, status: nil, outcome: "cancelled"))
+        store.record(record(timestamp: start.addingTimeInterval(4), provider: "Azure",
+                            model: "gpt-4o-mini", attempt: 4, status: 200, outcome: "streamError"))
+        store.record(record(timestamp: start.addingTimeInterval(5), provider: "Azure",
+                            model: "gpt-4o-mini", attempt: 5, status: 200))
+        try await store.flush()
+
+        let byProvider = try await snapshot(store, from: start, grouping: .provider)
+        #expect(byProvider.summary.attempts == 6)
+        #expect(byProvider.summary.failedAttempts == 4)
+        #expect(byProvider.summary.cancelledAttempts == 1)
+        #expect(approx(byProvider.summary.failureRate, 4.0 / 6.0))
+
+        let openAI = try #require(byProvider.groups.first { $0.title == "OpenAI" })
+        #expect(openAI.summary.failedAttempts == 0)
+        #expect(openAI.summary.failureRate == 0)
+
+        let azure = try #require(byProvider.groups.first { $0.title == "Azure" })
+        #expect(azure.summary.attempts == 5)
+        #expect(azure.summary.failedAttempts == 4)
+        #expect(azure.summary.cancelledAttempts == 1)
+        #expect(approx(azure.summary.failureRate, 0.8))
     }
 
     // MARK: - 区间与持久化
@@ -466,6 +517,9 @@ struct PerformanceStoreTests {
 
         let snapshot = try await store.performanceSnapshot(from: start, to: start, grouping: .route)
         #expect(snapshot.summary.attempts == 0)
+        #expect(snapshot.summary.failedAttempts == 0)
+        #expect(snapshot.summary.cancelledAttempts == 0)
+        #expect(snapshot.summary.failureRate == nil)
         #expect(snapshot.summary.ttftMeanMS == nil)
         #expect(snapshot.summary.requestTTFTMeanMS == nil)
         #expect(snapshot.summary.tpsIncludingTTFT == nil)

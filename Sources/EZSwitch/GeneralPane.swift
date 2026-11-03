@@ -201,9 +201,9 @@ struct GeneralPane: View {
     var body: some View {
         Form {
             Section("本地服务") {
-                ServiceSummary(store: store)
+                ServiceSummary(store: store, embeddedInForm: true)
                 if let error = store.serverError {
-                    Text(error).font(.callout).foregroundStyle(.orange).textSelection(.enabled)
+                    Text(error).font(.callout).foregroundStyle(AppDesign.danger).textSelection(.enabled)
                 }
                 HStack {
                     TextField("监听端口", text: $draft.port)
@@ -213,11 +213,11 @@ struct GeneralPane: View {
                         .disabled(validPort == nil || validPort == store.config.port)
                 }
                 if validPort == nil {
-                    Text("请输入 1–65535 之间的整数端口。").font(.caption).foregroundStyle(.red)
+                    Text("请输入 1–65535 之间的整数端口。").font(.caption).foregroundStyle(AppDesign.danger)
                 }
                 if let running = store.runningPort, running != store.config.port {
                     Label("当前使用 \(String(running))；已保存的端口 \(String(store.config.port)) 将在重启后生效。", systemImage: "arrow.clockwise")
-                        .font(.caption).foregroundStyle(.orange)
+                        .font(.caption).foregroundStyle(AppDesign.warning)
                 } else {
                     Text("修改端口后需要重启应用。路由切换即时生效。")
                         .font(.caption).foregroundStyle(.secondary)
@@ -239,9 +239,14 @@ struct GeneralPane: View {
                         Text(promptText)
                             .font(.system(size: 12, design: .monospaced))
                             .textSelection(.enabled)
-                            .padding(10)
+                            .padding(AppDesign.Space.card)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                            .background(AppDesign.inset,
+                                        in: RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous)
+                                    .strokeBorder(AppDesign.border, lineWidth: 1)
+                            )
                     }
                     Button {
                         copyText(promptText)
@@ -252,7 +257,7 @@ struct GeneralPane: View {
                 } else {
                     if compatibleFakes.isEmpty {
                         Text("没有可用模型。请先绑定支持 \(draft.harness == .codex ? "Responses" : "Messages") 的上游并填写 API Key。")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(AppDesign.warning)
                     } else {
                         LabeledContent("可用本机模型") {
                             Text(compatibleFakes.map(\.fakeModelID).joined(separator: "、"))
@@ -289,7 +294,7 @@ struct GeneralPane: View {
                     }
                     if store.runningPort != nil, store.runningPort != store.config.port {
                         Text("端口变更待重启，重启 EZ Switch 后才能配置工具。")
-                            .font(.caption).foregroundStyle(.orange)
+                            .font(.caption).foregroundStyle(AppDesign.warning)
                     }
                 }
                 if let harnessMessage = draft.harnessMessage {
@@ -323,7 +328,7 @@ struct GeneralPane: View {
                             .textSelection(.enabled)
                     }
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(AppDesign.danger)
 
                     HStack {
                         if let retryEnabled = loginItem.retryEnabled {
@@ -359,7 +364,7 @@ struct GeneralPane: View {
                     Button("打开通知设置") { openNotificationSettings() }
                 }
                 if let error = notifications.deliveryError {
-                    Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    Text(error).font(.caption).foregroundStyle(AppDesign.danger).textSelection(.enabled)
                 }
             }
             Section("配置文件") {
@@ -368,7 +373,16 @@ struct GeneralPane: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("通用")
+        .scrollContentBackground(.hidden)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            AppPageHeader(title: "通用", subtitle: "本地服务、接入工具与启动设置")
+                .padding(.horizontal, AppDesign.Space.page)
+                .padding(.top, AppDesign.Space.page)
+                .padding(.bottom, AppDesign.Space.section)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AppDesign.canvas)
+        }
+        .background(AppDesign.canvas)
         .onAppear {
             draft.port = String(store.config.port)
             refreshLoginItemState()
@@ -520,14 +534,14 @@ struct GeneralPane: View {
         switch cli.phase {
         case .appMissing:
             Label("未检测到“应用程序”中的 EZ Switch。", systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+                .foregroundStyle(AppDesign.warning)
         case .notInstalled:
             Label("尚未安装。", systemImage: "circle.dashed").foregroundStyle(.secondary)
         case .installed:
             Label("已安装：\(cli.destinationPath)", systemImage: "checkmark.circle").foregroundStyle(.secondary)
         case .conflict(let reason):
             Label(reason, systemImage: "exclamationmark.octagon.fill")
-                .foregroundStyle(.red).textSelection(.enabled)
+                .foregroundStyle(AppDesign.danger).textSelection(.enabled)
         case .working:
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
@@ -535,7 +549,7 @@ struct GeneralPane: View {
             }
         case .failed(let message):
             Label(message, systemImage: "xmark.circle.fill")
-                .foregroundStyle(.red).textSelection(.enabled)
+                .foregroundStyle(AppDesign.danger).textSelection(.enabled)
         }
     }
 
@@ -591,7 +605,7 @@ struct GeneralPane: View {
             } icon: {
                 Image(systemName: "exclamationmark.triangle.fill")
             }
-            .foregroundStyle(.red)
+            .foregroundStyle(AppDesign.danger)
             .textSelection(.enabled)
         }
     }

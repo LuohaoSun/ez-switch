@@ -114,7 +114,7 @@ struct ActivityRouteGraph: View {
                           color: color, selected: selected) {
                 nodeLabel(title: title, dot: color) {
                     Text(detail)
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .font(ActivityTypeScale.nodeSubtitle).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                 }
             }
@@ -158,7 +158,7 @@ struct ActivityRouteGraph: View {
             Circle().fill(dot).frame(width: 6, height: 6)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 12)).lineLimit(1).truncationMode(.tail)
+                    .font(ActivityTypeScale.nodeTitle).lineLimit(1).truncationMode(.tail)
                 subtitle()
             }
             Spacer(minLength: 0)
@@ -169,7 +169,7 @@ struct ActivityRouteGraph: View {
     private func nodeLabel(title: String, subtitle: String, dot: Color) -> some View {
         nodeLabel(title: title, dot: dot) {
             Text(subtitle)
-                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .font(ActivityTypeScale.nodeSubtitle).foregroundStyle(.secondary)
                 .lineLimit(1).truncationMode(.middle)
         }
     }
@@ -178,20 +178,28 @@ struct ActivityRouteGraph: View {
     private func routerNode(_ layout: ActivityRouteGraphGeometry) -> some View {
         Button { onClear() } label: {
             VStack(spacing: 3) {
-                Text("EZSwitch").font(.system(size: 12, weight: .medium))
+                Text("EZSwitch").font(ActivityTypeScale.nodeTitleMedium)
                     .lineLimit(1).minimumScaleFactor(0.75)
-                Text(routerSubtitle).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(routerSubtitle).font(ActivityTypeScale.nodeSubtitle).foregroundStyle(.secondary)
                     .lineLimit(1).minimumScaleFactor(0.8)
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
             .frame(width: layout.midWidth, height: layout.midHeight)
-            .background(Color(nsColor: .controlBackgroundColor),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(selection == nil ? Color.primary.opacity(0.14) : ActivityPalette.active,
-                              lineWidth: selection == nil ? 1 : 1.6))
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: ActivityRouteGraphGeometry.cornerRadius,
+                                 style: .continuous)
+                    .fill(AppDesign.inset)
+                    .shadow(color: Color.black.opacity(0.05), radius: 2, y: 1)
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: ActivityRouteGraphGeometry.cornerRadius, style: .continuous)
+                    .strokeBorder(selection == nil ? AppDesign.border : ActivityPalette.active,
+                                  lineWidth: selection == nil ? 1 : 1.6)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: ActivityRouteGraphGeometry.cornerRadius,
+                                           style: .continuous))
+            .animation(.easeOut(duration: 0.15), value: selection == nil)
         }
         .buttonStyle(.plain)
         .position(x: layout.midX, y: layout.midCenterY)
@@ -308,21 +316,32 @@ private struct RouteNodeFace<Content: View>: View {
         RoundedRectangle(cornerRadius: ActivityRouteGraphGeometry.cornerRadius, style: .continuous)
     }
 
+    @StateObject private var hover = HoverState()
+
     var body: some View {
         content
             .padding(.horizontal, 8)
             .frame(width: width, height: height, alignment: .leading)
-            .background(background, in: shape)
+            .background {
+                shape.fill(background)
+                    .shadow(color: Color.black.opacity(0.05), radius: 2, y: 1)
+            }
             .overlay(shape.strokeBorder(border, lineWidth: selected ? 1.8 : 1))
             .contentShape(shape)
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.15)) { hover.isHovered = hovering }
+            }
+            .animation(.easeOut(duration: 0.15), value: selected)
     }
 
     private var background: Color {
-        selected ? color.opacity(0.18) : Color(nsColor: .controlBackgroundColor)
+        if selected { return color.opacity(0.18) }
+        if hover.isHovered { return AppDesign.hover }
+        return AppDesign.inset
     }
 
     private var border: Color {
-        selected ? color : Color.primary.opacity(0.14)
+        selected ? color : AppDesign.border
     }
 }
 
@@ -335,7 +354,7 @@ struct ActivityRouteGraphGeometry {
     static let nodeHeight: CGFloat = 38
     static let rowGap: CGFloat = 10
     static let topPad: CGFloat = 12
-    static let cornerRadius: CGFloat = 8
+    static let cornerRadius: CGFloat = 10
     static let anchorMargin: CGFloat = 12
 
     static let minSideWidth: CGFloat = 88

@@ -45,9 +45,16 @@ enum ProviderPresetNaming {
     }
 }
 
+/// 预设卡片的悬停态：用 `StateObject` 而非 `@State`，兼容仅安装 CommandLineTools 的构建环境。
+final class ProviderPresetHoverState: ObservableObject {
+    @Published var presetID: String?
+    @Published var isCustom = false
+}
+
 struct ProviderPresetPicker: View {
     @ObservedObject var draft: ProviderPresetDraft
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var hover = ProviderPresetHoverState()
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
     private var showsSearch: Bool { ProviderPreset.all.count > 6 }
@@ -84,6 +91,7 @@ struct ProviderPresetPicker: View {
             .padding(16)
         }
         .frame(width: 540, height: 540)
+        .background(AppDesign.canvas)
     }
 
     private func presetCard(_ preset: ProviderPreset) -> some View {
@@ -93,10 +101,17 @@ struct ProviderPresetPicker: View {
                     .frame(width: 28, height: 28)
                 Text(preset.name).font(.callout).lineLimit(1)
             }
-            .cardChrome()
+            .cardChrome(isHovered: hover.presetID == preset.id)
         }
         .buttonStyle(.plain)
         .help(preset.name)
+        .onHover { hovering in
+            if hovering {
+                hover.presetID = preset.id
+            } else if hover.presetID == preset.id {
+                hover.presetID = nil
+            }
+        }
     }
 
     private var customCard: some View {
@@ -108,21 +123,28 @@ struct ProviderPresetPicker: View {
                     .frame(width: 28, height: 28)
                 Text("自定义供应商").font(.callout).lineLimit(1)
             }
-            .cardChrome()
+            .cardChrome(isHovered: hover.isCustom)
         }
         .buttonStyle(.plain)
+        .onHover { hover.isCustom = $0 }
     }
 }
 
 private extension View {
-    func cardChrome() -> some View {
-        self
+    /// 预设卡片：静息时是干净的 surface 表面，悬停时换成中性 hover 底并轻微提亮描边，
+    /// 给出可点击的触感反馈，同时保持与设置页其它卡片同一套语义色和圆角。
+    func cardChrome(isHovered: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous)
+        return self
             .frame(maxWidth: .infinity)
             .padding(.vertical, 14)
-            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
-            .contentShape(RoundedRectangle(cornerRadius: 10))
+            .background(isHovered ? AppDesign.hover : AppDesign.surface, in: shape)
+            .overlay(
+                shape.strokeBorder(isHovered ? AppDesign.brand.opacity(0.45) : AppDesign.border,
+                                   lineWidth: 1)
+            )
+            .contentShape(shape)
+            .animation(.easeInOut(duration: 0.12), value: isHovered)
     }
 }
 

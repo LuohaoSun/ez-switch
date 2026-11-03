@@ -257,12 +257,13 @@ enum UsageSection: String, CaseIterable, Identifiable {
     var title: String { self == .usage ? "用量" : "性能" }
 }
 
-/// 性能比较表的排序字段：名称、请求数与三张平均指标
+/// 性能比较表的排序字段：名称、尝试失败率、请求数与三张平均指标
 /// （平均 TTFT、平均 TPS（含 TTFT）、平均 TPS（不含 TTFT））。
 /// 路由维度取含自动回退的 request 级指标，其余维度取单次上游尝试指标；
 /// 不含 TTFT 的吞吐两维度共用同一口径（只算生成时长）。
 enum PerformanceSortKey: String, CaseIterable, Identifiable {
     case name
+    case failureRate
     case requests
     case ttftMean
     case tpsIncludingTTFT
@@ -274,6 +275,7 @@ enum PerformanceSortKey: String, CaseIterable, Identifiable {
     func title(for grouping: UsageGrouping) -> String {
         switch self {
         case .name: return "名称"
+        case .failureRate: return "失败率"
         case .requests: return "请求"
         case .ttftMean: return "平均TTFT"
         case .tpsIncludingTTFT: return "平均TPS(含TTFT)"
@@ -284,13 +286,13 @@ enum PerformanceSortKey: String, CaseIterable, Identifiable {
     /// 表格表头与卡片同名，保持口径名词唯一。
     func columnTitle(for grouping: UsageGrouping) -> String { title(for: grouping) }
 
-    /// 首次点击该列时的默认方向：按"越好越靠前"取值——
+    /// 首次点击该列时的默认方向：按"越值得关注越靠前"取值——
     /// 延迟类（TTFT）越小越好，用升序；吞吐类（TPS）越大越好，用降序；
-    /// 名称按自然序升序；请求数越多越靠前，用降序。
+    /// 失败率是排查指标，失败率高的先看，用降序；名称按自然序升序；请求数越多越靠前，用降序。
     var defaultAscending: Bool {
         switch self {
         case .name, .ttftMean: return true
-        case .requests, .tpsIncludingTTFT, .tpsExcludingTTFT: return false
+        case .failureRate, .requests, .tpsIncludingTTFT, .tpsExcludingTTFT: return false
         }
     }
 }
@@ -306,6 +308,8 @@ enum PerformanceSort {
         case .name:
             // 名称由 `sorted` 单独按自然序处理，不参与数值比较。
             return nil
+        case .failureRate:
+            return summary.failureRate
         case .requests:
             // 去重请求数恒有值（0 也是已知值），因此不存在「未知置后」。
             return Double(summary.requests)
@@ -454,6 +458,12 @@ enum PerformanceFormat {
     static func tps(_ value: Double?) -> String {
         guard let value, value.isFinite, value >= 0 else { return "—" }
         return String(format: "%.1f", value)
+    }
+
+    /// 尝试失败率：固定两位小数，低失败率也能看出差异；未知显示「—」。
+    static func failureRate(_ value: Double?) -> String {
+        guard let value, value.isFinite, value >= 0 else { return "—" }
+        return String(format: "%.2f%%", value * 100)
     }
 
     static func samples(_ value: Int) -> String {

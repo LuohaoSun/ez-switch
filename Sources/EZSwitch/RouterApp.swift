@@ -57,10 +57,15 @@ private final class AppWindowCoordinator {
             return
         }
 
-        let hosting = NSHostingController(rootView: SettingsView(store: store, nav: settingsNav))
+        // 隔离预览探针只挂在设置窗口；活动/日志窗口不参与预览尺寸调整。
+        let rootView = SettingsView(store: store, nav: settingsNav)
+            .background(PreviewAppearanceProbe().frame(width: 0, height: 0))
+        let hosting = NSHostingController(rootView: rootView)
         let window = NSWindow(contentViewController: hosting)
         window.title = AppBrand.name
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.titlebarSeparatorStyle = .line
+        window.toolbarStyle = .unified
         window.setContentSize(NSSize(width: 1120, height: 760))
         window.minSize = NSSize(width: 1000, height: 640)
         window.isReleasedWhenClosed = false
@@ -120,7 +125,9 @@ struct RouterApp: App {
 
         if #available(macOS 15, *) {
             Window(AppBrand.name, id: "settings") {
+                // 隔离预览探针只挂在设置窗口；活动/日志窗口不参与预览尺寸调整。
                 SettingsView(store: store, nav: AppWindowCoordinator.shared.settingsNav)
+                    .background(PreviewAppearanceProbe().frame(width: 0, height: 0))
             }
             .defaultSize(width: 1120, height: 760)
             .windowResizability(.contentMinSize)
@@ -128,7 +135,7 @@ struct RouterApp: App {
             .restorationBehavior(.disabled)
         }
 
-        Window("日志", id: "logs") {
+        Window("活动", id: "logs") {
             LogWindowView()
         }
         .defaultSize(width: 560, height: 420)
@@ -156,7 +163,7 @@ struct RouterApp: App {
         NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = AppBrand.name
-        alert.informativeText = "点击菜单栏中的箭头图标可切换路由；选择“EZ Switch 面板...”可管理模型、供应商和服务端口。"
+        alert.informativeText = "点击菜单栏中的箭头图标可切换路由；选择“EZ Switch 面板…”可管理模型、供应商和服务端口。"
         alert.addButton(withTitle: "好")
         alert.runModal()
     }
@@ -226,8 +233,13 @@ struct MenuView: View {
                     Text("未添加模型，请在面板中拖入")
                 } else {
                     ForEach(candidates) { remote in
-                        Button(modelLabel(remote, fake: fake)) {
-                            store.selectRouteModel(fakeID: fake.id, remoteID: remote.id)
+                        Toggle(isOn: Binding(
+                            get: { store.router.activeRemoteID(fakeID: fake.id) == remote.id },
+                            set: { isOn in
+                                if isOn { store.selectRouteModel(fakeID: fake.id, remoteID: remote.id) }
+                            }
+                        )) {
+                            Text(remote.routeLabel)
                         }
                     }
                 }
@@ -240,7 +252,7 @@ struct MenuView: View {
 
         Divider()
 
-        Button("EZ Switch 面板...") {
+        Button("EZ Switch 面板…") {
             AppWindowCoordinator.shared.showSettings(store: store)
         }
 
@@ -254,10 +266,6 @@ struct MenuView: View {
     private func menuRouteLabel(_ fake: FakeModel) -> String {
         let activeID = store.router.activeRemoteID(fakeID: fake.id)
         return store.config.remotes.first(where: { $0.id == activeID })?.routeLabel ?? "未绑定"
-    }
-
-    private func modelLabel(_ remote: RemoteModel, fake: FakeModel) -> String {
-        remote.routeLabel + (store.router.activeRemoteID(fakeID: fake.id) == remote.id ? "  ✓" : "")
     }
 
     /// 菜单项文本的灰色部分（menu 里 AttributedString 的颜色才能保留）

@@ -99,11 +99,11 @@ struct ActivityListHeader: View {
                     .accessibilityLabel("TPS（含 TTFT）")
             }
         }
-        .font(.system(size: 11))
+        .font(ActivityTypeScale.cell)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .background(Color.primary.opacity(0.03))
+        .background(AppDesign.inset)
     }
 }
 
@@ -117,19 +117,30 @@ struct ActivityRequestRow: View {
     let isExpanded: Bool
     let onToggleExpand: () -> Void
 
+    @StateObject private var hover = HoverState()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             summary
             if isExpanded { detail }
         }
-        .background(isHighlighted ? ActivityPalette.active.opacity(0.08) : Color.clear)
+        .background(rowBackground)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) { hover.isHovered = hovering }
+        }
+    }
+
+    /// 图上高亮优先；没有高亮对象时，悬停给一层极淡的底，帮助扫行且不改变行高。
+    private var rowBackground: Color {
+        if isHighlighted { return ActivityPalette.active.opacity(0.08) }
+        return hover.isHovered ? AppDesign.hover : Color.clear
     }
 
     private var summary: some View {
         HStack(spacing: columns.spacing) {
             HStack(spacing: 4) {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(ActivityTypeScale.microSymbol)
                     .foregroundStyle(.tertiary)
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
                 Circle().fill(row.isActive ? accent : Color.clear).frame(width: 6, height: 6)
@@ -138,14 +149,15 @@ struct ActivityRequestRow: View {
 
             if columns.showTime {
                 Text(ActivityFormat.time(row.startedAt))
-                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.number).monospacedDigit()
+                    .foregroundStyle(.secondary)
                     .frame(width: columns.timeWidth, alignment: .leading)
             }
 
             apiCell
 
             Text(row.routeName)
-                .font(.system(size: 12, weight: .medium))
+                .font(ActivityTypeScale.labelMedium)
                 .lineLimit(1).truncationMode(.middle)
                 .frame(width: columns.routeWidth, alignment: .leading)
                 .help(row.routeName)
@@ -153,20 +165,25 @@ struct ActivityRequestRow: View {
             upstreamCell
 
             Text(row.statusText)
-                .font(.system(size: 11)).foregroundStyle(row.tone.color)
+                .font(ActivityTypeScale.labelMedium)
+                .foregroundStyle(row.tone.color)
                 .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(row.tone.color.opacity(0.12), in: Capsule())
                 .frame(width: columns.statusWidth, alignment: .leading)
 
             Group {
                 if let progress = row.attemptProgressText {
                     Text(progress)
-                        .font(.system(size: 10.5)).monospacedDigit()
+                        .font(ActivityTypeScale.compactNumber).monospacedDigit()
                         .foregroundStyle(row.phase == .fallenBack ? ActivityPalette.warn : Color.secondary)
                         .help("第 \(row.attemptIndex)/\(row.attemptCount) 次尝试；同一请求的尝试按时间倒序排列。")
                         .accessibilityLabel("第 \(row.attemptIndex) 次，共 \(row.attemptCount) 次尝试")
                 } else {
                     Text("—")
-                        .font(.system(size: 10.5))
+                        .font(ActivityTypeScale.compactNumber)
                         .foregroundStyle(.tertiary)
                         .accessibilityHidden(true)
                 }
@@ -174,28 +191,31 @@ struct ActivityRequestRow: View {
             .frame(width: columns.attemptsWidth, alignment: .leading)
 
             Text(ActivityFormat.tokenCell(row.tokens.input))
-                .font(.system(size: 12)).monospacedDigit()
+                .font(ActivityTypeScale.tokenNumber).monospacedDigit()
                 .frame(width: columns.tokenWidth, alignment: .trailing)
             Text(ActivityFormat.tokenCell(row.tokens.output))
-                .font(.system(size: 12)).monospacedDigit()
+                .font(ActivityTypeScale.tokenNumber).monospacedDigit()
                 .frame(width: columns.tokenWidth, alignment: .trailing)
 
             if columns.showElapsed {
                 Text(row.durationText)
-                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.number).monospacedDigit()
+                    .foregroundStyle(.secondary)
                     .frame(width: columns.elapsedWidth, alignment: .trailing)
             }
 
             if columns.showTTFT {
                 Text(row.ttftText)
-                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.number).monospacedDigit()
+                    .foregroundStyle(.secondary)
                     .frame(width: columns.ttftWidth, alignment: .trailing)
                     .help("\(ActivityPerformanceHelp.ttft)\n当前：\(row.ttftText)\n\(ActivityPerformanceHelp.validity)")
                     .accessibilityLabel("TTFT（首字等待） \(row.ttftText)")
             }
             if columns.showTPS {
                 Text(row.tpsIncludingTTFTText)
-                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.number).monospacedDigit()
+                    .foregroundStyle(.secondary)
                     .frame(width: columns.tpsIncludingWidth, alignment: .trailing)
                     .help("\(ActivityPerformanceHelp.tpsIncluding)\n当前：\(row.tpsIncludingTTFTText)\n\(ActivityPerformanceHelp.validity)")
                     .accessibilityLabel("TPS（含 TTFT） \(row.tpsIncludingTTFTText)")
@@ -219,17 +239,17 @@ struct ActivityRequestRow: View {
         VStack(alignment: .leading, spacing: 1) {
             if let provider = row.upstreamProvider, !provider.isEmpty {
                 Text(provider)
-                    .font(.system(size: 11))
+                    .font(ActivityTypeScale.cell)
                     .lineLimit(1).truncationMode(.middle)
             }
             if let model = row.upstreamModel, !model.isEmpty {
                 Text(model)
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.cell).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
             if !row.hasUpstream {
                 Text("未绑定上游")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.cell).foregroundStyle(.secondary)
                     .lineLimit(1)
             }
         }
@@ -239,7 +259,7 @@ struct ActivityRequestRow: View {
 
     private var protocolBadge: some View {
         Text(row.protocolKind.badgeTitle)
-            .font(.system(size: 10))
+            .font(ActivityTypeScale.badge)
             .foregroundStyle(protocolColor)
             .lineLimit(1).minimumScaleFactor(0.8)
             .padding(.horizontal, 6).padding(.vertical, 1)
@@ -256,17 +276,24 @@ struct ActivityRequestRow: View {
     }
 
     private var detail: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(row.detailLines.enumerated()), id: \.offset) { _, line in
-                Text(line)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        HStack(alignment: .top, spacing: 10) {
+            Rectangle()
+                .fill(accent.opacity(0.45))
+                .frame(width: 2)
+
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(Array(row.detailLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(ActivityTypeScale.label)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(row.detailFooterText)
+                    .font(ActivityTypeScale.cell).foregroundStyle(.tertiary)
+                    .padding(.top, 1)
             }
-            Text(row.detailFooterText)
-                .font(.system(size: 11)).foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 2)
         .padding(.bottom, 10)
         .padding(.leading, detailLeading)

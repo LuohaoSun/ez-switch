@@ -12,6 +12,9 @@ struct RouteCandidateItem: Identifiable, Equatable {
 /// 行内容是最简 AppKit cell（删除按钮仅悬停/键盘焦点时显现、吞掉自身点击；右键菜单提供同一操作），
 /// 表格不自滚动，高度由外层 SwiftUI 滚动视图决定。
 struct NativeRouteCandidateList: NSViewRepresentable {
+    /// 默认行高：与供应商模型表 26pt 相邻时保持两侧视觉平衡。
+    static let defaultRowHeight: CGFloat = 30
+
     let items: [RouteCandidateItem]
     let activeRemoteID: UUID?
     let store: ConfigStore
@@ -19,7 +22,7 @@ struct NativeRouteCandidateList: NSViewRepresentable {
     /// 收起时内容不可交互：不参与键盘焦点循环，也不暴露辅助功能元素
     /// （SwiftUI 的裁剪与 `allowsHitTesting` 只作用于 SwiftUI 层，挡不住 Tab 焦点）。
     var isInteractive: Bool = true
-    var rowHeight: CGFloat = 34
+    var rowHeight: CGFloat = NativeRouteCandidateList.defaultRowHeight
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -83,6 +86,8 @@ struct NativeRouteCandidateList: NSViewRepresentable {
 
         private var suppressReload = false
         private var pendingReload = false
+        /// 本表格自身正在发起行内排序拖动：内部排序不触发末尾“拖入模型”槽位高亮。
+        private var isInternalReorderDrag = false
         /// 本次拖动结束后短暂抑制行点击，保证拖动不改动“当前”选中模型。
         private var suppressClick = false
         /// 当前是否可交互（收起时否）。
@@ -233,12 +238,14 @@ struct NativeRouteCandidateList: NSViewRepresentable {
 
         /// 本表格发起行拖动：冻结快照并抑制落点后的点击。
         func sourceDragWillBegin() {
+            isInternalReorderDrag = true
             draggingActiveChanged(true)
             suppressClick = true
         }
 
         /// 行拖动结束：解冻，并在下一轮 runloop 解除点击抑制。
         func sourceDragDidEnd() {
+            isInternalReorderDrag = false
             draggingActiveChanged(false)
             DispatchQueue.main.async { [weak self] in self?.suppressClick = false }
         }
@@ -248,14 +255,24 @@ struct NativeRouteCandidateList: NSViewRepresentable {
         func draggingActiveChanged(_ active: Bool) {
             if active {
                 suppressReload = true
+                updatePlaceholderTarget(!isInternalReorderDrag)
                 return
             }
             suppressReload = false
+            updatePlaceholderTarget(false)
             guard pendingReload, let tableView else { return }
             pendingReload = false
             displayedItems = latestItems
             displayedActive = latestActive
             tableView.reloadData()
+        }
+
+        /// 拖动悬停在候选表上时，末尾虚线落点轻微染上强调色；离开即复原。
+        private func updatePlaceholderTarget(_ targeted: Bool) {
+            guard let tableView else { return }
+            let row = displayedItems.count
+            (tableView.view(atColumn: 0, row: row, makeIfNecessary: false)
+                as? RouteCandidatePlaceholderCell)?.setTargeted(targeted)
         }
 
         // MARK: 落点（原生提出行，固定 .above）
@@ -660,7 +677,7 @@ private final class CandidateTitleField: NSTextField {
 }
 
 /// 末尾常驻占位行“拖入模型”：追加到末尾/空路由拖入的唯一原生落点，保留虚线落点语义。
-/// 行高恒为 34pt；仅调整虚线/图标/文字的视觉权重（空路由强调、非空路由弱化），不影响落点与总高。
+/// 行高恒等于候选表行高；仅调整虚线/图标/文字的视觉权重（空路由强调、非空路由弱化），不影响落点与总高。
 /// 它不可选中，也不作为拖拽来源（bounds guard 在 pasteboardWriterForRow / shouldSelectRow / handleClick）。
 final class RouteCandidatePlaceholderCell: NSTableCellView {
     static let reuseIdentifier = NSUserInterfaceItemIdentifier("RouteCandidatePlaceholderCell")
@@ -669,6 +686,8 @@ final class RouteCandidatePlaceholderCell: NSTableCellView {
     private let content = NSStackView()
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "拖入模型")
+    private var isEmpty = true
+    private(set) var isTargeted = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -679,14 +698,32 @@ final class RouteCandidatePlaceholderCell: NSTableCellView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     /// 非空路由：常态弱化虚线/图标/文字，仅保留落点语义；空路由：强调为明确的拖入邀请。
-    /// 行高始终为 34pt，因此 `(行数 × rowHeight)` 的总高与落点映射不变。
+    /// 行高始终等于 `rowHeight`，因此 `(行数 × rowHeight)` 的总高与落点映射不变。
     func configure(isEmpty: Bool) {
-        slot.emphasis = isEmpty ? 1 : 0.45
-        let tint: NSColor = isEmpty ? .secondaryLabelColor : .tertiaryLabelColor
-        icon.contentTintColor = tint
-        label.textColor = tint
+        self.isEmpty = isEmpty
+        slot.emphasis = isEmpty ? 1 : 0.62
         label.stringValue = isEmpty ? "拖入第一个模型" : "拖入模型"
         setAccessibilityLabel(isEmpty ? "拖入第一个模型" : "拖入模型")
+        applyTint()
+    }
+
+    /// 拖动悬停到候选表上：落点轻微染上强调色，提示可放置；离开即复原。
+    func setTargeted(_ targeted: Bool) {
+        guard isTargeted != targeted else { return }
+        isTargeted = targeted
+        slot.isTargeted = targeted
+        applyTint()
+    }
+
+    private func applyTint() {
+        let tint: NSColor
+        if isTargeted {
+            tint = .controlAccentColor
+        } else {
+            tint = isEmpty ? .secondaryLabelColor : .tertiaryLabelColor
+        }
+        icon.contentTintColor = tint
+        label.textColor = tint
     }
 
     private func build() {
@@ -719,17 +756,28 @@ final class RouteCandidatePlaceholderCell: NSTableCellView {
 }
 
 /// 只画一个虚线圆角边框，作为占位行背景。
-/// `emphasis` 控制线条强度：空路由（1）清晰可辨，非空路由（<1）常态弱化为低调落点提示。
+/// `emphasis` 控制线条强度：空路由（1）清晰可辨，非空路由（0.62）保留低调落点提示；
+/// `isTargeted` 时改用强调色轻染，提示当前拖动可落在末尾。
 final class DashedSlotView: NSView {
     var emphasis: CGFloat = 1 {
         didSet { if emphasis != oldValue { needsDisplay = true } }
     }
+    var isTargeted = false {
+        didSet { if isTargeted != oldValue { needsDisplay = true } }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
         path.lineWidth = 1
-        path.setLineDash([4, 4], count: 2, phase: 0)
-        NSColor.labelColor.withAlphaComponent(0.12 * max(0, min(1, emphasis))).setStroke()
-        path.stroke()
+        path.setLineDash([5, 4], count: 2, phase: 0)
+        if isTargeted {
+            NSColor.controlAccentColor.withAlphaComponent(0.55).setStroke()
+            NSColor.controlAccentColor.withAlphaComponent(0.06).setFill()
+            path.stroke()
+            path.fill()
+        } else {
+            NSColor.labelColor.withAlphaComponent(0.12 * max(0, min(1, emphasis))).setStroke()
+            path.stroke()
+        }
     }
 }

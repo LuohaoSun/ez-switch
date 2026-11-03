@@ -576,7 +576,8 @@ final class UsageStore: @unchecked Sendable {
     ///   三个速率共用全部有效样本——含 TTFT 版本的分母覆盖整个响应期，攒批一次性下发也不失真；
     ///   不含 TTFT 版本只换分母、不换样本，便于与含 TTFT 版本直接对照。
     /// - output 求和用 Double 累加避免 Int 溢出；任一求和非有限（上溢）时相应速率为 `nil`。
-    /// - 失败 / 取消保留在 `attempts` 中，但不进入任何样本。
+    /// - `failedAttempts` 统计所有 `outcome != success` 的尝试（含取消），
+    ///   `failureRate = failedAttempts / attempts`；失败 / 取消仍不进入 TTFT / TPS 样本。
     /// - 队列为空或总时长为 0 时速率为 `nil`，不伪造 0。
     private func performanceSnapshot(_ db: OpaquePointer, from: Date, to: Date,
                                      grouping: UsageGrouping) throws -> PerformanceSnapshot {
@@ -670,6 +671,9 @@ final class UsageStore: @unchecked Sendable {
         private var attempts = 0
         /// 该组的去重请求集合；与 `attempts` 同一记录口径（含失败 / 取消 / 非流式）。
         private var requestIDs: Set<String> = []
+        /// 失败尝试：非 success 一律计入，取消也属于失败尝试。
+        private var failedAttempts = 0
+        private var cancelledAttempts = 0
         private var successfulStreamingAttempts = 0
         // TTFT 均值样本（独立队列）。
         private var ttftSum = 0.0
@@ -691,9 +695,16 @@ final class UsageStore: @unchecked Sendable {
         func add(requestID: String, outcome: String, status: Int?, outputTokens: Int?,
                  performance: UsagePerformance?) {
             attempts += 1
+            let normalizedOutcome = outcome.lowercased()
+            if normalizedOutcome != "success" {
+                failedAttempts += 1
+            }
+            if normalizedOutcome == "cancelled" {
+                cancelledAttempts += 1
+            }
             requestIDs.insert(requestID)
             guard let performance, performance.streaming,
-                  outcome.lowercased() == "success",
+                  normalizedOutcome == "success",
                   let status, (200...299).contains(status) else { return }
             successfulStreamingAttempts += 1
             // 读取时已做非有限/负数归一，这里仍显式校验，保证样本口径自洽。
@@ -724,6 +735,8 @@ final class UsageStore: @unchecked Sendable {
             var summary = PerformanceSummary()
             summary.attempts = attempts
             summary.requests = requestIDs.count
+            summary.failedAttempts = failedAttempts
+            summary.cancelledAttempts = cancelledAttempts
             summary.successfulStreamingAttempts = successfulStreamingAttempts
             summary.ttftSamples = ttftCount
             summary.requestTTFTSamples = requestTTFTCount

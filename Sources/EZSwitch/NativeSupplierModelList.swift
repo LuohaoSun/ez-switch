@@ -75,8 +75,8 @@ struct NativeSupplierModelList: NSViewRepresentable {
     /// 收起时内容不可交互：不参与键盘焦点循环，也不暴露辅助功能元素
     /// （SwiftUI 的裁剪与 `allowsHitTesting` 只作用于 SwiftUI 层，挡不住 Tab 焦点）。
     var isInteractive: Bool = true
-    /// 紧凑行高（约 系统字号 + 11）：圆角内缩选中更贴合单行文本。
-    var rowHeight: CGFloat = 24
+    /// 紧凑行高（约 系统字号 + 13）：圆角内缩选中更贴合单行文本，与右侧候选行节奏一致。
+    var rowHeight: CGFloat = 26
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 

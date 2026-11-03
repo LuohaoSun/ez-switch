@@ -2,16 +2,32 @@ import SwiftUI
 import AppKit
 import Charts
 
-// MARK: - 用量 / 性能页共用卡片样式
+// MARK: - 用量 / 性能页共用样式
+
+/// 悬停状态的轻量盒。
+/// 该工程的 CLI 工具链下 SwiftUI 的 `@State` 宏不可用，所以统一用 `ObservableObject` + `@StateObject`。
+final class HoverState: ObservableObject {
+    @Published var isHovered = false
+}
+
+/// 卡片与表格行的统一尺寸，集中在一处避免两页各自漂移。
+/// 数值直接取自设计令牌，页面不要再写第二套圆角字面量。
+enum UsageCardMetrics {
+    static let cardCornerRadius: CGFloat = AppDesign.Radius.card
+    static let tileCornerRadius: CGFloat = AppDesign.Radius.inset
+    static let rowCornerRadius: CGFloat = AppDesign.Radius.row
+    static let bannerCornerRadius: CGFloat = AppDesign.Radius.inset
+}
 
 extension View {
-    /// 轻量卡片：低对比背景、细描边、统一内边距，右边缘留白。
-    func cardSurface() -> some View {
-        self
-            .padding(16)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.07)))
-            .padding(.trailing, 2)
+    /// 轻量卡片：统一表面色、细描边、统一内边距，右边缘留白。
+    /// `padding` 默认 16，活动页的流向图卡片可传更紧凑的 12。
+    /// 生产实现只有 `CardSurfaceModifier` 一处；这里不裁剪内容，原生表格的绘制余量不受影响。
+    func cardSurface(padding: CGFloat = AppDesign.Space.card) -> some View {
+        modifier(CardSurfaceModifier(cornerRadius: AppDesign.Radius.card,
+                                     padding: padding,
+                                     clipsContent: false,
+                                     trailingInset: 2))
     }
 
     /// 图表卡片外壳：标题、内容间距与图高在两页保持一致。
@@ -52,35 +68,219 @@ extension View {
 }
 
 /// 顶部总览的单个指标块：标题 / 主值 / 说明三行，用量页与性能页共用同一组字号与间距。
+/// 只保留一层内嵌底色，不再加第二道描边，避免卡片里出现“框中框”。
+/// `primary` 用于一个页面里唯一的主指标：数值放大并交给品牌蓝，其余指标保持中性。
+///
+/// 数字区预留主字号的高度，主次指标共用基线、间距和内边距，避免同排卡片高低不齐。
 struct StatTile: View {
     let title: String
     let value: String
     let caption: String
     let help: String
+    var primary: Bool = false
+
+    /// 主数值字体；同时充当所有指标数字区的高度标尺。
+    private static let primaryValueFont = Font.system(.title, design: .rounded).weight(.semibold)
+    /// 次数值字体。
+    private static let secondaryValueFont = Font.system(.title2, design: .rounded).weight(.semibold)
+    /// 三行之间的间距对主/次指标一致，否则标题与说明的基线会各差 1pt。
+    private static let lineSpacing: CGFloat = 6
+    /// 内边距对主/次指标一致，否则标题起点上下差 2pt。
+    private static let contentPadding: CGFloat = 12
+
+    private var valueFont: Font {
+        primary ? Self.primaryValueFont : Self.secondaryValueFont
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: Self.lineSpacing) {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-                .minimumScaleFactor(0.8)
-            Text(value)
-                .font(.system(.title2, design: .rounded).weight(.semibold))
-                .monospacedDigit()
-                .lineLimit(1)
                 .minimumScaleFactor(0.7)
+                .allowsTightening(true)
+            numberSlot
             Text(caption)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
-                .minimumScaleFactor(0.8)
+                .minimumScaleFactor(0.7)
+                .allowsTightening(true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+        .padding(Self.contentPadding)
+        .background(
+            AppDesign.inset,
+            in: RoundedRectangle(cornerRadius: UsageCardMetrics.tileCornerRadius, style: .continuous)
+        )
         .help(help)
         .accessibilityElement(children: .combine)
+    }
+
+    /// 数字区公共槽位：一个不可见的大号数字定出高度，实际数值按首行基线与它对齐。
+    /// 槽位宽度仍由实际数值决定（`ZStack` 取两者较大值），长数值照常按可用宽度缩放。
+    private var numberSlot: some View {
+        ZStack(alignment: Alignment(horizontal: .leading, vertical: .firstTextBaseline)) {
+            Text("0")
+                .font(Self.primaryValueFont)
+                .monospacedDigit()
+                .hidden()
+                .accessibilityHidden(true)
+            Text(value)
+                .font(valueFont)
+                .foregroundStyle(primary ? AppDesign.brand : Color.primary)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+    }
+}
+
+// MARK: - 表格行 / 列头
+
+/// 明细行悬停底色：只换背景不改变行高与列宽，保证表格逐列对齐。
+struct HoverableTableRow<Content: View>: View {
+    private let horizontalPadding: CGFloat
+    private let verticalPadding: CGFloat
+    private let content: Content
+
+    @StateObject private var hover = HoverState()
+
+    init(horizontalPadding: CGFloat = 0,
+         verticalPadding: CGFloat = 0,
+         @ViewBuilder content: () -> Content) {
+        self.horizontalPadding = horizontalPadding
+        self.verticalPadding = verticalPadding
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, verticalPadding)
+            .background(
+                hover.isHovered ? AppDesign.hover : Color.clear,
+                in: RoundedRectangle(cornerRadius: UsageCardMetrics.rowCornerRadius, style: .continuous)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: UsageCardMetrics.rowCornerRadius, style: .continuous))
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.12)) { hover.isHovered = hovering }
+            }
+    }
+}
+
+/// 可排序列头：保持文字/箭头的对齐规则不变，悬停时显示淡淡的双向箭头，
+/// 当前排序列使用加粗的单向箭头。箭头始终占同宽空间，显隐不会让文字横向跳动。
+struct SortHeaderLabel: View {
+    let title: String
+    let leading: Bool
+    let isActive: Bool
+    let ascending: Bool
+
+    @StateObject private var hover = HoverState()
+
+    private var arrowName: String {
+        if isActive { return ascending ? "chevron.up" : "chevron.down" }
+        return "chevron.up.chevron.down"
+    }
+
+    private var arrowOpacity: Double {
+        if isActive { return 1 }
+        return hover.isHovered ? 0.35 : 0
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if leading {
+                text
+                arrow
+            } else {
+                arrow
+                text
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: leading ? .leading : .trailing)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: UsageCardMetrics.rowCornerRadius, style: .continuous)
+                .fill(hover.isHovered ? AppDesign.hover : Color.clear)
+        )
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) { hover.isHovered = hovering }
+        }
+    }
+
+    private var text: some View {
+        Text(title)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .allowsTightening(true)
+    }
+
+    private var arrow: some View {
+        Image(systemName: arrowName)
+            .font(.system(size: 8, weight: isActive ? .bold : .semibold))
+            .foregroundStyle(isActive ? AppDesign.brand : Color.primary)
+            .opacity(arrowOpacity)
+            .frame(width: 12)
+            .accessibilityHidden(true)
+    }
+}
+
+// MARK: - 提示条
+
+/// 统一的提示 / 警告横幅：连续圆角、细描边，用量页与性能页共用同一套观感。
+struct StatusBanner: View {
+    enum Tone {
+        case warning
+        case info
+    }
+
+    let tone: Tone
+    let systemImage: String
+    let message: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: systemImage)
+            Text(message)
+            Spacer(minLength: 0)
+        }
+        .font(.caption)
+        .foregroundStyle(foreground)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            background,
+            in: RoundedRectangle(cornerRadius: UsageCardMetrics.bannerCornerRadius, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: UsageCardMetrics.bannerCornerRadius, style: .continuous)
+                .strokeBorder(border)
+        )
+        .accessibilityElement(children: .combine)
+    }
+
+    private var foreground: Color {
+        switch tone {
+        case .warning: return AppDesign.warning
+        case .info: return .secondary
+        }
+    }
+
+    private var background: Color {
+        switch tone {
+        case .warning: return AppDesign.warning.opacity(0.10)
+        case .info: return AppDesign.inset
+        }
+    }
+
+    private var border: Color {
+        switch tone {
+        case .warning: return AppDesign.warning.opacity(0.20)
+        case .info: return AppDesign.border
+        }
     }
 }
 
@@ -150,10 +350,14 @@ struct TableRowLayout: Layout {
 }
 
 extension TableRowLayout {
-    /// 用量 / 性能明细共用同一份列规格：名称列 3 份，四个数值列各 1 份。
-    /// 最小宽度按列序覆盖两类表（名称 / 输入或 TTFT / 输出或 TPS / 缓存或 TPS / 缓存率或请求），
-    /// 避免两张表在窗口收窄时各锁各的宽度、列分布又漂开。
+    /// 用量明细：名称列 3 份，四个数值列各 1 份。
     static let statsDetail = TableRowLayout(minWidths: [120, 96, 112, 112, 72],
                                             weights: [3, 1, 1, 1, 1],
                                             spacing: 12)
+
+    /// 性能明细：名称列 3 份，五个数值列（失败率 / TTFT / 两个 TPS / 请求）各 1 份。
+    /// 与用量明细共用同一套权重与间距，只是多了一列失败率。
+    static let performanceDetail = TableRowLayout(minWidths: [120, 80, 96, 112, 112, 72],
+                                                  weights: [3, 1, 1, 1, 1, 1],
+                                                  spacing: 12)
 }
