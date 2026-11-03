@@ -99,11 +99,11 @@ struct ActivityListHeader: View {
                     .accessibilityLabel("TPS（含 TTFT）")
             }
         }
-        .font(.system(size: 11))
+        .font(ActivityTypeScale.cell)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .background(Color.primary.opacity(0.03))
+        .background(AppDesign.inset)
     }
 }
 
@@ -133,14 +133,14 @@ struct ActivityRequestRow: View {
     /// 图上高亮优先；没有高亮对象时，悬停给一层极淡的底，帮助扫行且不改变行高。
     private var rowBackground: Color {
         if isHighlighted { return ActivityPalette.active.opacity(0.08) }
-        return hover.isHovered ? Color.primary.opacity(0.035) : Color.clear
+        return hover.isHovered ? AppDesign.hover : Color.clear
     }
 
     private var summary: some View {
         HStack(spacing: columns.spacing) {
             HStack(spacing: 4) {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(ActivityTypeScale.microSymbol)
                     .foregroundStyle(.tertiary)
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
                 Circle().fill(row.isActive ? accent : Color.clear).frame(width: 6, height: 6)
@@ -149,7 +149,7 @@ struct ActivityRequestRow: View {
 
             if columns.showTime {
                 Text(ActivityFormat.time(row.startedAt))
-                    .font(.system(.caption, design: .rounded)).monospacedDigit()
+                    .font(ActivityTypeScale.number).monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(width: columns.timeWidth, alignment: .leading)
             }
@@ -157,7 +157,7 @@ struct ActivityRequestRow: View {
             apiCell
 
             Text(row.routeName)
-                .font(.system(size: 12, weight: .medium))
+                .font(ActivityTypeScale.labelMedium)
                 .lineLimit(1).truncationMode(.middle)
                 .frame(width: columns.routeWidth, alignment: .leading)
                 .help(row.routeName)
@@ -165,7 +165,7 @@ struct ActivityRequestRow: View {
             upstreamCell
 
             Text(row.statusText)
-                .font(.caption.weight(.medium))
+                .font(ActivityTypeScale.labelMedium)
                 .foregroundStyle(row.tone.color)
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
@@ -177,13 +177,13 @@ struct ActivityRequestRow: View {
             Group {
                 if let progress = row.attemptProgressText {
                     Text(progress)
-                        .font(.system(size: 10.5, design: .rounded)).monospacedDigit()
+                        .font(ActivityTypeScale.compactNumber).monospacedDigit()
                         .foregroundStyle(row.phase == .fallenBack ? ActivityPalette.warn : Color.secondary)
                         .help("第 \(row.attemptIndex)/\(row.attemptCount) 次尝试；同一请求的尝试按时间倒序排列。")
                         .accessibilityLabel("第 \(row.attemptIndex) 次，共 \(row.attemptCount) 次尝试")
                 } else {
                     Text("—")
-                        .font(.system(size: 10.5, design: .rounded))
+                        .font(ActivityTypeScale.compactNumber)
                         .foregroundStyle(.tertiary)
                         .accessibilityHidden(true)
                 }
@@ -191,22 +191,22 @@ struct ActivityRequestRow: View {
             .frame(width: columns.attemptsWidth, alignment: .leading)
 
             Text(ActivityFormat.tokenCell(row.tokens.input))
-                .font(.system(.callout, design: .rounded)).monospacedDigit()
+                .font(ActivityTypeScale.tokenNumber).monospacedDigit()
                 .frame(width: columns.tokenWidth, alignment: .trailing)
             Text(ActivityFormat.tokenCell(row.tokens.output))
-                .font(.system(.callout, design: .rounded)).monospacedDigit()
+                .font(ActivityTypeScale.tokenNumber).monospacedDigit()
                 .frame(width: columns.tokenWidth, alignment: .trailing)
 
             if columns.showElapsed {
                 Text(row.durationText)
-                    .font(.system(.caption, design: .rounded)).monospacedDigit()
+                    .font(ActivityTypeScale.number).monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(width: columns.elapsedWidth, alignment: .trailing)
             }
 
             if columns.showTTFT {
                 Text(row.ttftText)
-                    .font(.system(.caption, design: .rounded)).monospacedDigit()
+                    .font(ActivityTypeScale.number).monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(width: columns.ttftWidth, alignment: .trailing)
                     .help("\(ActivityPerformanceHelp.ttft)\n当前：\(row.ttftText)\n\(ActivityPerformanceHelp.validity)")
@@ -214,7 +214,7 @@ struct ActivityRequestRow: View {
             }
             if columns.showTPS {
                 Text(row.tpsIncludingTTFTText)
-                    .font(.system(.caption, design: .rounded)).monospacedDigit()
+                    .font(ActivityTypeScale.number).monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(width: columns.tpsIncludingWidth, alignment: .trailing)
                     .help("\(ActivityPerformanceHelp.tpsIncluding)\n当前：\(row.tpsIncludingTTFTText)\n\(ActivityPerformanceHelp.validity)")
@@ -239,17 +239,17 @@ struct ActivityRequestRow: View {
         VStack(alignment: .leading, spacing: 1) {
             if let provider = row.upstreamProvider, !provider.isEmpty {
                 Text(provider)
-                    .font(.system(size: 11))
+                    .font(ActivityTypeScale.cell)
                     .lineLimit(1).truncationMode(.middle)
             }
             if let model = row.upstreamModel, !model.isEmpty {
                 Text(model)
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.cell).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
             if !row.hasUpstream {
                 Text("未绑定上游")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(ActivityTypeScale.cell).foregroundStyle(.secondary)
                     .lineLimit(1)
             }
         }
@@ -259,7 +259,7 @@ struct ActivityRequestRow: View {
 
     private var protocolBadge: some View {
         Text(row.protocolKind.badgeTitle)
-            .font(.system(size: 10))
+            .font(ActivityTypeScale.badge)
             .foregroundStyle(protocolColor)
             .lineLimit(1).minimumScaleFactor(0.8)
             .padding(.horizontal, 6).padding(.vertical, 1)
@@ -284,12 +284,12 @@ struct ActivityRequestRow: View {
             VStack(alignment: .leading, spacing: 5) {
                 ForEach(Array(row.detailLines.enumerated()), id: \.offset) { _, line in
                     Text(line)
-                        .font(.system(size: 12))
+                        .font(ActivityTypeScale.label)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Text(row.detailFooterText)
-                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .font(ActivityTypeScale.cell).foregroundStyle(.tertiary)
                     .padding(.top, 1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)

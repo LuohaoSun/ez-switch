@@ -29,11 +29,12 @@ struct ExtensionCard<Content: View>: View {
                 Divider()
                 content
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 14)
+                    .padding(.horizontal, AppDesign.Space.card)
+                    .padding(.vertical, AppDesign.Space.section)
             }
         }
-        .ezsCardSurface()
+        .ezsCardSurface(cornerRadius: AppDesign.Radius.card)
+        .tint(AppDesign.brand)
         .onChange(of: isEnabled) { enabled in
             withAnimation(expandAnimation) { state.expanded = enabled }
         }
@@ -49,9 +50,9 @@ struct ExtensionCard<Content: View>: View {
                         .rotationEffect(.degrees(state.expanded ? 90 : 0))
                         .accessibilityHidden(true)
                     Image(systemName: systemImage)
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 24)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(AppDesign.brand)
+                        .frame(width: 22)
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title).font(.headline)
@@ -75,8 +76,8 @@ struct ExtensionCard<Content: View>: View {
                 .help(isEnabled ? "停用" : "启用")
                 .accessibilityLabel("启用\(title)")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, AppDesign.Space.card)
+        .padding(.vertical, 14)
         .animation(expandAnimation, value: state.expanded)
     }
 

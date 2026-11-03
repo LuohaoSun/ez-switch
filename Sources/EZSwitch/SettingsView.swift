@@ -115,6 +115,7 @@ struct SettingsView: View {
     // 子页面自行观察配置；外层只转发对象，避免每次排序都更新整个设置宿主。
     let store: ConfigStore
     @ObservedObject var nav: SettingsNav
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Group {
@@ -123,7 +124,6 @@ struct SettingsView: View {
                                     sidebar: sidebar,
                                     detail: detail)
                 .ignoresSafeArea(.container, edges: .top)
-                .navigationTitle(navigationTitle)
                 .toolbar {
                     ToolbarItem(placement: .navigation) {
                         Button {
@@ -145,6 +145,7 @@ struct SettingsView: View {
                 .navigationSplitViewStyle(.automatic)
             }
         }
+        .navigationTitle(navigationTitle)
         .background(WindowActivator().frame(width: 0, height: 0))
         .frame(minWidth: 1000, minHeight: 640)
         .task {
@@ -172,6 +173,53 @@ struct SettingsView: View {
             }
         }
         .listStyle(.sidebar)
+        .tint(AppDesign.brand)
+        .safeAreaInset(edge: .top, spacing: 0) { brandHeader }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // 只有这个小块观察 store，服务状态变化不会触发整个设置宿主刷新。
+            SettingsSidebarServiceStatus(store: store)
+        }
+    }
+
+    /// 侧栏品牌头：真实应用图标 + 名称 + 版本，跟随原生侧栏材质，不加彩色底座或渐变。
+    private var brandHeader: some View {
+        HStack(spacing: 10) {
+            if let icon = appIcon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 30, height: 30)
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(AppDesign.brand)
+                    .frame(width: 30, height: 30)
+                    .accessibilityHidden(true)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text("EZ Switch")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(versionText)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var appIcon: NSImage? {
+        NSImage(named: NSImage.applicationIconName) ?? NSApplication.shared.applicationIconImage
+    }
+
+    private var versionText: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        return short.map { "版本 \($0)" } ?? "开发版"
     }
 
     @ViewBuilder
@@ -182,14 +230,19 @@ struct SettingsView: View {
                 Divider()
             }
             detailContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .transition(reduceMotion ? AnyTransition.identity : AnyTransition.opacity)
         }
-        .animation(.easeInOut(duration: 0.12), value: nav.section)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(AppDesign.canvas)
+        .tint(AppDesign.brand)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: nav.section)
     }
 
     /// 配置读取失败时的简洁提示；修正文件后经“通用”页重新加载即可恢复保存。
     private func configLoadErrorBanner(_ error: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(AppDesign.warning)
             VStack(alignment: .leading, spacing: 2) {
                 Text("配置读取失败，正在使用默认配置").font(.callout)
                 Text(error).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
@@ -198,14 +251,15 @@ struct SettingsView: View {
             }
             Spacer()
         }
-        .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(Color.orange.opacity(0.10),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(.horizontal, AppDesign.Space.section)
+        .padding(.vertical, 8)
+        .background(AppDesign.warning.opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(Color.orange.opacity(0.18), lineWidth: 1)
+            RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous)
+                .strokeBorder(AppDesign.warning.opacity(0.22), lineWidth: 1)
         )
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 8)
         .padding(.vertical, 8)
     }
 
@@ -238,6 +292,49 @@ struct SettingsView: View {
             get: { nav.sidebarVisible ? .all : .detailOnly },
             set: { nav.sidebarVisible = ($0 != .detailOnly) }
         )
+    }
+}
+
+// MARK: - 侧栏底部服务状态
+
+/// 侧栏底部的本地服务摘要。独立持有观察，避免路由或配置变更刷新整页。
+private struct SettingsSidebarServiceStatus: View {
+    @ObservedObject var store: ConfigStore
+
+    private var statusColor: Color {
+        if store.serverError != nil { return AppDesign.danger }
+        return store.runningPort == nil ? AppDesign.warning : AppDesign.success
+    }
+
+    private var detailText: String {
+        if store.serverError != nil { return "端口 \(store.config.port) 启动失败" }
+        guard let running = store.runningPort else { return "端口 \(store.config.port)" }
+        if running != store.config.port { return "运行 \(running)，保存 \(store.config.port)" }
+        return store.connectionURL
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 7) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(store.serviceTitle)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                Text(detailText)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .help(store.serverError ?? store.connectionURL)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -289,7 +386,6 @@ struct ModelsPane: View {
             .listStyle(.inset)
             .onDeleteCommand { requestDelete() }
         }
-        .navigationTitle("路由")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -424,7 +520,7 @@ struct FakeEditSheet: View {
                         .onChange(of: draft.modelID) { _ in draft.modelTouched = true }
 
                     if draft.modelTouched, let error = errorText {
-                        Text(error).font(.caption).foregroundStyle(.red)
+                        Text(error).font(.caption).foregroundStyle(AppDesign.danger)
                     }
                 }
 
@@ -453,7 +549,7 @@ struct FakeEditSheet: View {
         HStack(spacing: 12) {
             if source != nil {
                 Button("删除") { draft.confirmDelete = true }
-                    .foregroundColor(.red)
+                    .foregroundStyle(AppDesign.danger)
             }
             Spacer()
             Button("取消") { dismiss() }

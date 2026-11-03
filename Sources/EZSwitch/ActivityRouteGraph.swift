@@ -114,7 +114,7 @@ struct ActivityRouteGraph: View {
                           color: color, selected: selected) {
                 nodeLabel(title: title, dot: color) {
                     Text(detail)
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .font(ActivityTypeScale.nodeSubtitle).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                 }
             }
@@ -158,7 +158,7 @@ struct ActivityRouteGraph: View {
             Circle().fill(dot).frame(width: 6, height: 6)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 12)).lineLimit(1).truncationMode(.tail)
+                    .font(ActivityTypeScale.nodeTitle).lineLimit(1).truncationMode(.tail)
                 subtitle()
             }
             Spacer(minLength: 0)
@@ -169,7 +169,7 @@ struct ActivityRouteGraph: View {
     private func nodeLabel(title: String, subtitle: String, dot: Color) -> some View {
         nodeLabel(title: title, dot: dot) {
             Text(subtitle)
-                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .font(ActivityTypeScale.nodeSubtitle).foregroundStyle(.secondary)
                 .lineLimit(1).truncationMode(.middle)
         }
     }
@@ -178,9 +178,9 @@ struct ActivityRouteGraph: View {
     private func routerNode(_ layout: ActivityRouteGraphGeometry) -> some View {
         Button { onClear() } label: {
             VStack(spacing: 3) {
-                Text("EZSwitch").font(.system(size: 12, weight: .medium))
+                Text("EZSwitch").font(ActivityTypeScale.nodeTitleMedium)
                     .lineLimit(1).minimumScaleFactor(0.75)
-                Text(routerSubtitle).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(routerSubtitle).font(ActivityTypeScale.nodeSubtitle).foregroundStyle(.secondary)
                     .lineLimit(1).minimumScaleFactor(0.8)
             }
             .padding(.horizontal, 6)
@@ -189,12 +189,12 @@ struct ActivityRouteGraph: View {
             .background {
                 RoundedRectangle(cornerRadius: ActivityRouteGraphGeometry.cornerRadius,
                                  style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .fill(AppDesign.inset)
                     .shadow(color: Color.black.opacity(0.05), radius: 2, y: 1)
             }
             .overlay(
                 RoundedRectangle(cornerRadius: ActivityRouteGraphGeometry.cornerRadius, style: .continuous)
-                    .strokeBorder(selection == nil ? Color.primary.opacity(0.14) : ActivityPalette.active,
+                    .strokeBorder(selection == nil ? AppDesign.border : ActivityPalette.active,
                                   lineWidth: selection == nil ? 1 : 1.6)
             )
             .contentShape(RoundedRectangle(cornerRadius: ActivityRouteGraphGeometry.cornerRadius,
@@ -336,12 +336,12 @@ private struct RouteNodeFace<Content: View>: View {
 
     private var background: Color {
         if selected { return color.opacity(0.18) }
-        if hover.isHovered { return Color.primary.opacity(0.045) }
-        return Color(nsColor: .controlBackgroundColor)
+        if hover.isHovered { return AppDesign.hover }
+        return AppDesign.inset
     }
 
     private var border: Color {
-        selected ? color : Color.primary.opacity(0.14)
+        selected ? color : AppDesign.border
     }
 }
 

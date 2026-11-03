@@ -11,9 +11,11 @@
 
 ## 界面预览
 
-![供应商与路由](Docs/images/routes-and-models.png)
+以下为 1.1.0 界面样式预览，使用本地模拟供应商与演示用量。截图取自发布前预览构建，版本标签仍为 1.0.0。
 
-![用量统计](Docs/images/token-usage.png)
+![供应商与路由](Docs/images/style-workspace.png)
+
+![用量统计](Docs/images/style-usage.png)
 
 ## 安装
 

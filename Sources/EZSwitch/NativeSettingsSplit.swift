@@ -50,6 +50,8 @@ final class SettingsSplitContainerViewController<Sidebar: View, Detail: View>: N
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarHost)
         sidebarItem.minimumThickness = 185
         sidebarItem.maximumThickness = 250
+        // 品牌头需要贴到统一标题栏下方，保持侧栏全高原生材质。
+        sidebarItem.allowsFullHeightLayout = true
         sidebarItem.canCollapse = true
         sidebarItem.canCollapseFromWindowResize = false
         sidebarItem.collapseBehavior = .preferResizingSiblingsWithFixedSplitView  // 折叠时保持 split 固定几何

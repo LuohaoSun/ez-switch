@@ -11,29 +11,23 @@ final class HoverState: ObservableObject {
 }
 
 /// 卡片与表格行的统一尺寸，集中在一处避免两页各自漂移。
+/// 数值直接取自设计令牌，页面不要再写第二套圆角字面量。
 enum UsageCardMetrics {
-    static let cardCornerRadius: CGFloat = 12
-    static let tileCornerRadius: CGFloat = 10
-    static let rowCornerRadius: CGFloat = 6
-    static let bannerCornerRadius: CGFloat = 8
+    static let cardCornerRadius: CGFloat = AppDesign.Radius.card
+    static let tileCornerRadius: CGFloat = AppDesign.Radius.inset
+    static let rowCornerRadius: CGFloat = AppDesign.Radius.row
+    static let bannerCornerRadius: CGFloat = AppDesign.Radius.inset
 }
 
 extension View {
-    /// 轻量卡片：低对比背景、细描边、统一内边距，右边缘留白。
+    /// 轻量卡片：统一表面色、细描边、统一内边距，右边缘留白。
     /// `padding` 默认 16，活动页的流向图卡片可传更紧凑的 12。
-    func cardSurface(padding: CGFloat = 16) -> some View {
-        self
-            .padding(padding)
-            .background {
-                RoundedRectangle(cornerRadius: UsageCardMetrics.cardCornerRadius, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-                    .shadow(color: Color.black.opacity(0.04), radius: 3, y: 1)
-            }
-            .overlay(
-                RoundedRectangle(cornerRadius: UsageCardMetrics.cardCornerRadius, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.09))
-            )
-            .padding(.trailing, 2)
+    /// 生产实现只有 `CardSurfaceModifier` 一处；这里不裁剪内容，原生表格的绘制余量不受影响。
+    func cardSurface(padding: CGFloat = AppDesign.Space.card) -> some View {
+        modifier(CardSurfaceModifier(cornerRadius: AppDesign.Radius.card,
+                                     padding: padding,
+                                     clipsContent: false,
+                                     trailingInset: 2))
     }
 
     /// 图表卡片外壳：标题、内容间距与图高在两页保持一致。
@@ -74,26 +68,39 @@ extension View {
 }
 
 /// 顶部总览的单个指标块：标题 / 主值 / 说明三行，用量页与性能页共用同一组字号与间距。
-/// 内部浅浅的底色 + 1pt 细描边，让指标在总览卡里有清晰的结构层次。
+/// 只保留一层内嵌底色，不再加第二道描边，避免卡片里出现“框中框”。
+/// `primary` 用于一个页面里唯一的主指标：数值放大并交给品牌蓝，其余指标保持中性。
+///
+/// 数字区预留主字号的高度，主次指标共用基线、间距和内边距，避免同排卡片高低不齐。
 struct StatTile: View {
     let title: String
     let value: String
     let caption: String
     let help: String
+    var primary: Bool = false
+
+    /// 主数值字体；同时充当所有指标数字区的高度标尺。
+    private static let primaryValueFont = Font.system(.title, design: .rounded).weight(.semibold)
+    /// 次数值字体。
+    private static let secondaryValueFont = Font.system(.title2, design: .rounded).weight(.semibold)
+    /// 三行之间的间距对主/次指标一致，否则标题与说明的基线会各差 1pt。
+    private static let lineSpacing: CGFloat = 6
+    /// 内边距对主/次指标一致，否则标题起点上下差 2pt。
+    private static let contentPadding: CGFloat = 12
+
+    private var valueFont: Font {
+        primary ? Self.primaryValueFont : Self.secondaryValueFont
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: Self.lineSpacing) {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
                 .allowsTightening(true)
-            Text(value)
-                .font(.system(.title2, design: .rounded).weight(.semibold))
-                .monospacedDigit()
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+            numberSlot
             Text(caption)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
@@ -102,17 +109,31 @@ struct StatTile: View {
                 .allowsTightening(true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .padding(Self.contentPadding)
         .background(
-            Color.primary.opacity(0.035),
+            AppDesign.inset,
             in: RoundedRectangle(cornerRadius: UsageCardMetrics.tileCornerRadius, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: UsageCardMetrics.tileCornerRadius, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06))
         )
         .help(help)
         .accessibilityElement(children: .combine)
+    }
+
+    /// 数字区公共槽位：一个不可见的大号数字定出高度，实际数值按首行基线与它对齐。
+    /// 槽位宽度仍由实际数值决定（`ZStack` 取两者较大值），长数值照常按可用宽度缩放。
+    private var numberSlot: some View {
+        ZStack(alignment: Alignment(horizontal: .leading, vertical: .firstTextBaseline)) {
+            Text("0")
+                .font(Self.primaryValueFont)
+                .monospacedDigit()
+                .hidden()
+                .accessibilityHidden(true)
+            Text(value)
+                .font(valueFont)
+                .foregroundStyle(primary ? AppDesign.brand : Color.primary)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
     }
 }
 
@@ -139,7 +160,7 @@ struct HoverableTableRow<Content: View>: View {
             .padding(.horizontal, horizontalPadding)
             .padding(.vertical, verticalPadding)
             .background(
-                hover.isHovered ? Color.primary.opacity(0.045) : Color.clear,
+                hover.isHovered ? AppDesign.hover : Color.clear,
                 in: RoundedRectangle(cornerRadius: UsageCardMetrics.rowCornerRadius, style: .continuous)
             )
             .contentShape(RoundedRectangle(cornerRadius: UsageCardMetrics.rowCornerRadius, style: .continuous))
@@ -182,8 +203,8 @@ struct SortHeaderLabel: View {
         .frame(maxWidth: .infinity, alignment: leading ? .leading : .trailing)
         .contentShape(Rectangle())
         .background(
-            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(hover.isHovered ? Color.primary.opacity(0.045) : Color.clear)
+            RoundedRectangle(cornerRadius: UsageCardMetrics.rowCornerRadius, style: .continuous)
+                .fill(hover.isHovered ? AppDesign.hover : Color.clear)
         )
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) { hover.isHovered = hovering }
@@ -200,7 +221,7 @@ struct SortHeaderLabel: View {
     private var arrow: some View {
         Image(systemName: arrowName)
             .font(.system(size: 8, weight: isActive ? .bold : .semibold))
-            .foregroundStyle(isActive ? Color.accentColor : Color.primary)
+            .foregroundStyle(isActive ? AppDesign.brand : Color.primary)
             .opacity(arrowOpacity)
             .frame(width: 12)
             .accessibilityHidden(true)
@@ -243,22 +264,22 @@ struct StatusBanner: View {
 
     private var foreground: Color {
         switch tone {
-        case .warning: return .orange
+        case .warning: return AppDesign.warning
         case .info: return .secondary
         }
     }
 
     private var background: Color {
         switch tone {
-        case .warning: return Color.orange.opacity(0.10)
-        case .info: return Color.primary.opacity(0.04)
+        case .warning: return AppDesign.warning.opacity(0.10)
+        case .info: return AppDesign.inset
         }
     }
 
     private var border: Color {
         switch tone {
-        case .warning: return Color.orange.opacity(0.18)
-        case .info: return Color.primary.opacity(0.06)
+        case .warning: return AppDesign.warning.opacity(0.20)
+        case .info: return AppDesign.border
         }
     }
 }

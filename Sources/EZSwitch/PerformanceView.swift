@@ -88,33 +88,70 @@ struct PerformanceView: View {
 
     // MARK: - 顶部指标
 
+    /// 请求数是主指标（品牌色放大），其余四项为次指标。
+    /// 宽窗口五列同排；最小窗口回落成「主指标一行 + 2×2」，
+    /// 标题与数值不靠压缩字号硬塞。
     private var metricsCard: some View {
-        HStack(spacing: 10) {
-            StatTile(title: "请求数",
-                     value: UsageFormat.compact(summary.requests),
-                     caption: "次 · 尝试 \(PerformanceFormat.samples(summary.attempts))",
-                     help: requestCountHelp)
-            StatTile(title: "尝试失败率",
-                     value: PerformanceFormat.failureRate(summary.failureRate),
-                     caption: "失败 \(UsageFormat.compact(summary.failedAttempts)) / \(UsageFormat.compact(summary.attempts)) 次",
-                     help: attemptFailureHelp)
-            metricTile(title: "平均TTFT",
-                       value: PerformanceFormat.milliseconds(summaryTTFTValue),
-                       unit: "总等待",
-                       samples: summary.requestTTFTSamples,
-                       help: "\(ttftMeanHelp(requestScope: true))\n\(coverageHelp)")
-            metricTile(title: "平均TPS(含TTFT)",
-                       value: PerformanceFormat.tps(summaryTPSIncludingValue),
-                       unit: "Tokens/秒",
-                       samples: summary.tpsSamples,
-                       help: "\(tpsMeanHelp(includingTTFT: true))\n\(coverageHelp)")
-            metricTile(title: "平均TPS(不含TTFT)",
-                       value: PerformanceFormat.tps(summaryTPSExcludingValue),
-                       unit: "Tokens/秒",
-                       samples: summary.tpsSamples,
-                       help: "\(tpsMeanHelp(includingTTFT: false))\n\(coverageHelp)")
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                requestCountTile.frame(minWidth: 150)
+                failureRateTile.frame(minWidth: 150)
+                ttftTile.frame(minWidth: 150)
+                tpsIncludingTile.frame(minWidth: 150)
+                tpsExcludingTile.frame(minWidth: 150)
+            }
+            VStack(spacing: 10) {
+                requestCountTile
+                HStack(spacing: 10) {
+                    failureRateTile
+                    ttftTile
+                }
+                HStack(spacing: 10) {
+                    tpsIncludingTile
+                    tpsExcludingTile
+                }
+            }
         }
         .cardSurface()
+    }
+
+    private var requestCountTile: some View {
+        StatTile(title: "请求数",
+                 value: UsageFormat.compact(summary.requests),
+                 caption: "次 · 尝试 \(PerformanceFormat.samples(summary.attempts))",
+                 help: requestCountHelp,
+                 primary: true)
+    }
+
+    private var failureRateTile: some View {
+        StatTile(title: "尝试失败率",
+                 value: PerformanceFormat.failureRate(summary.failureRate),
+                 caption: "失败 \(UsageFormat.compact(summary.failedAttempts)) / \(UsageFormat.compact(summary.attempts)) 次",
+                 help: attemptFailureHelp)
+    }
+
+    private var ttftTile: some View {
+        metricTile(title: "平均TTFT",
+                   value: PerformanceFormat.milliseconds(summaryTTFTValue),
+                   unit: "总等待",
+                   samples: summary.requestTTFTSamples,
+                   help: "\(ttftMeanHelp(requestScope: true))\n\(coverageHelp)")
+    }
+
+    private var tpsIncludingTile: some View {
+        metricTile(title: "平均TPS(含TTFT)",
+                   value: PerformanceFormat.tps(summaryTPSIncludingValue),
+                   unit: "Tokens/秒",
+                   samples: summary.tpsSamples,
+                   help: "\(tpsMeanHelp(includingTTFT: true))\n\(coverageHelp)")
+    }
+
+    private var tpsExcludingTile: some View {
+        metricTile(title: "平均TPS(不含TTFT)",
+                   value: PerformanceFormat.tps(summaryTPSExcludingValue),
+                   unit: "Tokens/秒",
+                   samples: summary.tpsSamples,
+                   help: "\(tpsMeanHelp(includingTTFT: false))\n\(coverageHelp)")
     }
 
     /// 请求数口径：去重计数与尝试数并列给出，说明自动回退只计一次。
@@ -174,7 +211,7 @@ struct PerformanceView: View {
                 x: .value(isHourlyChart ? "时间" : "日期", point.date, unit: model.chartUnit),
                 y: .value("请求数", point.requests)
             )
-            .foregroundStyle(Color.accentColor)
+            .foregroundStyle(AppDesign.chartInput)
             .cornerRadius(4)
             .opacity(model.performanceActiveBucket == nil
                      || model.performanceActiveBucket?.date == point.date ? 1 : 0.35)
@@ -211,9 +248,12 @@ struct PerformanceView: View {
         return VStack(alignment: .leading, spacing: 0) {
             // 与用量明细同一层级：标题、分组 segmented 紧邻；排序不再占用控件，改为点击列头。
             HStack(spacing: 12) {
-                Text("性能明细")
-                    .font(.headline)
-                    .help("数值悬停可查看该分组的有效样本数；顶部卡片显示所选范围的总样本数。")
+                HStack(spacing: 8) {
+                    Text("性能明细")
+                        .font(.headline)
+                        .help("数值悬停可查看该分组的有效样本数；顶部卡片显示所选范围的总样本数。")
+                    CountBadge(count: rows.count)
+                }
 
                 Picker("分组", selection: $model.performanceGrouping) {
                     ForEach(UsageGrouping.allCases) { grouping in
@@ -227,8 +267,6 @@ struct PerformanceView: View {
                 .help(groupingHelp)
 
                 Spacer(minLength: 8)
-
-                Text("\(rows.count) 项").font(.caption).foregroundStyle(.secondary)
             }
             .padding(.bottom, 10)
 
@@ -398,16 +436,12 @@ struct PerformanceView: View {
     // MARK: - 空 / 错误 / 加载
 
     private var noHistoryState: some View {
-        VStack(spacing: 14) {
-            EmptyState(title: "当前区间暂无记录",
-                       detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史性能；这里会统计请求数与流式请求的平均首输出延迟、平均吞吐。",
-                       symbol: "speedometer")
-            Text("转发本身不受影响。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
+        VStack(spacing: 0) {
+            AppPageState(title: "当前区间暂无记录",
+                         detail: "把客户端指向本机地址并成功转发一次请求，或切换到其他时间区间查看历史性能；这里会统计请求数与流式请求的平均首输出延迟、平均吞吐。转发本身不受影响。",
+                         symbol: "speedometer")
+            Spacer(minLength: 0)
         }
-        .padding(.top, 40)
     }
 
     /// 有转发记录但无 TTFT / TPS 样本：请求数与图表照常展示，仅提示延迟 / 吞吐不可用。
@@ -424,18 +458,10 @@ struct PerformanceView: View {
     }
 
     private func errorState(_ message: String) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 32))
-                .foregroundStyle(.orange)
-            Text("性能统计不可用").font(.headline)
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Text("请求转发不受影响；统计恢复后会继续记录。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        VStack(spacing: 16) {
+            AppPageState(title: "性能统计不可用",
+                         detail: "\(message)\n请求转发不受影响；统计恢复后会继续记录。",
+                         symbol: "exclamationmark.triangle")
             Button {
                 Task { await model.refresh(store: store) }
             } label: {
@@ -443,7 +469,6 @@ struct PerformanceView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(32)
     }
 
     private var loadingState: some View {

@@ -96,32 +96,19 @@ struct StatusLabel: View {
     var body: some View {
         Label(title, systemImage: warning ? "exclamationmark.circle.fill" : "checkmark.circle")
             .font(.caption)
-            .foregroundStyle(warning ? Color.orange : Color.secondary)
+            .foregroundStyle(warning ? AppDesign.warning : Color.secondary)
     }
 }
 
-/// 统一的原生卡片表面：控制背景 + 连续圆角 + 细描边 + 极轻投影（不投影内容文字）。
+/// 统一的原生卡片表面：表面色 + 连续圆角 + 细描边 + 极轻投影（不投影内容文字）。
+/// 生产实现只有 `CardSurfaceModifier` 一处，这里仅保留既有签名。
 extension View {
-    func ezsCardSurface(cornerRadius: CGFloat = 12, padding: CGFloat? = nil) -> some View {
-        modifier(EZSCardSurface(cornerRadius: cornerRadius, padding: padding))
-    }
-}
-
-private struct EZSCardSurface: ViewModifier {
-    let cornerRadius: CGFloat
-    let padding: CGFloat?
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        return content
-            .padding(padding ?? 0)
-            .clipShape(shape)
-            .background(
-                shape
-                    .fill(Color(nsColor: .controlBackgroundColor))
-                    .shadow(color: Color.black.opacity(0.04), radius: 3, y: 1)
-            )
-            .overlay(shape.strokeBorder(Color.primary.opacity(0.09), lineWidth: 1))
+    /// 保留既有的内容裁剪：扩展卡与供应商卡片依赖它把内容收进圆角。
+    /// `cardSurface` 则不裁剪，避免收窄原生表格的绘制余量。
+    func ezsCardSurface(cornerRadius: CGFloat = AppDesign.Radius.card, padding: CGFloat? = nil) -> some View {
+        modifier(CardSurfaceModifier(cornerRadius: cornerRadius,
+                                     padding: padding ?? 0,
+                                     clipsContent: true))
     }
 }
 
@@ -135,28 +122,51 @@ struct ServiceSummary: View {
             content
         } else {
             content
-                .padding(16)
+                .padding(AppDesign.Space.card)
                 .ezsCardSurface()
         }
     }
 
     private var content: some View {
         HStack(spacing: 12) {
-            Image(systemName: store.serverError == nil && store.runningPort != nil ? "network" : "exclamationmark.triangle")
-                .font(.title2)
-                .foregroundStyle(store.serverError != nil ? Color.orange : Color.accentColor)
+            Image(systemName: statusSymbol)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(statusColor)
                 .frame(width: 40, height: 40)
-                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-            VStack(alignment: .leading, spacing: 4) {
+                .background(statusColor.opacity(0.10),
+                            in: RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 5) {
                 Text(store.serviceTitle).font(.headline)
-                Text(store.connectionURL).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                Text(store.connectionURL)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        AppDesign.inset,
+                        in: RoundedRectangle(cornerRadius: AppDesign.Radius.row, style: .continuous)
+                    )
             }
-            Spacer()
+            Spacer(minLength: 12)
             Button { copyText(store.connectionURL) } label: {
                 Label("复制地址", systemImage: "doc.on.doc")
             }
             .disabled(store.runningPort == nil)
+            .help("复制本机服务地址")
         }
+    }
+
+    /// 运行 / 未运行 / 启动失败三态共用一枚语义色图标，不再用品牌色冒充运行状态。
+    private var statusSymbol: String {
+        if store.serverError != nil { return "exclamationmark.triangle.fill" }
+        return "network"
+    }
+
+    private var statusColor: Color {
+        if store.serverError != nil { return AppDesign.danger }
+        return store.runningPort != nil ? AppDesign.success : Color.secondary
     }
 }
 
@@ -179,15 +189,32 @@ struct EmptyState: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: symbol).font(.system(size: 32)).foregroundStyle(.secondary)
-            Text(title).font(.headline)
-            Text(detail).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Image(systemName: symbol)
+                .font(.system(size: 22, weight: .regular))
+                .foregroundStyle(.secondary)
+                .frame(width: 52, height: 52)
+                .background(
+                    AppDesign.inset,
+                    in: RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous)
+                )
+                .accessibilityHidden(true)
+            VStack(spacing: 4) {
+                Text(title).font(.headline)
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
-                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .tint(AppDesign.brand)
                     .padding(.top, 2)
             }
         }
-        .frame(maxWidth: .infinity).padding(32)
+        .frame(maxWidth: .infinity)
+        .padding(32)
+        .accessibilityElement(children: .contain)
     }
 }

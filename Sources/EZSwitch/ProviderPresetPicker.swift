@@ -91,6 +91,7 @@ struct ProviderPresetPicker: View {
             .padding(16)
         }
         .frame(width: 540, height: 540)
+        .background(AppDesign.canvas)
     }
 
     private func presetCard(_ preset: ProviderPreset) -> some View {
@@ -130,21 +131,19 @@ struct ProviderPresetPicker: View {
 }
 
 private extension View {
-    /// 预设卡片：悬停时换成控制背景并轻微强调描边，给出可点击的触感反馈。
+    /// 预设卡片：静息时是干净的 surface 表面，悬停时换成中性 hover 底并轻微提亮描边，
+    /// 给出可点击的触感反馈，同时保持与设置页其它卡片同一套语义色和圆角。
     func cardChrome(isHovered: Bool) -> some View {
-        self
+        let shape = RoundedRectangle(cornerRadius: AppDesign.Radius.inset, style: .continuous)
+        return self
             .frame(maxWidth: .infinity)
             .padding(.vertical, 14)
-            .background(
-                isHovered ? Color(nsColor: .controlBackgroundColor) : Color(nsColor: .textBackgroundColor),
-                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-            )
+            .background(isHovered ? AppDesign.hover : AppDesign.surface, in: shape)
             .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(isHovered ? Color.accentColor.opacity(0.45) : Color.primary.opacity(0.12),
-                                  lineWidth: 1)
+                shape.strokeBorder(isHovered ? AppDesign.brand.opacity(0.45) : AppDesign.border,
+                                   lineWidth: 1)
             )
-            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .contentShape(shape)
             .animation(.easeInOut(duration: 0.12), value: isHovered)
     }
 }

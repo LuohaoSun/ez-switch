@@ -57,7 +57,10 @@ private final class AppWindowCoordinator {
             return
         }
 
-        let hosting = NSHostingController(rootView: SettingsView(store: store, nav: settingsNav))
+        // 隔离预览探针只挂在设置窗口；活动/日志窗口不参与预览尺寸调整。
+        let rootView = SettingsView(store: store, nav: settingsNav)
+            .background(PreviewAppearanceProbe().frame(width: 0, height: 0))
+        let hosting = NSHostingController(rootView: rootView)
         let window = NSWindow(contentViewController: hosting)
         window.title = AppBrand.name
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
@@ -122,7 +125,9 @@ struct RouterApp: App {
 
         if #available(macOS 15, *) {
             Window(AppBrand.name, id: "settings") {
+                // 隔离预览探针只挂在设置窗口；活动/日志窗口不参与预览尺寸调整。
                 SettingsView(store: store, nav: AppWindowCoordinator.shared.settingsNav)
+                    .background(PreviewAppearanceProbe().frame(width: 0, height: 0))
             }
             .defaultSize(width: 1120, height: 760)
             .windowResizability(.contentMinSize)
