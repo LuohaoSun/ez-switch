@@ -34,7 +34,8 @@ enum PerformanceSource: Sendable, Equatable {
 ///   at most once, never per choice/field/token). Persisted/shown, so it is never
 ///   capped.
 ///
-/// Valid semantic content: Chat `content` / `reasoning_content` / non-empty
+/// Valid semantic content: Chat `content` / `reasoning_content` / `reasoning` /
+/// `thinking` / non-empty
 /// `tool_calls[].function.arguments`; Responses `output_text`, `reasoning_text`,
 /// `reasoning_summary_text`, `function_call_arguments` deltas; Anthropic
 /// `content_block_delta` with `text_delta` / `thinking_delta` / `input_json_delta`;
@@ -239,6 +240,11 @@ struct PerformanceParser {
             guard let delta = choice["delta"] as? [String: Any] else { continue }
             if PerformanceParser.hasText(delta["content"]) { return true }
             if PerformanceParser.hasText(delta["reasoning_content"]) { return true }
+            // DeepSeek 官方用 `reasoning_content`，但 vLLM / SGLang 等 OpenAI 兼容网关
+            // （含公司内网）把思考流放在 `reasoning`，部分网关用 `thinking`。漏认这些字段
+            // 会把整段思考当成「还没输出」，TTFT 变成思考结束时刻，生成窗口只剩正文阶段。
+            if PerformanceParser.hasText(delta["reasoning"]) { return true }
+            if PerformanceParser.hasText(delta["thinking"]) { return true }
             guard let calls = delta["tool_calls"] as? [[String: Any]] else { continue }
             for call in calls {
                 // A first tool event often carries only id/name; only a non-empty
