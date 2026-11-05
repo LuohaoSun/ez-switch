@@ -85,6 +85,34 @@ struct PerformanceParserTests {
         #expect(p.outputDeltaCount == 1)
     }
 
+    /// vLLM / SGLang 风格的网关把思考流放在 `delta.reasoning`（不是 DeepSeek 官方的
+    /// `reasoning_content`）。这些增量必须算作首输出，否则十分钟的思考会被当成静默，
+    /// TTFT 变成思考结束时刻、生成窗口只剩正文。
+    @Test func chatReasoningFieldStartsTheClock() {
+        var p = parser(.chat)
+        p.ingest(sse(#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#), at: at(2_000_000))
+        p.ingest(sse(#"{"choices":[{"delta":{"reasoning":"先想"}}]}"#), at: at(10_000_000))
+        p.ingest(sse(#"{"choices":[{"delta":{"reasoning":"再想"}}]}"#), at: at(600_000_000))
+        p.ingest(sse(#"{"choices":[{"delta":{"content":"答案"}}]}"#), at: at(610_000_000))
+        p.finish(at: at(620_000_000))
+
+        let perf = p.makePerformance()
+        #expect(perf.outputDeltaCount == 3)              // 两个思考事件 + 一个正文事件
+        #expect(approx(perf.ttftMS, 9))                  // 10ms - 1ms 尝试起点
+        #expect(approx(perf.generationMS, 610))          // 620ms - 10ms，覆盖整个思考期
+    }
+
+    /// `thinking` 字段同理；非字符串（如布尔开关）不得当成输出。
+    @Test func chatThinkingFieldCountsButNonStringValuesDoNot() {
+        var p = parser(.chat)
+        p.ingest(sse(#"{"choices":[{"delta":{"thinking":true}}]}"#), at: at(2_000_000))
+        p.ingest(sse(#"{"choices":[{"delta":{"thinking":"想"}}]}"#), at: at(3_000_000))
+        p.finish(at: at(4_000_000))
+        let perf = p.makePerformance()
+        #expect(perf.outputDeltaCount == 1)
+        #expect(approx(perf.ttftMS, 2))
+    }
+
     // MARK: - Responses
 
     @Test func responsesDeltaTypesRecognisedAndCreatedExcluded() {
