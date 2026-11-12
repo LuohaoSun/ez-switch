@@ -360,7 +360,7 @@ struct ActivityViewModelTests {
         let narrow = ActivityColumns(width: 420)
         #expect(narrow.apiWidth > 0)
         #expect(narrow.routeWidth > 0)
-        #expect(narrow.upstreamMinWidth > 0)
+        #expect(narrow.upstreamWidth > 0)
         #expect(!narrow.showTime)
         #expect(!narrow.showElapsed)
         #expect(!narrow.showTTFT)
@@ -386,14 +386,60 @@ struct ActivityViewModelTests {
         #expect(wide.tpsIncludingWidth > 0)
         #expect(wide.apiWidth >= narrow.apiWidth)
         #expect(wide.routeWidth >= narrow.routeWidth)
-        #expect(wide.upstreamMinWidth >= narrow.upstreamMinWidth)
+        #expect(wide.upstreamWidth >= narrow.upstreamWidth)
 
-        // 路由列定宽：更宽的窗口只把多余空间给上游模型，不把路由列撑大。
+        // 时间 / API / 路由是短标签，保持定宽：更宽的窗口不把它们撑大。
         let extraWide = ActivityColumns(width: 1400)
         #expect(extraWide.routeWidth == wide.routeWidth)
-        #expect(narrow.attemptsWidth > 0)
-        #expect(wide.attemptsWidth >= narrow.attemptsWidth)
+        #expect(extraWide.apiWidth == wide.apiWidth)
     }
+
+    /// 剩余宽度按权重摊给能吃的列，不让「上游模型」一列独吞：
+    /// 宽窗口下上游模型仍是最宽的一列，但不再是「吃掉全部剩宽、右侧数字列挤成一条」。
+    @Test("宽窗口下剩余宽度按权重分配，上游模型不独吞")
+    func columnsShareSurplusByWeight() {
+        let wide = ActivityColumns(width: 1400)
+        #expect(wide.upstreamWidth > wide.tokenWidth)
+        #expect(wide.upstreamWidth > wide.statusWidth)
+        #expect(wide.upstreamWidth > wide.ttftWidth)
+        // 数字列随窗口一起变宽，而不是固定在最小宽度上。
+        let normal = ActivityColumns(width: 900)
+        #expect(wide.tokenWidth > normal.tokenWidth)
+        #expect(wide.ttftWidth >= normal.ttftWidth)
+        // 输入 / 输出共用同一宽度，两列数值才对得齐。
+        #expect(wide.tokenWidth == ActivityColumns(width: 1400).tokenWidth)
+    }
+
+    /// 所有列宽 + 间隔 + leading 不能超过可用宽度：否则列会被 SwiftUI 二次压缩，
+    /// 表头与行又会错位（这正是之前「滚动条吃掉宽度就错位」的根因）。
+    /// 极宽窗口下允许右侧留白（各列触顶后不再伸展），但不能溢出。
+    @Test("各档窗口下总列宽不超可用宽度")
+    func columnsFitAvailableWidth() {
+        for width: CGFloat in [420, 600, 720, 820, 900, 960, 1000, 1120, 1400, 1920] {
+            let c = ActivityColumns(width: width)
+            let views = 2 + (c.showTime ? 1 : 0)
+                + (c.showTTFT ? 1 : 0) + (c.showElapsed ? 1 : 0) + (c.showTPS ? 1 : 0)
+            var total = c.leading + c.apiWidth + c.routeWidth + c.upstreamWidth
+                + c.statusWidth + c.tokenWidth * 2
+                + c.ttftWidth + c.elapsedWidth + c.tpsIncludingWidth + c.timeWidth
+            total += CGFloat(views - 1) * c.spacing
+            #expect(total <= width + 0.5, "宽 \(width) 时总列宽 \(total) 溢出")
+        }
+    }
+
+    /// 数字列触顶后不再变宽：宽窗口的余量归上游模型，避免右侧数字列被拉成一条散开的空档。
+    @Test("数字列有上限，宽窗口余量归上游模型")
+    func numericColumnsAreCapped() {
+        let wide = ActivityColumns(width: 1400)
+        let extraWide = ActivityColumns(width: 1920)
+        #expect(wide.tokenWidth <= 84.5)
+        #expect(extraWide.tokenWidth <= 84.5)
+        #expect(extraWide.ttftWidth <= 84.5)
+        #expect(extraWide.statusWidth <= 96.5)
+        #expect(extraWide.tpsIncludingWidth <= 104.5)
+        #expect(extraWide.upstreamWidth <= 512.5)
+    }
+
 
     // MARK: - 请求级性能明细
 

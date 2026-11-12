@@ -1,8 +1,11 @@
 import SwiftUI
 
 /// 请求表的列宽：按可用宽度自适应，窄窗口先隐藏 TPS，再隐藏 TTFT、耗时、时间。
-/// 「API 类型」「路由」「上游模型」各自独立成列，窄窗口也不合并；
-/// 路由名通常很短，用定宽避免把整段剩余宽度都吃掉，多余空间全部让给上游模型。
+/// 「API 类型」「路由」「上游模型」各自独立成列，窄窗口也不合并。
+///
+/// 剩余宽度的分配：不再让「上游模型」一列独吞（宽窗口会出现中间大片留白、
+/// 右侧数字列反而挤在边上），而是按权重摊给真正能吃宽度的列——上游模型 3.5、
+/// 状态 1.2、TPS 1.2、输入/输出/TTFT/耗时各 1。时间/API/路由是短标签，定宽不参与伸展。
 struct ActivityColumns {
     let showTime: Bool
     let showElapsed: Bool
@@ -14,9 +17,9 @@ struct ActivityColumns {
     let timeWidth: CGFloat
     let apiWidth: CGFloat
     let routeWidth: CGFloat
-    let upstreamMinWidth: CGFloat
+    let upstreamWidth: CGFloat
     let statusWidth: CGFloat
-    let attemptsWidth: CGFloat
+    /// 输入、输出共用同一宽度，两列数值起点才对得齐。
     let tokenWidth: CGFloat
     let elapsedWidth: CGFloat
     let ttftWidth: CGFloat
@@ -26,24 +29,78 @@ struct ActivityColumns {
     init(width: CGFloat) {
         let w = max(width, 320)
         let narrow = w < 600
-        self.spacing = narrow ? 6 : 8
+        self.spacing = narrow ? 6 : (w >= 1080 ? 12 : 9)
         self.leading = 22
         self.showTime = w >= 720
         self.showElapsed = w >= 820
         // TTFT 只有数字、宽度可控，和「耗时」同档出现；TPS 更宽，等窗口再大一些才加。
         self.showTTFT = w >= 820
         self.showTPS = w >= 960
-        self.timeWidth = self.showTime ? 58 : 0
-        self.elapsedWidth = self.showElapsed ? 56 : 0
-        self.ttftWidth = self.showTTFT ? 58 : 0
-        self.tpsIncludingWidth = self.showTPS ? 84 : 0
-        self.apiWidth = narrow ? 60 : 68
-        self.statusWidth = narrow ? 66 : 74
-        self.attemptsWidth = narrow ? 44 : 52
-        self.tokenWidth = narrow ? 48 : 54
-        // 路由定宽（长名字中间截断、悬停看全称）；上游模型列吃掉剩余宽度，且有下限。
-        self.routeWidth = narrow ? 64 : 96
-        self.upstreamMinWidth = narrow ? 72 : 96
+
+        // 起始宽度只保证内容放得下；多余宽度按下面的权重分配。
+        let timeBase: CGFloat = 56
+        let apiBase: CGFloat = narrow ? 60 : 66
+        let routeBase: CGFloat = narrow ? 64 : 92
+        let upstreamBase: CGFloat = narrow ? 72 : 104
+        let statusBase: CGFloat = narrow ? 62 : 70
+        let tokenBase: CGFloat = narrow ? 44 : 50
+        let ttftBase: CGFloat = narrow ? 48 : 52
+        let elapsedBase: CGFloat = narrow ? 46 : 52
+        let tpsBase: CGFloat = 60
+
+        // 参与伸展的列：起始宽度只保证内容放得下，多余宽度按权重摊分。
+        // 每一列都有上限——宽窗口下让列无限变宽只是把内容拉散，
+        // 极端宽的窗口宁可右侧留白，也不拉出一条空荡荡的长行。
+        var slots: [(base: CGFloat, weight: CGFloat, cap: CGFloat?)] = [
+            (upstreamBase, 3.5, 512),
+            (statusBase, 1.2, 96),
+            (tokenBase, 1, 84),
+            (tokenBase, 1, 84),
+        ]
+        if self.showTTFT { slots.append((ttftBase, 1, 84)) }
+        if self.showElapsed { slots.append((elapsedBase, 1, 84)) }
+        if self.showTPS { slots.append((tpsBase, 1.2, 104)) }
+
+        // HStack：leading + 各数据列一共 views 个视图，间隔就是 views-1 段。
+        let views = 1 + (self.showTime ? 1 : 0) + 2 + slots.count
+        let gapsWidth = CGFloat(views - 1) * self.spacing
+        let baseSum = apiBase + routeBase + (self.showTime ? timeBase : 0)
+            + slots.reduce(0) { $0 + $1.base }
+        var granted = slots.map(\.base)
+        var leftover = max(0, w - self.leading - gapsWidth - baseSum)
+        // 按权重的比例加水，触顶的列把余量让给还没触顶的列；上游模型无上限，最终兜住全部余量。
+        for _ in 0..<4 {
+            guard leftover > 0.5 else { break }
+            let open = slots.indices.filter { i in
+                guard let cap = slots[i].cap else { return true }
+                return granted[i] < cap - 0.5
+            }
+            let weightSum = open.reduce(CGFloat(0)) { $0 + slots[$1].weight }
+            guard weightSum > 0 else { break }
+            let unit = leftover / weightSum
+            var used: CGFloat = 0
+            for i in open {
+                let want = slots[i].weight * unit
+                let room = slots[i].cap.map { max(0, $0 - granted[i]) } ?? want
+                let add = min(want, room)
+                granted[i] += add
+                used += add
+            }
+            leftover -= used
+        }
+
+        self.upstreamWidth = granted[0]
+        self.statusWidth = granted[1]
+        self.tokenWidth = granted[2]
+        var index = 4
+        self.ttftWidth = self.showTTFT ? granted[index] : 0
+        if self.showTTFT { index += 1 }
+        self.elapsedWidth = self.showElapsed ? granted[index] : 0
+        if self.showElapsed { index += 1 }
+        self.tpsIncludingWidth = self.showTPS ? granted[index] : 0
+        self.timeWidth = self.showTime ? timeBase : 0
+        self.apiWidth = apiBase
+        self.routeWidth = routeBase
     }
 }
 
@@ -72,24 +129,19 @@ struct ActivityListHeader: View {
                 .frame(width: columns.routeWidth, alignment: .leading)
             Text("上游模型")
                 .lineLimit(1)
-                .frame(minWidth: columns.upstreamMinWidth, maxWidth: .infinity, alignment: .leading)
+                .frame(width: columns.upstreamWidth, alignment: .leading)
             Text("状态").frame(width: columns.statusWidth, alignment: .leading)
-            Text("尝试")
-                .lineLimit(1)
-                .frame(width: columns.attemptsWidth, alignment: .leading)
-                .help("尝试序号：显示第 N/M 次尝试；已回退的旧尝试会保留为独立条目。")
-                .accessibilityLabel("尝试序号")
             Text("输入").frame(width: columns.tokenWidth, alignment: .trailing)
             Text("输出").frame(width: columns.tokenWidth, alignment: .trailing)
-            if columns.showElapsed {
-                Text("耗时").frame(width: columns.elapsedWidth, alignment: .trailing)
-            }
             if columns.showTTFT {
                 Text("TTFT")
                     .lineLimit(1)
                     .frame(width: columns.ttftWidth, alignment: .trailing)
                     .help("\(ActivityPerformanceHelp.ttft)\n\(ActivityPerformanceHelp.validity)")
                     .accessibilityLabel("TTFT（首字等待）")
+            }
+            if columns.showElapsed {
+                Text("耗时").frame(width: columns.elapsedWidth, alignment: .trailing)
             }
             if columns.showTPS {
                 Text("TPS 含 TTFT")
@@ -173,22 +225,7 @@ struct ActivityRequestRow: View {
                 .padding(.vertical, 2)
                 .background(row.tone.color.opacity(0.12), in: Capsule())
                 .frame(width: columns.statusWidth, alignment: .leading)
-
-            Group {
-                if let progress = row.attemptProgressText {
-                    Text(progress)
-                        .font(ActivityTypeScale.compactNumber).monospacedDigit()
-                        .foregroundStyle(row.phase == .fallenBack ? ActivityPalette.warn : Color.secondary)
-                        .help("第 \(row.attemptIndex)/\(row.attemptCount) 次尝试；同一请求的尝试按时间倒序排列。")
-                        .accessibilityLabel("第 \(row.attemptIndex) 次，共 \(row.attemptCount) 次尝试")
-                } else {
-                    Text("—")
-                        .font(ActivityTypeScale.compactNumber)
-                        .foregroundStyle(.tertiary)
-                        .accessibilityHidden(true)
-                }
-            }
-            .frame(width: columns.attemptsWidth, alignment: .leading)
+                .help(statusHelp)
 
             Text(ActivityFormat.tokenCell(row.tokens.input))
                 .font(ActivityTypeScale.tokenNumber).monospacedDigit()
@@ -197,13 +234,6 @@ struct ActivityRequestRow: View {
                 .font(ActivityTypeScale.tokenNumber).monospacedDigit()
                 .frame(width: columns.tokenWidth, alignment: .trailing)
 
-            if columns.showElapsed {
-                Text(row.durationText)
-                    .font(ActivityTypeScale.number).monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(width: columns.elapsedWidth, alignment: .trailing)
-            }
-
             if columns.showTTFT {
                 Text(row.ttftText)
                     .font(ActivityTypeScale.number).monospacedDigit()
@@ -211,6 +241,13 @@ struct ActivityRequestRow: View {
                     .frame(width: columns.ttftWidth, alignment: .trailing)
                     .help("\(ActivityPerformanceHelp.ttft)\n当前：\(row.ttftText)\n\(ActivityPerformanceHelp.validity)")
                     .accessibilityLabel("TTFT（首字等待） \(row.ttftText)")
+            }
+
+            if columns.showElapsed {
+                Text(row.durationText)
+                    .font(ActivityTypeScale.number).monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: columns.elapsedWidth, alignment: .trailing)
             }
             if columns.showTPS {
                 Text(row.tpsIncludingTTFTText)
@@ -227,6 +264,13 @@ struct ActivityRequestRow: View {
         .onTapGesture {
             withAnimation(.easeInOut(duration: 0.12)) { onToggleExpand() }
         }
+    }
+
+    /// 状态胶囊的悬停说明。多次尝试时在这里补出尝试序号——表格不再单列「尝试」，
+    /// 但回退了几次仍然看得到（明细、复制文本里也有）。
+    private var statusHelp: String {
+        guard row.attemptCount > 1 else { return row.statusText }
+        return "\(row.statusText) · 第 \(row.attemptIndex)/\(row.attemptCount) 次尝试"
     }
 
     private var apiCell: some View {
@@ -253,7 +297,7 @@ struct ActivityRequestRow: View {
                     .lineLimit(1)
             }
         }
-        .frame(minWidth: columns.upstreamMinWidth, maxWidth: .infinity, alignment: .leading)
+        .frame(width: columns.upstreamWidth, alignment: .leading)
         .help(row.identityModelText)
     }
 

@@ -62,6 +62,10 @@ struct UsageTotals: Sendable {
     var inputAttempts: Int = 0
     var outputAttempts: Int = 0
     var cachedInputAttempts: Int = 0
+    /// 只统计「上报了缓存用量」的那些尝试的输入之和。
+    /// 命中率分母必须用它：没上报缓存的供应商（如公司内网）输入再大，
+    /// 也不能拉低一个它根本没有参与统计的比值。
+    var cacheReportedInput: Int = 0
     var failedAttempts: Int = 0
     var total: Int { usageTotal(input, output) }
     var coverage: Double { attempts == 0 ? 0 : Double(knownAttempts) / Double(attempts) }

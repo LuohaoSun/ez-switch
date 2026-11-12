@@ -445,14 +445,15 @@ struct MenuUsageSummaryTests {
         #expect(summary.cacheRate == nil)
         #expect(summary.menuTitle.contains("缓存率 —"))
 
-        // 补一条上报缓存命中的记录：输入 30、缓存 6 → 20%。
+        // 补一条上报缓存命中的记录：输入 20、缓存 6 → 30%。
+        // 之前那条没上报缓存的 10 个输入不进分母，避免稀释命中率。
         store.record(UsageRecord(requestID: UUID(), timestamp: Date(), routeID: "r1", routeName: "R1",
                                  remoteID: "m1", provider: "OpenAI", model: "gpt-4o", endpoint: "chat",
                                  attempt: 1, status: 200, outcome: "success", durationMS: 5,
                                  tokens: UsageTokens(input: 20, output: 5, cachedInput: 6)))
         try await store.flush()
         #expect(await waitUntil { summary.todayTokens == 40 })
-        #expect(summary.cacheRate == 6.0 / 30.0)
-        #expect(summary.menuTitle.contains("缓存率 20.0%"))
+        #expect(summary.cacheRate == 6.0 / 20.0)
+        #expect(summary.menuTitle.contains("缓存率 30.0%"))
     }
 }

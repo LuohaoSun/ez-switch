@@ -137,7 +137,9 @@ struct LogWindowView: View {
         }
     }
 
-    /// 请求卡：标题与表头固定，只有数据行在卡内滚动。
+    /// 请求卡：标题固定，表头钉在滚动区顶部。
+    /// 表头必须和数据行待在同一个 `ScrollView` 里：滚动条会吃掉内容宽度，
+    /// 表头若留在外面就会比行宽，「上游模型」这个弹性列一压缩，它右边的列集体左移。
     private func requestTable(columns: ActivityColumns) -> some View {
         VStack(spacing: 0) {
             listHeader
@@ -145,21 +147,25 @@ struct LogWindowView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 6)
 
-            ActivityListHeader(columns: columns)
-            Divider()
-
             ScrollView {
-                LazyVStack(spacing: 0) {
-                    if model.visibleRows.isEmpty {
-                        emptyState
-                    } else {
-                        ForEach(model.visibleRows) { row in
-                            ActivityRequestRow(row: row, columns: columns,
-                                               accent: model.color(for: row.groupID),
-                                               isHighlighted: model.isRowHighlighted(row),
-                                               isExpanded: model.isExpanded(row.id),
-                                               onToggleExpand: { model.toggleExpanded(row.id) })
-                            Divider().opacity(0.65)
+                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    Section {
+                        if model.visibleRows.isEmpty {
+                            emptyState
+                        } else {
+                            ForEach(model.visibleRows) { row in
+                                ActivityRequestRow(row: row, columns: columns,
+                                                   accent: model.color(for: row.groupID),
+                                                   isHighlighted: model.isRowHighlighted(row),
+                                                   isExpanded: model.isExpanded(row.id),
+                                                   onToggleExpand: { model.toggleExpanded(row.id) })
+                                Divider().opacity(0.65)
+                            }
+                        }
+                    } header: {
+                        VStack(spacing: 0) {
+                            ActivityListHeader(columns: columns)
+                            Divider()
                         }
                     }
                 }

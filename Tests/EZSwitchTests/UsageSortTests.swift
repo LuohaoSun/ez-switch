@@ -23,6 +23,8 @@ struct UsageSortTests {
         totals.outputAttempts = outputAttempts
         totals.cachedInput = cached
         totals.cachedInputAttempts = cachedAttempts
+        // 缓存率分母只算上报了缓存的输入；夹具默认「上报了就全覆盖」。
+        totals.cacheReportedInput = cachedAttempts > 0 ? input : 0
         return UsageGroupRow(id: title, title: title, subtitle: "", totals: totals)
     }
 

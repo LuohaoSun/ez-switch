@@ -627,11 +627,35 @@ struct UsageSelectionTests {
         model.preset = .last7Days
         await model.refresh(store: store)
 
-        // 缓存 100 / 输入 400 = 25%；两条记录里只有一条上报了缓存 → 部分上报。
-        #expect(model.cacheHitRate == 0.25)
-        #expect(UsageFormat.cacheRateText(model.cacheHitRate) == "25.0%")
+        // 分母只算上报了缓存的那 300：(300, 100) → 33.3%；400 里的 100 不进分母。
+        #expect(model.cacheHitRate.map { abs($0 - 1.0 / 3.0) < 0.0001 } == true)
+        #expect(UsageFormat.cacheRateText(model.cacheHitRate) == "33.3%")
         #expect(model.cacheRateIsPartial)
-        #expect(model.cacheRateCaption == "部分上报")
+        #expect(model.cacheRateCaption == "覆盖 75% 输入")
+        #expect(model.cacheRateHelp.contains("不计入分母"))
+    }
+
+    /// 上游完全不上报缓存的流量不能稀释命中率：公司内网只给 input，
+    /// 它的输入必须被排除在分母之外，否则整体命中率会被拉到 40% 出头。
+    @Test func unreportedUpstreamDoesNotDiluteCacheRate() async throws {
+        let url = try makeDatabaseURL()
+        defer { cleanup(url) }
+        let store = UsageStore(url: url)
+        // 公司内网：大量输入，从不报缓存。
+        store.record(record(timestamp: localMidnight(daysAgo: 1).addingTimeInterval(10 * 3600),
+                            routeID: "r_intra", routeName: "内网", input: 900_000, output: 1_000, cached: nil))
+        // 正常供应商：输入小但报了缓存。
+        store.record(record(timestamp: localMidnight(daysAgo: 1).addingTimeInterval(11 * 3600),
+                            routeID: "r_open", routeName: "外部", input: 100_000, output: 1_000, cached: 98_000))
+        try await store.flush()
+
+        let model = UsageViewModel(section: .usage)
+        model.preset = .last7Days
+        await model.refresh(store: store)
+
+        // 旧口径会算成 98,000 / 1,000,000 = 9.8%；正确口径是 98,000 / 100,000 = 98%。
+        #expect(UsageFormat.cacheRateText(model.cacheHitRate) == "98.0%")
+        #expect(model.cacheRateCaption == "覆盖 10% 输入")
     }
 
     @Test func explicitZeroCachedCountsAsZeroNotAsMissing() async throws {
@@ -665,7 +689,8 @@ struct UsageSelectionTests {
         let model = UsageViewModel(section: .usage)
         model.preset = .last7Days
         await model.refresh(store: store)
-        #expect(model.cacheHitRate == 0.45)
+        // 分母只取上报了缓存的那 900：450/900 = 50%。
+        #expect(model.cacheHitRate == 0.5)
 
         let point = try #require(model.snapshot.days.first { $0.input == 100 })
         model.toggleSelection(at: point.date, points: model.snapshot.days, unit: .day,
