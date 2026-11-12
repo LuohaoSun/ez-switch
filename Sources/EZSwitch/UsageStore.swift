@@ -942,6 +942,8 @@ final class UsageStore: @unchecked Sendable {
         totals.inputAttempts = Int(sqlite3_column_int64(statement, offset + 9))
         totals.outputAttempts = Int(sqlite3_column_int64(statement, offset + 10))
         totals.cachedInputAttempts = Int(sqlite3_column_int64(statement, offset + 11))
+        // 命中率的分母：只累计上报了缓存用量的那些尝试的输入。
+        totals.cacheReportedInput = Int(sqlite3_column_int64(statement, offset + 12))
         return totals
     }
 
@@ -969,7 +971,8 @@ final class UsageStore: @unchecked Sendable {
              COALESCE(SUM(CASE WHEN \(successPredicate) THEN 0 ELSE 1 END), 0),
              COUNT(input_tokens),
              COUNT(output_tokens),
-             COUNT(cached_input_tokens)
+             COUNT(cached_input_tokens),
+             COALESCE(SUM(CASE WHEN cached_input_tokens IS NOT NULL THEN input_tokens ELSE 0 END), 0)
     """
 
     private static let schemaSQL = """

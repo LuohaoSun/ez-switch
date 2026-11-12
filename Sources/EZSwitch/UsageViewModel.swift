@@ -209,6 +209,13 @@ enum UsageFormat {
         guard let rate, rate.isFinite else { return "—" }
         return String(format: "%.1f%%", rate * 100)
     }
+
+    /// 覆盖率一类的小比例：整数百分比，方便塞进卡片副标题。
+    static func percentCompact(_ value: Double) -> String {
+        guard value.isFinite else { return "—" }
+        let pct = min(max(value, 0), 1) * 100
+        return pct >= 10 ? String(format: "%.0f%%", pct) : String(format: "%.1f%%", pct)
+    }
 }
 
 // MARK: - 页面状态
@@ -218,24 +225,33 @@ enum UsageFormat {
 /// 上报计数为 0 表示该列没有任何记录上报过，区别于「明确上报为 0」；
 /// 因此缺项一律按未知处理（`nil` → 显示「—」），不粉饰成精确的 0%。
 enum UsageCacheRate {
-    /// 命中率（0...1）；nil = 未知（没上报输入 / 没上报缓存 / 输入为 0）。
+    /// 命中率（0...1）；nil = 未知（没人上报缓存 / 上报了缓存的尝试没有输入 / 分母为 0）。
+    ///
+    /// 分母是「上报了缓存的那些尝试的输入之和」，不是全部输入：没上报缓存的供应商
+    /// （例如公司内网只给 input，`prompt_tokens_details` 恒为 null）根本不在这个比值里，
+    /// 把它们的输入算进分母会凭空拉低命中率。
     static func value(for totals: UsageTotals) -> Double? {
-        UsageFormat.cacheRate(input: totals.inputAttempts > 0 ? totals.input : nil,
+        UsageFormat.cacheRate(input: totals.cacheReportedInput > 0 ? totals.cacheReportedInput : nil,
                               cachedInput: totals.cachedInputAttempts > 0 ? totals.cachedInput : nil)
     }
 
     /// 命中率不可知的原因；nil 表示命中率已知。
     static func unknownReason(for totals: UsageTotals) -> String? {
-        if totals.inputAttempts == 0 { return "上游未上报输入用量" }
         if totals.cachedInputAttempts == 0 { return "上游未上报缓存用量" }
-        if totals.input <= 0 { return "区间内没有输入 token" }
+        if totals.cacheReportedInput <= 0 { return "上报缓存的尝试没有输入 token" }
         return nil
     }
 
-    /// 缓存上报覆盖不足：只有部分尝试上报了缓存用量。
+    /// 缓存上报覆盖不全：有上报缓存的尝试，也有没上报的。
     /// 此时比值只按已上报部分计算，不代表全部请求的真实命中率。
     static func isPartial(for totals: UsageTotals) -> Bool {
-        totals.cachedInputAttempts > 0 && totals.cachedInputAttempts < totals.inputAttempts
+        totals.cacheReportedInput > 0 && totals.cacheReportedInput < totals.input
+    }
+
+    /// 已上报缓存的输入占全部输入的比例（0...1）；没有输入时为 nil。
+    static func coverage(for totals: UsageTotals) -> Double? {
+        guard totals.input > 0 else { return nil }
+        return Double(totals.cacheReportedInput) / Double(totals.input)
     }
 }
 
@@ -604,31 +620,36 @@ final class UsageViewModel: ObservableObject {
 
     var scopedTotals: UsageTotals { scopedSnapshot?.totals ?? UsageTotals() }
 
-    /// 缓存命中率；nil = 未知（上游没上报输入/缓存，或输入为 0）。
+    /// 缓存命中率；nil = 未知（上游没上报缓存，或上报缓存的尝试没有输入）。
     var cacheHitRate: Double? { UsageCacheRate.value(for: scopedTotals) }
 
     var cacheRateUnknownReason: String? { UsageCacheRate.unknownReason(for: scopedTotals) }
 
     var cacheRateIsPartial: Bool { UsageCacheRate.isPartial(for: scopedTotals) }
 
+    /// 已上报缓存的输入占比；用于说明这个比值覆盖了多大的输入盘子。
+    var cacheRateCoverage: Double? { UsageCacheRate.coverage(for: scopedTotals) }
+
     var cacheRateCaption: String {
         let totals = scopedTotals
-        if totals.inputAttempts == 0 || totals.cachedInputAttempts == 0 { return "未上报" }
-        if totals.input <= 0 { return "无输入" }
-        return cacheRateIsPartial ? "部分上报" : "命中/输入"
+        if totals.cachedInputAttempts == 0 { return "未上报" }
+        if totals.cacheReportedInput <= 0 { return "无输入" }
+        guard cacheRateIsPartial, let coverage = cacheRateCoverage else { return "命中/输入" }
+        return "覆盖 \(UsageFormat.percentCompact(coverage)) 输入"
     }
 
-    /// 比值只按已上报部分计算，不声称是配对样本。
+    /// 分子分母都只取「上报了缓存」的那部分尝试，不声称覆盖全部流量。
     var cacheRateHelp: String {
         let totals = scopedTotals
-        var lines = ["缓存命中率 = 已上报缓存 token ÷ 已上报输入 token"]
+        var lines = ["缓存命中率 = 已上报缓存 token ÷ 上报了缓存的那些尝试的输入 token"]
         if let reason = cacheRateUnknownReason {
             lines.append("\(reason)，命中率未知")
             return lines.joined(separator: "\n")
         }
-        lines.append("已上报缓存 \(UsageFormat.exact(totals.cachedInput)) / 已上报输入 \(UsageFormat.exact(totals.input))")
-        if cacheRateIsPartial {
-            lines.append("仅 \(totals.cachedInputAttempts)/\(totals.inputAttempts) 次上游尝试上报了缓存用量，比值只按已上报部分计算")
+        lines.append("已上报缓存 \(UsageFormat.exact(totals.cachedInput)) / 已上报输入 \(UsageFormat.exact(totals.cacheReportedInput))")
+        if cacheRateIsPartial, let coverage = cacheRateCoverage {
+            let skipped = totals.input - totals.cacheReportedInput
+            lines.append("另有 \(UsageFormat.exact(skipped)) 输入来自未上报缓存的尝试（覆盖 \(UsageFormat.percentCompact(coverage))），不计入分母")
         }
         return lines.joined(separator: "\n")
     }

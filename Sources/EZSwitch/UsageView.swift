@@ -601,9 +601,11 @@ struct UsageView: View {
         if let reason = UsageCacheRate.unknownReason(for: totals) {
             return "\(reason)，缓存率未知"
         }
-        var text = "缓存率 = 已上报缓存 \(UsageFormat.exact(totals.cachedInput)) ÷ 已上报输入 \(UsageFormat.exact(totals.input))"
+        var text = "缓存率 = 已上报缓存 \(UsageFormat.exact(totals.cachedInput)) ÷ 上报了缓存的那些尝试的输入 \(UsageFormat.exact(totals.cacheReportedInput))"
         if UsageCacheRate.isPartial(for: totals) {
-            text += "\n仅 \(totals.cachedInputAttempts)/\(totals.inputAttempts) 次上游尝试上报了缓存用量，比值只按已上报部分计算"
+            let skipped = totals.input - totals.cacheReportedInput
+            let coverage = UsageCacheRate.coverage(for: totals).map(UsageFormat.percentCompact) ?? "—"
+            text += "\n另有 \(UsageFormat.exact(skipped)) 输入来自未上报缓存的尝试（覆盖 \(coverage)），不计入分母"
         }
         return text
     }

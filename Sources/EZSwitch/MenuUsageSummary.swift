@@ -89,15 +89,15 @@ final class MenuUsageSummary: ObservableObject {
         return "今日用量: \(UsageFormat.compact(tokens)) Tokens · 缓存率 \(UsageFormat.cacheRateText(cacheRate))"
     }
 
-    /// 菜单项的补充说明：缓存率是已上报字段之间的比值，各字段覆盖可能不同。
+    /// 菜单项的补充说明：缓存率只在「上报了缓存」的那部分尝试里计算。
     var menuHelp: String {
         var lines = ["打开用量统计，查看今日与本机历史 Token 用量",
-                     "缓存率 = 已上报的缓存命中输入 ÷ 已上报的输入 token"]
+                     "缓存率 = 已上报缓存命中输入 ÷ 上报了缓存的那些尝试的输入 token"]
         if cacheRate == nil {
-            lines.append("上游未上报缓存用量或输入为 0，缓存率显示 —")
+            lines.append("上游未上报缓存用量或上报缓存的尝试没有输入，缓存率显示 —")
         }
         if isCacheCoveragePartial {
-            lines.append("部分记录未上报缓存用量，缓存率为已上报部分的比率")
+            lines.append("部分记录未上报缓存用量，这些输入不计入分母")
         }
         if !isCompleteCoverage {
             lines.append("部分上游尝试未上报用量，各字段覆盖可能不同")
