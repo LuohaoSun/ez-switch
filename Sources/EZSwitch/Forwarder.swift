@@ -308,8 +308,8 @@ enum Forwarder {
     /// `requestStart`/`attemptStart` 为路由器侧的单调起点（记录在最终 record
     /// 时换算成 ttft/requestTTFT）；nil = 不测 TTFT。
     /// `extensionRegistry` 提供已注册的连接器定义；非原生 HTTP 来源一律经它转发。
-    /// `outboundPolicy` 只作用于真正上游：`.direct` 保留注入的 `session`，`.proxy` 取出站
-    /// 工厂的代理会话。连接器不受代理影响（不把代理会话用在本地 loopback 上）。
+    /// `outboundPolicy` 只作用于真正上游：`.direct` 保留注入的 `session`，`.system` / `.proxy`
+    /// 取出站工厂的会话。连接器不受代理影响（不把代理会话用在本地 loopback 上）。
     static func makeRequest(clientHead: HTTPRequestHead, body: Data,
                             endpoint: EndpointKind, remote: RemoteModel,
                             adapter: ProtocolAdapter = .passthrough,
@@ -440,12 +440,12 @@ enum Forwarder {
         return (try? JSONSerialization.data(withJSONObject: object)) ?? body
     }
 
-    /// `.direct` 保留注入会话（生产单例 / 测试 mock），`.proxy` 取出站工厂的代理会话。
+    /// `.direct` 保留注入会话（生产单例 / 测试 mock）；`.system` 与 `.proxy` 取出站工厂的会话。
     static func resolvedSession(for policy: OutboundPolicy, injected: URLSession) throws -> URLSession {
         switch policy {
         case .direct:
             return injected
-        case .proxy:
+        case .system, .proxy:
             return try OutboundTransport.session(for: policy)
         case .invalid(let reason):
             throw OutboundTransportError.invalidPolicy(reason)

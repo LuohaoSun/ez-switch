@@ -1,12 +1,11 @@
 import SwiftUI
 
-/// 出站代理扩展卡片：主开关在标题，展开体里是代理地址与走代理的来源名单。
+/// 出站代理扩展卡片：主开关在标题，展开体是当前系统代理状态与走代理的名单。
 struct ProxySettingsSection: View {
     @ObservedObject var store: ConfigStore
     @StateObject private var draft = ProxySettingsDraft()
 
     private var isEnabled: Bool { store.config.extensions.outboundProxy.enabled }
-    private var savedAddress: String { store.config.extensions.outboundProxy.address }
     private var selectedProviders: Set<String> { store.config.extensions.outboundProxy.providerNames }
     private var selectedConnectorSources: Set<String> {
         store.config.extensions.outboundProxy.connectorSources
@@ -22,14 +21,14 @@ struct ProxySettingsSection: View {
         ExtensionCard(
             title: "出站代理",
             systemImage: "network",
-            summary: "通过指定代理连接所选供应商。",
+            summary: "勾选的供应商走 macOS 系统代理；未勾选的严格直连。",
             isEnabled: Binding(
                 get: { isEnabled },
                 set: { draft.error = store.setOutboundProxyEnabled($0) }
             )
         ) {
             VStack(alignment: .leading, spacing: 14) {
-                addressField
+                systemProxyRow
                 nativeProviderList
                 connectorList
 
@@ -39,50 +38,40 @@ struct ProxySettingsSection: View {
 
                 footnotes
             }
+            .task { refreshSystemProxy() }
+            .onChange(of: isEnabled) { _ in refreshSystemProxy() }
         }
     }
 
-    // MARK: 代理地址
+    // MARK: 系统代理状态
 
-    private var addressField: some View {
+    private var systemProxyRow: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("代理地址")
+            Text("系统代理")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 8) {
-                TextField("代理地址", text: addressBinding,
-                          prompt: Text(verbatim: "http://127.0.0.1:7890"))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.body, design: .monospaced))
+                Text(SystemProxyDescription.text(draft.systemProxy))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
 
-                Button("保存") { saveAddress() }
-                    .disabled(!addressDirty)
+                Button {
+                    refreshSystemProxy()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("重新读取 macOS 系统代理设置")
+
+                Spacer(minLength: 0)
             }
         }
     }
 
-    /// 失焦不落盘：只有点「保存」才提交，草稿与已保存值不同才可点。
-    private var addressBinding: Binding<String> {
-        Binding(
-            get: { draft.addressDraft ?? savedAddress },
-            set: { draft.addressDraft = $0 }
-        )
-    }
-
-    private var addressDirty: Bool {
-        guard let value = draft.addressDraft else { return false }
-        return value != savedAddress
-    }
-
-    private func saveAddress() {
-        guard let value = draft.addressDraft else { return }
-        if let message = store.setOutboundProxyAddress(value) {
-            draft.error = message
-        } else {
-            draft.addressDraft = nil
-            draft.error = nil
-        }
+    private func refreshSystemProxy() {
+        draft.systemProxy = SystemProxy.current()
     }
 
     // MARK: 名单
@@ -159,10 +148,11 @@ struct ProxySettingsSection: View {
 
     private var footnotes: some View {
         VStack(alignment: .leading, spacing: 4) {
+            Text("跟随 macOS 系统设置（含 PAC 与例外列表）；系统代理未开启时直连，在系统设置里开关代理后新请求即时生效。")
+            Text("系统代理若要求账号密码，请求会失败并如实报错，不会偷偷直连。")
             if !connectors.isEmpty {
-                Text("修改代理会重启受影响的连接器组件，可能中断进行中的工具会话。")
+                Text("修改开关或名单会重启受影响的连接器组件，可能中断进行中的工具会话。")
             }
-            Text("暂不支持代理认证与 PAC。")
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -170,10 +160,32 @@ struct ProxySettingsSection: View {
     }
 }
 
-/// 代理卡片自身的可变 UI 状态（地址草稿、写入错误）。
+/// 系统代理快照的中文描述，供卡片状态行与测试复用。
+enum SystemProxyDescription {
+    static func text(_ snapshot: SystemProxySnapshot) -> String {
+        guard snapshot.isActive else { return "未开启，将直连" }
+        var parts: [String] = []
+        if let http = snapshot.http { parts.append("HTTP \(endpoint(http))") }
+        if let https = snapshot.https, https != snapshot.http { parts.append("HTTPS \(endpoint(https))") }
+        if let socks = snapshot.socks { parts.append("SOCKS \(endpoint(socks))") }
+        if let pac = snapshot.pacURL {
+            parts.append("PAC \(pac.host ?? pac.absoluteString)")
+        } else if snapshot.pacEnabled {
+            parts.append("PAC（地址不可读）")
+        }
+        if snapshot.autoDiscovery { parts.append("自动发现（WPAD）") }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func endpoint(_ value: SystemProxySnapshot.Endpoint) -> String {
+        "\(value.host):\(value.port)"
+    }
+}
+
+/// 代理卡片自身的可变 UI 状态（系统代理快照、写入错误）。
 @MainActor
 final class ProxySettingsDraft: ObservableObject {
-    @Published var addressDraft: String?
+    @Published var systemProxy = SystemProxySnapshot.empty
     @Published var error: String?
 }
 

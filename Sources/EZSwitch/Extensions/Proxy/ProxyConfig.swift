@@ -1,25 +1,26 @@
 import Foundation
 
 /// 出站代理扩展配置（opaque 扩展键 `outboundProxy`）。未识别字段原样保留。
+/// 走不走代理只由「总开关 + 名单」决定：被勾选的来源跟随 macOS 系统代理。
 /// 原生供应商按 providerName 选择、连接器按 source 标识选择（后者改名/未加供应商前都稳定）。
+///
+/// 旧版本的 `address` 字段已不再参与求值，会作为未识别字段原样保留在 `extra` 里。
 struct OutboundProxySettings: Codable, Equatable {
     var enabled: Bool = false
-    var address: String = ""
     var providerNames: Set<String> = []
     var connectorSources: Set<String> = []
     /// 未识别字段，原样保留。
     var extra: [String: ExtensionJSONValue] = [:]
 
-    init(enabled: Bool = false, address: String = "", providerNames: Set<String> = [],
+    init(enabled: Bool = false, providerNames: Set<String> = [],
          connectorSources: Set<String> = []) {
         self.enabled = enabled
-        self.address = address
         self.providerNames = providerNames
         self.connectorSources = connectorSources
     }
 
     private enum KnownKeys: String, CodingKey, CaseIterable {
-        case enabled, address, providerNames, connectorSources
+        case enabled, providerNames, connectorSources
     }
 
     private struct DynamicKey: CodingKey {
@@ -32,7 +33,6 @@ struct OutboundProxySettings: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: KnownKeys.self)
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-        address = try c.decodeIfPresent(String.self, forKey: .address) ?? ""
         providerNames = try c.decodeIfPresent(Set<String>.self, forKey: .providerNames) ?? []
         connectorSources = try c.decodeIfPresent(Set<String>.self, forKey: .connectorSources) ?? []
         let dynamic = try decoder.container(keyedBy: DynamicKey.self)
@@ -48,7 +48,6 @@ struct OutboundProxySettings: Codable, Equatable {
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: KnownKeys.self)
         try c.encode(enabled, forKey: .enabled)
-        try c.encode(address, forKey: .address)
         try c.encode(providerNames.sorted(), forKey: .providerNames)
         try c.encode(connectorSources.sorted(), forKey: .connectorSources)
         guard !extra.isEmpty else { return }
@@ -102,13 +101,13 @@ extension ConfigStore {
         return false
     }
 
-    /// 总开关。关闭恒允许，且是损坏节点的恢复操作；开启需节点可编辑且有有效地址。
+    /// 总开关。关闭恒允许，且是损坏节点的恢复操作；开启只要求节点可编辑（不再需要地址，
+    /// 勾选的来源一律跟随 macOS 系统代理）。
     @discardableResult
     func setOutboundProxyEnabled(_ enabled: Bool) -> String? {
         guard enabled else { return disableOutboundProxy() }
         guard !outboundProxyNodeIsCorrupt else { return Self.corruptProxyNodeError }
         var settings = config.extensions.outboundProxy
-        if let error = ProxyExtension.validate(settings.address) { return error }
         settings.enabled = true
         updateExtensions { $0.outboundProxy = settings }
         return nil
@@ -139,23 +138,6 @@ extension ConfigStore {
             updateExtensions { $0.setExtensionValue(recovered, for: key) }
             return nil
         }
-    }
-
-    /// 原子验证并保存地址。非法拒绝且不覆盖；空地址仅在关闭状态下允许清空。
-    /// 损坏节点拒绝写入并保留原始 JSON。
-    @discardableResult
-    func setOutboundProxyAddress(_ address: String) -> String? {
-        guard !outboundProxyNodeIsCorrupt else { return Self.corruptProxyNodeError }
-        let trimmed = address.trimmingCharacters(in: .whitespaces)
-        var settings = config.extensions.outboundProxy
-        if trimmed.isEmpty {
-            guard !settings.enabled else { return "启用状态下不能清空代理地址" }
-        } else if let error = ProxyExtension.validate(address) {
-            return error
-        }
-        settings.address = trimmed
-        updateExtensions { $0.outboundProxy = settings }
-        return nil
     }
 
     /// 勾选/取消原生供应商。取消恒允许；勾选要求该名字是现存原生供应商。

@@ -86,8 +86,9 @@ struct ExtensionRegistry: Sendable {
                      outboundPolicy: OutboundPolicy = .direct) async throws -> [String] {
         guard let definition = definitions[source] else { throw ConnectorUnavailable(source: source) }
         if case .invalid(let reason) = outboundPolicy { throw OutboundTransportError.invalidPolicy(reason) }
-        // 显式代理要求连接器声明支持且提供 policy 闭包，缺一即抛错，绝不静默降级直连。
-        if case .proxy = outboundPolicy,
+        // 需要走代理（显式或跟随系统）要求连接器声明支持且提供 policy 闭包，缺一即抛错，
+        // 绝不静默降级直连。
+        if outboundPolicy.requiresProxyCapability,
            !definition.supportsOutboundProxy || definition.fetchModelsWithPolicy == nil {
             throw ConnectorProxyUnsupported(source: source)
         }
@@ -98,11 +99,11 @@ struct ExtensionRegistry: Sendable {
 
     func forward(_ request: ConnectorRequest, source: RemoteSource) async throws -> UpstreamResponse {
         guard let definition = definitions[source] else { throw ConnectorUnavailable(source: source) }
-        // 后端兜底：显式代理要求支持，无效地址一律拒绝，避免连接器漏实现时静默直连。
+        // 后端兜底：需要走代理的连接器必须声明支持，无效策略一律拒绝，避免漏实现时静默直连。
         switch request.outboundPolicy {
         case .direct:
             break
-        case .proxy:
+        case .system, .proxy:
             guard definition.supportsOutboundProxy else { throw ConnectorProxyUnsupported(source: source) }
         case .invalid(let reason):
             throw OutboundTransportError.invalidPolicy(reason)

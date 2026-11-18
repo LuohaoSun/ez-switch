@@ -51,13 +51,6 @@ private final class RequestSpy: @unchecked Sendable {
     var requests: [URLRequest] { lock.lock(); defer { lock.unlock() }; return storage }
 }
 
-private final class FallbackSpy: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [AutoFallbackEvent] = []
-    func record(_ event: AutoFallbackEvent) { lock.lock(); storage.append(event); lock.unlock() }
-    var events: [AutoFallbackEvent] { lock.lock(); defer { lock.unlock() }; return storage }
-}
-
 private actor PolicyRecorder {
     private(set) var policies: [OutboundPolicy] = []
     func record(_ policy: OutboundPolicy) { policies.append(policy) }
@@ -226,87 +219,32 @@ struct ProxyRoutingTests {
         #expect(spy.requests.isEmpty)
     }
 
-    // MARK: RouterServer fallback (no implicit direct)
+    // MARK: system proxy policy
 
-    private func proxySettings(provider: String, address: String) -> ExtensionSettings {
-        var settings = ExtensionSettings()
-        settings.outboundProxy = OutboundProxySettings(enabled: true, address: address,
-                                                       providerNames: [provider])
-        return settings
+    /// 跟随系统代理的候选也用出站工厂会话：注入的直连 mock 不会被拿去发上游请求。
+    @Test func systemPolicyUsesFactorySessionInsteadOfInjected() throws {
+        let injected = URLSession(configuration: .ephemeral)
+        let resolved = try Forwarder.resolvedSession(for: .system, injected: injected)
+        #expect(resolved !== injected)
+        #expect(resolved === (try OutboundTransport.session(for: .system)))
     }
 
-    private func startServer(remotes: [RemoteModel], fake: FakeModel, settings: ExtensionSettings,
-                             upstream: URLSession, events: FallbackSpy?)
-        async throws -> (RouterServer, Int) {
-        let router = Router()
-        router.update(AppConfig(port: 0, remotes: remotes, fakes: [fake], extensions: settings))
-        let notifier: (@Sendable (AutoFallbackEvent) -> Void)? = events.map { spy in
-            { @Sendable (event: AutoFallbackEvent) in spy.record(event) }
-        }
-        let server = RouterServer(router: router, session: upstream, onAutoFallback: notifier)
-        try server.start(port: 0)
-        return (server, try #require(server.boundPort))
-    }
-
-    private func send(port: Int, path: String, body: String) async throws -> (Data, HTTPURLResponse) {
-        let config = URLSessionConfiguration.ephemeral
-        config.connectionProxyDictionary = [:]
-        let session = URLSession(configuration: config)
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.httpBody = Data(body.utf8)
-        let (data, response) = try await session.data(for: request)
-        return (data, try #require(response as? HTTPURLResponse))
-    }
-
-    /// 首选候选是 `.invalid` 代理：属后端错误 → 回退到下一个候选，绝不隐式直连首选。
-    @Test func invalidPolicyCandidateFallsBackWithoutImplicitDirect() async throws {
-        let a = apiRemote("A", "one", host: "a.test")
-        let b = apiRemote("B", "two", host: "b.test")
-        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
-                             remoteID: a.id, fallbackRemoteIDs: [b.id])
-        let spy = RequestSpy()
-        let events = FallbackSpy()
-        let injected = mockSession { request in
-            spy.store(request)
-            return .init(chunks: [Data(#"{"ok":true}"#.utf8)])
-        }
-        defer { ProxyRoutingURLProtocol.handler = nil }
-
-        let (server, port) = try await startServer(
-            remotes: [a, b], fake: fake,
-            settings: proxySettings(provider: "A", address: "http://127.0.0.1"),
-            upstream: injected, events: events)
-        defer { server.stop() }
-
-        let (_, response) = try await send(port: port, path: "/v1/chat/completions",
-                                           body: #"{"model":"main","stream":false}"#)
-        #expect(response.statusCode == 200)
-        // 注入的直连会话只被回退后的 B 使用；A 从未隐式直连。
-        #expect(spy.requests.count == 1)
-        #expect(spy.requests.first?.url?.host == "b.test")
-        #expect(events.events.first?.from == "A · one")
-        #expect(events.events.first?.to == "B · two")
-    }
-
-    /// 唯一候选是 `.invalid` 代理：后端错误应为 502（可回退语义），而不是客户端 400。
-    @Test func invalidProxyLastCandidateReturnsBackend502NotClient400() async throws {
-        let a = apiRemote("A", "one", host: "a.test")
-        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main", remoteID: a.id)
+    /// `.system` 交给连接器时同样保持非直连语义，连接器自带本地通道不受影响。
+    @Test func connectorReceivesSystemPolicyAndKeepsOwnTransport() async throws {
+        let recorder = PolicyRecorder()
+        let registry = connectorRegistry(recorder: recorder)
         let spy = RequestSpy()
         let injected = mockSession { request in spy.store(request); return .init() }
         defer { ProxyRoutingURLProtocol.handler = nil }
 
-        let (server, port) = try await startServer(
-            remotes: [a], fake: fake,
-            settings: proxySettings(provider: "A", address: "ftp://127.0.0.1:21"),
-            upstream: injected, events: nil)
-        defer { server.stop() }
+        _ = try await Forwarder.makeRequest(clientHead: head("/v1/chat/completions"),
+                                            body: Data(#"{"model":"main"}"#.utf8),
+                                            endpoint: .chat, remote: connectorRemote("Fixture", "m"),
+                                            query: "", session: injected,
+                                            outboundPolicy: .system,
+                                            extensionRegistry: registry)
 
-        let (_, response) = try await send(port: port, path: "/v1/chat/completions",
-                                           body: #"{"model":"main","stream":false}"#)
-        #expect(response.statusCode == 502)
+        #expect(await recorder.policies == [.system])
         #expect(spy.requests.isEmpty)
     }
 
@@ -328,26 +266,6 @@ struct ProxyRoutingTests {
                                                 query: "", session: injected,
                                                 outboundPolicy: .proxy(proxy))
             Issue.record("proxy to a loopback upstream unexpectedly proceeded")
-        } catch {
-            #expect(isLoopbackProxyRejection(error))
-        }
-        #expect(spy.requests.isEmpty)
-    }
-
-    @Test func catalogProxyToLoopbackProviderIsRejectedWithoutTouchingInjectedSession() async throws {
-        let spy = RequestSpy()
-        let injected = mockSession { request in spy.store(request); return .init() }
-        defer { ProxyRoutingURLProtocol.handler = nil }
-        let loopback = RemoteModel(id: UUID(), name: "L · one", apiKey: "key", model: "one",
-                                   extraHeaders: [:],
-                                   apiEndpoints: .enabled([.chat], baseURL: "http://127.0.0.1:8080/v1"))
-
-        do {
-            _ = try await ProviderModelCatalog.fetch(for: loopback,
-                                                      settings: proxySettings(provider: "L",
-                                                                              address: "http://127.0.0.1:7890"),
-                                                      session: injected)
-            Issue.record("catalog proxy to a loopback provider unexpectedly proceeded")
         } catch {
             #expect(isLoopbackProxyRejection(error))
         }

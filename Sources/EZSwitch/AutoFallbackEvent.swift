@@ -4,7 +4,7 @@ import Foundation
 /// 下一个候选可尝试时发一次；冷却过滤、候选耗尽、取消、客户端错误及已开始响应都不发。
 struct AutoFallbackEvent: Sendable, Equatable {
     enum Reason: Sendable, Equatable {
-        /// 上游返回可重试的 HTTP 状态码（429 / 5xx），仅带数值。
+        /// 上游返回了非 2xx 状态码，仅带数值。
         case httpStatus(Int)
         /// 连接失败（未拿到响应头）。
         case connectionFailure

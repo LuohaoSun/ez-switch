@@ -160,6 +160,9 @@ enum UsageFormat {
         return f
     }()
 
+    /// Token 数量的紧凑写法：k / M / B（十亿）。
+    /// 切到 B 的阈值取 999.95M 而不是整 1B：M 保留一位小数，四舍五入会把 999.96M 写成
+    /// 「1000.0M」，提前换单位可以保证显示上不出现 1000.0M。
     static func compact(_ value: Int) -> String {
         // 用 Double 取幅值，避免 Int.min 上 abs 溢出陷阱。
         let magnitude = abs(Double(value))
@@ -171,8 +174,10 @@ enum UsageFormat {
             return sign + String(format: "%.1fk", magnitude / 1_000)
         case 100_000..<1_000_000:
             return sign + String(format: "%.0fk", magnitude / 1_000)
-        default:
+        case 1_000_000..<999_950_000:
             return sign + String(format: "%.1fM", magnitude / 1_000_000)
+        default:
+            return sign + String(format: "%.1fB", magnitude / 1_000_000_000)
         }
     }
 

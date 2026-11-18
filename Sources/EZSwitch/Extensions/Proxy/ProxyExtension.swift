@@ -11,16 +11,6 @@ enum ProxyExtension {
         registry.connector(for: source)?.supportsOutboundProxy == true
     }
 
-    /// 地址校验：nil = 可用，否则返回可展示原因。
-    static func validate(_ address: String) -> String? {
-        do {
-            _ = try OutboundPolicy.validatedProxyURL(address)
-            return nil
-        } catch {
-            return (error as? LocalizedError)?.errorDescription ?? "代理地址无效"
-        }
-    }
-
     // MARK: 策略求值
 
     /// 候选远端的出站策略：原生按供应商名，连接器按来源标识。
@@ -45,23 +35,15 @@ enum ProxyExtension {
         }
     }
 
-    /// fail-closed：直接读 raw 的 enabled / 选中集合 / 地址，译文结构损坏时不退化成直连。
+    /// 总开关开启且该来源被勾选 → 跟随 macOS 系统代理；否则严格直连。
+    /// 直接读 raw 节点：结构损坏或 `enabled` 不是布尔时按「未启用」处理，绝不误走代理。
     private static func selectedPolicy(_ settings: ExtensionSettings,
                                        _ isSelected: ([String: ExtensionJSONValue]) -> Bool) -> OutboundPolicy {
         guard let node = settings.extensionValue(for: settingsKey)?.objectValue,
               rawBool(node[Key.enabled]), isSelected(node) else {
             return .direct
         }
-        return resolve(node[Key.address])
-    }
-
-    private static func resolve(_ value: ExtensionJSONValue?) -> OutboundPolicy {
-        guard case .string(let address)? = value,
-              !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .invalid("代理地址为空")
-        }
-        do { return .proxy(try OutboundPolicy.validatedProxyURL(address)) }
-        catch { return .invalid(error.localizedDescription) }
+        return .system
     }
 
     // MARK: 生命周期（由 BuiltinExtensions 通用 hook 转发）
@@ -97,7 +79,6 @@ enum ProxyExtension {
 
     private enum Key {
         static let enabled = "enabled"
-        static let address = "address"
         static let providerNames = "providerNames"
         static let connectorSources = "connectorSources"
     }

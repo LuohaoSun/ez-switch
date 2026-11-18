@@ -786,8 +786,8 @@ struct UsageIntegrationTests {
         #expect(events.events.isEmpty)
     }
 
-    /// 不可重试状态码（400）不触发回退：直接选中并把上游错误透传给客户端。
-    @Test func nonRetryableStatusEmitsNoEvent() async throws {
+    /// 请求侧状态码（400）也回退：同一份请求可能只是这家挑剔，换一个供应商就能跑通。
+    @Test func requestSideStatusFallsBackToNextCandidate() async throws {
         let upstream = mockSession { request in
             if request.url?.host == "fail.test" {
                 return UsageMockURLProtocol.Reply(status: 400,
@@ -816,9 +816,107 @@ struct UsageIntegrationTests {
         let session = URLSession(configuration: .ephemeral)
         let response = try await post(session, port: port, path: "/v1/chat/completions",
                                       body: #"{"model":"main","stream":false}"#)
-        #expect(response.statusCode == 400)
+        #expect(response.statusCode == 200)
         try? await Task.sleep(nanoseconds: 200_000_000)
-        #expect(events.events.isEmpty)
+        #expect(events.events.map(\.reason) == [.httpStatus(400)])
+    }
+
+    /// 400 只跳过这一次：不冷却远端、也不清首选，否则一条坏请求会把整条路由带跑。
+    @Test func requestSideStatusDoesNotCoolTheRemote() async throws {
+        // 两家都回 400：链走完后首选与候选顺序都该原样保留。
+        let upstream = mockSession { _ in
+            UsageMockURLProtocol.Reply(status: 400,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"error":{"message":"bad request"}}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let server = RouterServer(router: router, session: upstream)
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 400)
+        // 下一个请求仍从原首选开始，两个候选都没被拉黑。
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [first.id, second.id])
+        #expect(router.activeRemoteID(fakeID: fake.id) == first.id)
+    }
+
+    /// 429 的 Retry-After 决定冷却时长：该远端会被跳过，首选让给下一个候选。
+    @Test func retryAfterHeaderSendsRemoteToCooldown() async throws {
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 429,
+                    headers: ["Content-Type": "application/json", "Retry-After": "120"],
+                    chunks: [Data(#"{"error":{"message":"slow down"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[]}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let server = RouterServer(router: router, session: upstream)
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 200)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [second.id])
+    }
+
+    /// 认证类失败后的备用成功只是“这次能跑”，不改首选：用户修好主账号 key 后
+    /// 下一次请求仍从主账号开始，不会一直被粘在备用上。
+    @Test func credentialFailureDoesNotStickToBackup() async throws {
+        let upstream = mockSession { request in
+            if request.url?.host == "fail.test" {
+                return UsageMockURLProtocol.Reply(status: 401,
+                    headers: ["Content-Type": "application/json"],
+                    chunks: [Data(#"{"error":{"message":"invalid api key"}}"#.utf8)])
+            }
+            return UsageMockURLProtocol.Reply(status: 200,
+                headers: ["Content-Type": "application/json"],
+                chunks: [Data(#"{"choices":[]}"#.utf8)])
+        }
+        defer { UsageMockURLProtocol.handler = nil }
+
+        let first = providerRemote("FailCo", "model-a", baseURL: "https://fail.test/v1")
+        let second = providerRemote("GoodCo", "model-b", baseURL: "https://good.test/v1")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: first.id, fallbackRemoteIDs: [second.id])
+        let router = Router()
+        router.update(AppConfig(port: 0, remotes: [first, second], fakes: [fake]))
+
+        let server = RouterServer(router: router, session: upstream)
+        try server.start(port: 0)
+        defer { server.stop() }
+        let port = try #require(server.boundPort)
+
+        let session = URLSession(configuration: .ephemeral)
+        let response = try await post(session, port: port, path: "/v1/chat/completions",
+                                      body: #"{"model":"main","stream":false}"#)
+        #expect(response.statusCode == 200)
+        #expect(router.activeRemoteID(fakeID: fake.id) == first.id)
     }
 
     /// 关闭自动回退：候选只剩第一个，失败也不会有“下一个候选”，不发事件。

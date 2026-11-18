@@ -363,6 +363,9 @@ enum RequestProcessor {
         var lastError: Error?
         // 上一次 attempt 失败留下的回退：正式开始下一个候选前发事件，避免取消/候选耗尽误报。
         var pendingFallback: (from: String, reason: AutoFallbackEvent.Reason)?
+        // 上一个候选的失败是否属于认证类。认证失败后的成功不记为新首选：备用可用，
+        // 但记成首选会让用户修好主账号凭据后也切不回去（见 `recordSuccess`）。
+        var suppressPreferred = false
         for (index, candidate) in compatible.enumerated() {
             let remote = candidate.remote
             let adapter = candidate.adapter
@@ -403,19 +406,27 @@ enum RequestProcessor {
                                                                attemptStart: attemptStartMonotonic,
                                                                extensionRegistry: extensionRegistry)
                 let status = upstream.response.statusCode
-                if index < compatible.count - 1 && (status == 429 || [500, 502, 503, 504].contains(status)) {
+                // 除成功外的任何状态码都换下一个候选；要不要冷却由 `FallbackPolicy` 分叉：
+                // 请求侧错误（400/409/413/415/422…）只跳过这一次，不把这个远端记恨六十秒。
+                let disposition = FallbackPolicy.disposition(forStatus: status)
+                if index < compatible.count - 1, disposition != .none {
                     let body = await FallbackDiagnostics.readErrorBody(upstream)
                     let reason = FallbackDiagnostics.summary(response: upstream.response, body: body, remote: remote)
-                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → next=\(compatible[index + 1].remote.name)")
+                    Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) disposition=\(disposition) → next=\(compatible[index + 1].remote.name)")
                     // countTokens：复用回退但绝不记账 / 冷却，也不发通知。
                     if account {
-                        router.recordFailure(remoteID: remote.id)
+                        router.recordFailure(remoteID: remote.id,
+                                             retryAfter: disposition == .switchAndCool
+                                                ? FallbackPolicy.cooldownDeadline(response: upstream.response)
+                                                : nil)
                         recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
                                       fake: fake, remote: remote, endpoint: endpoint,
                                       attempt: attempt, status: status, outcome: "httpError",
                                       started: attemptStarted, tokens: upstream.usage?.tokens,
                                       performance: upstream.performance?.performance)
                     }
+                    // 一旦这条链上出现过认证失败，就不把最终成功的备录取为新首选。
+                    suppressPreferred = suppressPreferred || FallbackPolicy.isCredentialFailure(status)
                     // 只记短标签，绝不落任何上游错误正文（正文仅进 log）。
                     activity.finishAttempt(attempt: attempt, outcome: .httpError, statusCode: status,
                                            reason: "HTTP \(status)",
@@ -461,7 +472,9 @@ enum RequestProcessor {
                 Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) attempt=\(attempt)/\(compatible.count) failed=\(remote.name) reason=\(reason) → \(next)")
                 // countTokens：继续尝试下一个候选，但不冷却 / 不记账 / 不通知。
                 if account {
-                    router.recordFailure(remoteID: remote.id)
+                    // 没有响应头 = 这条线路/这台机器的问题，按远端侧失败冷却。
+                    router.recordFailure(remoteID: remote.id,
+                                         retryAfter: FallbackPolicy.cooldownDeadline(response: nil))
                     // 连接失败（没有响应头）也必须记录，且只记一次
                     recordAttempt(recordUsage, requestID: requestID, timestamp: requestStarted,
                                   fake: fake, remote: remote, endpoint: endpoint,
@@ -493,9 +506,15 @@ enum RequestProcessor {
             return
         }
         var errorBody = Data()
-        let retryableFailure = upstream.response.statusCode == 429 || [500, 502, 503, 504].contains(upstream.response.statusCode)
-        if retryableFailure, account {
-            router.recordFailure(remoteID: remote.id)
+        // 选中的候选（最后一个候选，或关闭自动回退时的唯一候选）自己失败时也要按同一套
+        // 口径记账：远端侧失败才冷却，请求侧失败不冷却。
+        let selectedDisposition = FallbackPolicy.disposition(forStatus: upstream.response.statusCode)
+        let upstreamFailed = selectedDisposition != .none
+        if upstreamFailed, account {
+            router.recordFailure(remoteID: remote.id,
+                                 retryAfter: selectedDisposition == .switchAndCool
+                                    ? FallbackPolicy.cooldownDeadline(response: upstream.response)
+                                    : nil)
         }
 
         // Codex 的 Responses 流若被上游交错输出项事件，Codex 会丢弃 output_text.delta
@@ -537,7 +556,7 @@ enum RequestProcessor {
                 var iterator = upstream.body.makeAsyncIterator()
                 while let chunk = try await iterator.next() {
                     if Task.isCancelled { break }
-                    if retryableFailure, errorBody.count < FallbackDiagnostics.bodyLimit {
+                    if upstreamFailed, errorBody.count < FallbackDiagnostics.bodyLimit {
                         let count = min(chunk.readableBytes, FallbackDiagnostics.bodyLimit - errorBody.count)
                         if let data = chunk.getBytes(at: chunk.readerIndex, length: count) {
                             errorBody.append(contentsOf: data)
@@ -572,11 +591,13 @@ enum RequestProcessor {
                 } else {
                     try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
                     if isSuccess, account {
-                        router.recordSuccess(fakeID: fake.id, remoteID: remote.id, epoch: selectionEpoch)
+                        router.recordSuccess(fakeID: fake.id, remoteID: remote.id,
+                                             epoch: selectionEpoch,
+                                             adoptsPreferred: !suppressPreferred)
                     }
                     outcome = isSuccess ? "success" : "httpError"
                 }
-                if retryableFailure {
+                if upstreamFailed {
                     let reason = FallbackDiagnostics.summary(response: upstream.response, body: errorBody, remote: remote)
                     Log.shared.log("fallback: [\(endpoint.rawValue)] route=\(fake.fakeModelID) failed=\(remote.name) reason=\(reason)；无后续候选，返回上游错误")
                 }
