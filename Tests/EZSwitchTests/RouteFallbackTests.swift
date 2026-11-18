@@ -282,4 +282,38 @@ struct RouteFallbackTests {
         #expect(router.activeRemoteID(fakeID: fake.id) == c.id)
         #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [c.id, a.id])
     }
+
+    /// 请求侧失败（`retryAfter: nil`）只跳过当前请求：不冷却、也不清首选。
+    /// 否则一条超长上下文的请求会让整条路由的起点被带跑。
+    @Test
+    func requestSideFailureSkipsWithoutCooldownOrDemotion() throws {
+        let a = remote("A", "one"), b = remote("B", "two")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b], fakes: [fake]))
+
+        router.recordFailure(remoteID: a.id, retryAfter: nil)
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [a.id, b.id])
+        #expect(router.activeRemoteID(fakeID: fake.id) == a.id)
+    }
+
+    /// 认证类失败后的备用成功不改首选：修好主账号凭据后能自动切回去。
+    @Test
+    func credentialFailureSuccessDoesNotBecomePreferred() throws {
+        let a = remote("A", "one"), b = remote("B", "two")
+        let fake = FakeModel(id: UUID(), fakeModelID: "main", displayName: "main",
+                             remoteID: a.id, fallbackRemoteIDs: [b.id])
+        let router = Router()
+        router.update(AppConfig(port: 8788, remotes: [a, b], fakes: [fake]))
+
+        let epoch = router.requestEpoch(fakeModelID: "main")
+        router.recordFailure(remoteID: a.id)                       // a 的 key 失效，进入冷却
+        router.recordSuccess(fakeID: fake.id, remoteID: b.id, epoch: epoch, adoptsPreferred: false)
+
+        // 冷却期内仍跳过 a，但首选没被改成 b：冷却一过就回到 a。
+        #expect(router.activeRemoteID(fakeID: fake.id) == a.id)
+        router.recordFailure(remoteID: a.id, retryAfter: Date().addingTimeInterval(-1))
+        #expect(router.candidates(fakeModelID: "main")?.remotes.map(\.id) == [a.id, b.id])
+    }
 }

@@ -191,9 +191,7 @@ struct ConfigStoreTests {
         #expect(group.provider == "ProxyOnly")
         #expect(group.modelRemotes.isEmpty)
 
-        // 空壳供应商已存在于 groupedRemotes，因此可以在出站代理名单里勾选。
-        #expect(store.setOutboundProxyProvider("ProxyOnly", selected: true) == nil)
-        #expect(store.config.extensions.outboundProxy.providerNames == ["ProxyOnly"])
+        // 空壳供应商可被出站代理名单勾选，见 ProxySettingsTests。
 
         let persisted = try JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: store.configURL))
         #expect(persisted.remotes.map(\.name) == ["ProxyOnly · "])

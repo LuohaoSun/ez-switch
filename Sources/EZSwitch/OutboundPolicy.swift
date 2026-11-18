@@ -9,9 +9,21 @@ import Network
 
 /// 出站代理策略。`.invalid` 保留原因、绝不静默退化为直连。
 enum OutboundPolicy: Equatable, Sendable {
+    /// 严格直连：绕开系统代理。
     case direct
+    /// 跟随 macOS 系统代理（含 PAC 与例外列表）；系统未配置代理时自然直连。
+    case system
+    /// 显式代理地址。
     case proxy(URL)
     case invalid(String)
+
+    /// 是否需要「出站可被代理」的能力位。连接器用它判断能否承担该策略。
+    var requiresProxyCapability: Bool {
+        switch self {
+        case .direct, .invalid: return false
+        case .system, .proxy: return true
+        }
+    }
 
     /// 严格解析并校验用户填写的代理地址（scheme∈{http,https,socks5}，host+port 必填，
     /// path 仅空或 `/`，禁 query/fragment/userinfo/控制字符）。供 UI / 配置保存校验。
@@ -129,12 +141,21 @@ enum OutboundTransport {
         try OutboundPolicy.validatedProxyURL(text)
     }
 
-    /// 由策略取得可复用的出站会话。相同策略返回同一实例。
+    /// 由策略取得可复用的出站会话。相同策略（含系统代理快照）返回同一实例。
     /// `.invalid` 抛 ``OutboundTransportError/invalidPolicy(_:)``（后端错误，非 `ClientRequestFailure`）。
     static func session(for policy: OutboundPolicy) throws -> URLSession {
+        try session(for: policy, systemProxy: SystemProxy.current())
+    }
+
+    /// 测试入口：系统代理快照可注入，不依赖真实系统设置。
+    static func session(for policy: OutboundPolicy,
+                        systemProxy: SystemProxySnapshot) throws -> URLSession {
         switch policy {
         case .direct:
             return try cachedSession(key: .direct) { makeDirectSession() }
+        case .system:
+            // 指纹随系统代理变化：换新会话，避免沿用在旧设置下建立的连接池。
+            return try cachedSession(key: .system(systemProxy.fingerprint)) { makeSystemSession() }
         case .invalid(let reason):
             throw OutboundTransportError.invalidPolicy(reason)
         case .proxy(let url):
@@ -143,6 +164,7 @@ enum OutboundTransport {
     }
 
     // CFNetwork can bypass explicit proxies for loopback destinations.
+    // 只针对显式代理：`.system` 的回环去留由 macOS 的例外列表决定，不做硬拒绝。
     static func validateDestination(_ url: URL, policy: OutboundPolicy) throws {
         guard case .proxy = policy, let rawHost = url.host else { return }
         let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]."))
@@ -179,6 +201,12 @@ enum OutboundTransport {
         let cfg = baseConfiguration()
         cfg.connectionProxyDictionary = [:] // 绕开 macOS 系统代理
         return URLSession(configuration: cfg)
+    }
+
+    /// 跟随系统代理：故意不设 `connectionProxyDictionary`，让 CFNetwork 按系统设置逐连接
+    /// 决定（PAC、例外列表都交给系统）；系统代理未开启时即为直连。
+    private static func makeSystemSession() -> URLSession {
+        URLSession(configuration: baseConfiguration())
     }
 
     private static func makeProxySession(for url: URL) throws -> URLSession {
@@ -258,6 +286,8 @@ enum OutboundTransport {
 
     private enum CacheKey: Hashable {
         case direct
+        /// 系统代理快照指纹：系统设置一改即换新会话。
+        case system(String)
         case proxy(String)
     }
 

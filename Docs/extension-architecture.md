@@ -15,7 +15,7 @@
 
 `Chat → Responses` 目前不是独立的一层，而是复用主干既有配置与执行路径的协议适配方式；详见下文。
 
-出站代理是同一套骨架上的另一类单元：**出站能力由通用 `OutboundPolicy` 接口承载**（`.direct` 直连 / `.proxy` 经代理 / `.invalid` 配置非法），原生 HTTP 转发按候选快照解析出的策略选择可复用的 `URLSession`；非法策略按后端错误处理，**绝不静默退化为直连**。面板集中在 `Extensions/Proxy`，策略与传输在主干通用的 `OutboundPolicy` / `OutboundTransport`。它同样只经 `BuiltinExtensions.swift` 组合，不引用任何具体连接器名称；连接器通过能力位声明是否允许被代理。
+出站代理是同一套骨架上的另一类单元：**出站能力由通用 `OutboundPolicy` 接口承载**（`.direct` 严格直连 / `.system` 跟随 macOS 系统代理 / `.proxy` 显式代理 / `.invalid` 配置非法），原生 HTTP 转发按候选快照解析出的策略选择可复用的 `URLSession`；非法策略按后端错误处理，**绝不静默退化为直连**。跟随系统代理时不设 `connectionProxyDictionary`，由 CFNetwork 按系统设置（含 PAC 与例外列表）逐连接决定；会话按系统代理快照指纹缓存，设置变化即重建。面板集中在 `Extensions/Proxy`，系统设置读取在主干通用的 `SystemProxy`，策略与传输在 `OutboundPolicy` / `OutboundTransport`。它同样只经 `BuiltinExtensions.swift` 组合，不引用任何具体连接器名称；连接器通过能力位声明是否允许被代理。
 
 ## 组合点
 
@@ -65,7 +65,7 @@ bash Scripts/check-extension-boundaries.sh
 扩展是同一 target 内的可选编译单元，配置必须在其缺席时仍可安全读写：
 
 - **来源标识**：远端记录持久化的 `source` 按字符串原样往返。原生 HTTP 上游的来源标识为 `api`，其 JSON 拼写保持不变；任何其它来源字符串（例如曾由某个扩展写入、而当前构建尚未内置的 `source`）既不会被拒绝、也不会被改写，可无损往返。
-- **扩展配置**：已知的 `chatToResponses` 由强类型保留；出站代理设置（`outboundProxy`：`enabled`、代理地址、原生 `providerNames`、连接器 `connectorSources`）按通用扩展键读写，未识别字段原样往返；其余未知扩展键以任意 JSON 往返保留，不因该扩展未内置而被丢弃。旧配置缺省字段按各自默认值解码。
+- **扩展配置**：已知的 `chatToResponses` 由强类型保留；出站代理设置（`outboundProxy`：`enabled`、原生 `providerNames`、连接器 `connectorSources`）按通用扩展键读写，未识别字段原样往返；其余未知扩展键以任意 JSON 往返保留，不因该扩展未内置而被丢弃。旧配置缺省字段按各自默认值解码；早期版本的 `address`（手填代理地址）已不再参与求值，作为未识别字段原样保留。
 - **缺席/移除时保留数据**：未安装或已移除某扩展后，其已加入的供应商/模型、路由绑定与该扩展配置都**保留**，不会被清理或改写。
 - **候选不可用**：来源非 `api` 的远端若没有在本构建中注册的连接器（`ExtensionRegistry` 查不到定义），其转发与模型目录都会按不可用处理（`ConnectorUnavailable`），从可用候选中排除并继续走现有 fallback 规则；若没有其他可用候选，则返回现有路由错误。它始终保留自身来源，绝不被当作原生 HTTP 上游执行。缺席或未就绪的扩展候选同理。
 - **解码失败保护原文件**：配置初次加载解码失败时**阻断保存**，直到一次成功重载为止；期间不写盘，从而不覆盖磁盘上的原文件。
@@ -74,7 +74,7 @@ bash Scripts/check-extension-boundaries.sh
 
 - 扩展没有拆成独立 SwiftPM 模块，也不是第三方动态插件；它们是同一 target 内按构建开关可裁剪的编译单元，通过宿主通用接口接入配置和路由。
 - `Chat → Responses` 暂保留现有共享配置与执行（每请求独立的内置 helper 进程），本次不承诺将其拆分为独立模块。
-- 出站代理首版是**单一**代理地址 + 名单：不做 PAC、不做代理认证（userinfo），也不为不同来源配置不同代理；`https://`（TLS 到代理）仅在 **macOS 14+** 可用，`http` / `socks5` 自 macOS 13 起可用。
+- 出站代理只提供「**跟随 macOS 系统代理** + 名单」：不提供手填地址、不为不同来源配置不同代理、不自己解析 PAC 或处理代理认证（全部交给系统）。通用的显式代理类型（`http` / `https` / `socks5`）仍保留在 `OutboundPolicy` / `OutboundTransport` 中，供将来需要时复用。
 - 不支持第三方扩展安装、热加载或插件市场，也不引入常驻服务。
 
 ## 验证

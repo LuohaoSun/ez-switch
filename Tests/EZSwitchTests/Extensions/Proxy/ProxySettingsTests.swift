@@ -17,6 +17,7 @@ private func proxyRegistry() -> ExtensionRegistry {
             fetchModelsWithPolicy: { policy in
                 switch policy {
                 case .direct: return ["direct"]
+                case .system: return ["system"]
                 case .proxy(let url): return ["proxy:\(url.host ?? "")"]
                 case .invalid(let reason): return ["invalid:\(reason)"]
                 }
@@ -64,33 +65,29 @@ struct ProxySettingsTests {
         #expect(ProxyExtension.policy(remote: remote, settings: store.config.extensions) == .direct)
     }
 
-    @Test func enableRequiresValidAddressAndAddressValidationIsAtomic() throws {
-        let (store, directory) = try makeStore(registry: proxyRegistry())
+    @Test func enablingNeedsNoAddressAndPolicyFollowsChecklist() throws {
+        let (store, directory) = try makeStore(remotes: [nativeRemote("Alpha", "m")],
+                                              registry: proxyRegistry())
         defer { withExtendedLifetime(directory) {} }
-        #expect(store.setOutboundProxyEnabled(true) != nil)             // 无地址
-        #expect(!store.config.extensions.outboundProxy.enabled)
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1") != nil) // 缺端口
-        #expect(store.config.extensions.outboundProxy.address.isEmpty)
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1:7890") == nil)
+        // 不再需要地址：打开总开关即可（地址字段已从配置契约移除）。
         #expect(store.setOutboundProxyEnabled(true) == nil)
         #expect(store.config.extensions.outboundProxy.enabled)
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1:7890\n") != nil) // 尾换行拒绝
-        #expect(store.setOutboundProxyAddress("\nhttp://127.0.0.1:7890") != nil) // 首换行拒绝
-        #expect(store.config.extensions.outboundProxy.address == "http://127.0.0.1:7890")
-        #expect(store.setOutboundProxyAddress("") != nil)               // 启用中不能清空
-        #expect(store.config.extensions.outboundProxy.address == "http://127.0.0.1:7890")
+        // 未勾选的来源仍严格直连。
+        #expect(ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) == .direct)
+
+        #expect(store.setOutboundProxyProvider("Alpha", selected: true) == nil)
+        #expect(ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) == .system)
+
         #expect(store.setOutboundProxyEnabled(false) == nil)
-        #expect(store.setOutboundProxyAddress("") == nil)               // 关闭后可清空
-        #expect(store.config.extensions.outboundProxy.address.isEmpty)
+        #expect(ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) == .direct)
     }
 
-    @Test func selectedNativeProviderCarriesProxyPolicyIntoRoutedCandidate() throws {
+    @Test func selectedNativeProviderCarriesSystemPolicyIntoRoutedCandidate() throws {
         let (store, directory) = try makeStore(remotes: [nativeRemote("Alpha", "m")],
                                                registry: proxyRegistry())
         defer { withExtendedLifetime(directory) {} }
         let record = try #require(store.config.remotes.first)
         #expect(store.addFake(fakeModelID: "main", remoteID: record.id))
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1:7890") == nil)
         #expect(store.setOutboundProxyEnabled(true) == nil)
 
         let before = try #require(store.router.routedCandidates(fakeModelID: "main", endpoint: .chat))
@@ -98,11 +95,7 @@ struct ProxySettingsTests {
 
         #expect(store.setOutboundProxyProvider("Alpha", selected: true) == nil)
         let after = try #require(store.router.routedCandidates(fakeModelID: "main", endpoint: .chat))
-        guard case .proxy(let url) = try #require(after.candidates.first?.outboundPolicy) else {
-            Issue.record("expected proxy policy"); return
-        }
-        #expect(url.host == "127.0.0.1")
-        #expect(url.port == 7890)
+        #expect(after.candidates.first?.outboundPolicy == .system)
     }
 
     @Test func connectorSelectionRequiresSupportAndDeselectionAlwaysWorks() throws {
@@ -117,24 +110,43 @@ struct ProxySettingsTests {
         #expect(store.config.extensions.outboundProxy.connectorSources.isEmpty)
     }
 
-    @Test func malformedEnabledNodeStaysInvalidNotDirect() throws {
+    /// 尚未添加模型、只落了连接配置的空壳供应商也要能勾选（先配好供应商再取模型列表）。
+    @Test func providerShellCanBeSelected() throws {
+        let (store, directory) = try makeStore(registry: proxyRegistry())
+        defer { withExtendedLifetime(directory) {} }
+        let endpoints = APIEndpointSettings.enabled([.chat], baseURL: "https://proxy.example/v1")
+        #expect(store.addProvider(name: "ProxyOnly", modelIDs: [], apiKey: "secret",
+                                  extraHeaders: [:], apiEndpoints: endpoints) == nil)
+        #expect(store.setOutboundProxyEnabled(true) == nil)
+        #expect(store.setOutboundProxyProvider("ProxyOnly", selected: true) == nil)
+        #expect(store.config.extensions.outboundProxy.providerNames == ["ProxyOnly"])
+        #expect(ProxyExtension.policy(provider: "ProxyOnly", settings: store.config.extensions) == .system)
+    }
+
+    /// 旧版本手填的 `address` 不再参与求值：勾选即跟随系统代理，地址原样留在 JSON 里。
+    @Test func legacyAddressFieldIsIgnoredButPreserved() throws {
         let nativeID = UUID()
         let json = """
         {"port":8788,"remotes":[{"id":"\(nativeID.uuidString)","name":"Alpha · m","apiKey":"k",\
         "model":"m","extraHeaders":{},"apiEndpoints":{"chat":{"enabled":true,"baseURL":"https://alpha.test/v1"},\
         "responses":{"enabled":true,"baseURL":"https://alpha.test/v1"},\
         "messages":{"enabled":true,"baseURL":"https://alpha.test/v1"}},"source":"api"}],"fakes":[],\
-        "extensions":{"outboundProxy":{"enabled":true,"address":"http://127.0.0.1",\
+        "extensions":{"outboundProxy":{"enabled":true,"address":"ftp://127.0.0.1:21",\
         "providerNames":["Alpha"],"connectorSources":["proxyFixture"]}}}
         """
         let (store, directory) = try makeStore(rawJSON: json, registry: proxyRegistry())
         defer { withExtendedLifetime(directory) {} }
-        guard case .invalid = ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) else {
-            Issue.record("native: expected invalid, not direct"); return
-        }
-        guard case .invalid = ProxyExtension.policy(source: proxySource, settings: store.config.extensions) else {
-            Issue.record("connector: expected invalid, not direct"); return
-        }
+        // 旧地址即使不合法也不再让策略变成 .invalid。
+        #expect(ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) == .system)
+        #expect(ProxyExtension.policy(source: proxySource, settings: store.config.extensions) == .system)
+
+        // 任意一次写入后，旧 address 仍作为未识别字段原样保留。
+        #expect(store.setOutboundProxyConnector(proxySource, selected: true) == nil)
+        let root = try #require(try JSONSerialization.jsonObject(
+            with: Data(contentsOf: store.configURL)) as? [String: Any])
+        let extensions = try #require(root["extensions"] as? [String: Any])
+        let node = try #require(extensions["outboundProxy"] as? [String: Any])
+        #expect(node["address"] as? String == "ftp://127.0.0.1:21")
     }
 
     @Test func rawSelectionSurvivesTypedDecodeFailure() throws {
@@ -145,9 +157,7 @@ struct ProxySettingsTests {
         """
         let (store, directory) = try makeStore(rawJSON: json, registry: proxyRegistry())
         defer { withExtendedLifetime(directory) {} }
-        guard case .proxy = ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) else {
-            Issue.record("expected proxy from raw selection"); return
-        }
+        #expect(ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) == .system)
     }
 
     @Test func renameRemovalAndInitPruneMaintainNativeNames() throws {
@@ -180,23 +190,24 @@ struct ProxySettingsTests {
     @Test func unknownNodeAndExtensionFieldsSurviveResave() throws {
         let json = """
         {"port":8788,"remotes":[],"fakes":[],"extensions":{"outboundProxy":{"enabled":false,\
-        "address":"","providerNames":[],"connectorSources":[],"futureField":{"n":1}},\
-        "otherExtension":{"anything":[1,2]}}}
+        "address":"http://127.0.0.1:7890","providerNames":[],"connectorSources":[],\
+        "futureField":{"n":1}},"otherExtension":{"anything":[1,2]}}}
         """
         let (store, directory) = try makeStore(rawJSON: json, registry: proxyRegistry())
         defer { withExtendedLifetime(directory) {} }
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1:7890") == nil)
+        #expect(store.setOutboundProxyEnabled(true) == nil)
         let root = try #require(try JSONSerialization.jsonObject(
             with: Data(contentsOf: store.configURL)) as? [String: Any])
         let extensions = try #require(root["extensions"] as? [String: Any])
         let node = try #require(extensions["outboundProxy"] as? [String: Any])
+        // 旧 address 与未知字段都按未识别字段原样往返。
         #expect(node["address"] as? String == "http://127.0.0.1:7890")
         #expect(node["futureField"] != nil)
         #expect(extensions["otherExtension"] != nil)
     }
 
-    /// 损坏节点（connectorSources 类型非法）在有效 enabled/address/providerNames/未知字段下，
-    /// 保存地址、勾选/取消名单、开启一律拒绝：原始 JSON 与策略都不变。
+    /// 损坏节点（connectorSources 类型非法）在有效 enabled/providerNames/未知字段下，
+    /// 勾选/取消名单、开启一律拒绝：原始 JSON 与策略都不变。
     @Test func corruptNodeRejectsFieldWritesAndPreservesRawAndPolicy() throws {
         let nativeID = UUID()
         let json = """
@@ -210,11 +221,8 @@ struct ProxySettingsTests {
         let (store, directory) = try makeStore(rawJSON: json, registry: proxyRegistry())
         defer { withExtendedLifetime(directory) {} }
         let before = try Data(contentsOf: store.configURL)
-        guard case .proxy = ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) else {
-            Issue.record("precondition: expected proxy policy"); return
-        }
+        #expect(ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) == .system)
 
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1:9999") != nil)
         #expect(store.setOutboundProxyProvider("Alpha", selected: false) != nil)
         #expect(store.setOutboundProxyProvider("Alpha", selected: true) != nil)
         #expect(store.setOutboundProxyConnector(proxySource, selected: true) != nil)
@@ -232,9 +240,7 @@ struct ProxySettingsTests {
         #expect((node["providerNames"] as? [String]) == ["Alpha"])
         #expect(node["connectorSources"] as? Int == 5)          // 未改写成数组
         #expect((node["futureField"] as? [String: Any])?["n"] as? Int == 1)
-        guard case .proxy = ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) else {
-            Issue.record("policy changed after rejected writes"); return
-        }
+        #expect(ProxyExtension.policy(provider: "Alpha", settings: store.config.extensions) == .system)
     }
 
     /// 显式关闭是损坏 object 节点的恢复操作：只改 enabled=false，保留地址/名单/未知字段。
@@ -268,7 +274,7 @@ struct ProxySettingsTests {
         let (store, directory) = try makeStore(rawJSON: json, registry: proxyRegistry())
         defer { withExtendedLifetime(directory) {} }
         #expect(store.setOutboundProxyEnabled(true) != nil)
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1:7890") != nil)
+        #expect(store.setOutboundProxyProvider("Alpha", selected: true) != nil)
 
         #expect(store.setOutboundProxyEnabled(false) == nil)
         let root = try #require(try JSONSerialization.jsonObject(
@@ -278,9 +284,7 @@ struct ProxySettingsTests {
         #expect(node["enabled"] as? Bool == false)
 
         // 恢复后节点有效，可正常编辑。
-        #expect(store.setOutboundProxyAddress("http://127.0.0.1:7890") == nil)
         #expect(store.setOutboundProxyEnabled(true) == nil)
-        #expect(store.config.extensions.outboundProxy.address == "http://127.0.0.1:7890")
         #expect(store.config.extensions.outboundProxy.enabled)
     }
 
@@ -315,14 +319,43 @@ struct ProxySettingsTests {
         let registry = proxyRegistry()
         // direct 也交给 policy 闭包，避免闭包读取全局策略而非本次快照。
         #expect(try await registry.fetchModels(source: proxySource) == ["direct"])
+        #expect(try await registry.fetchModels(source: proxySource, outboundPolicy: .system)
+            == ["system"])
         let url = try OutboundPolicy.validatedProxyURL("http://127.0.0.1:7890")
         #expect(try await registry.fetchModels(source: proxySource, outboundPolicy: .proxy(url))
             == ["proxy:127.0.0.1"])
+        // 跟随系统代理同样要求能力位，不静默降级直连。
+        await #expect(throws: ConnectorProxyUnsupported.self) {
+            try await registry.fetchModels(source: plainSource, outboundPolicy: .system)
+        }
         await #expect(throws: ConnectorProxyUnsupported.self) {
             try await registry.fetchModels(source: plainSource, outboundPolicy: .proxy(url))
         }
         await #expect(throws: OutboundTransportError.self) {
             try await registry.fetchModels(source: proxySource, outboundPolicy: .invalid("boom"))
         }
+    }
+
+    @Test func systemProxyDescriptionCoversActiveAndIdleStates() {
+        #expect(SystemProxyDescription.text(.empty) == "未开启，将直连")
+
+        let httpOnly = SystemProxySnapshot(dictionary: [
+            "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 7890,
+        ])
+        #expect(SystemProxyDescription.text(httpOnly) == "HTTP 127.0.0.1:7890")
+
+        let both = SystemProxySnapshot(dictionary: [
+            "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 7890,
+            "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": 7890,
+            "SOCKSEnable": 1, "SOCKSProxy": "127.0.0.1", "SOCKSPort": 1080,
+        ])
+        // HTTPS 与 HTTP 同一地址时不重复展示。
+        #expect(SystemProxyDescription.text(both) == "HTTP 127.0.0.1:7890 · SOCKS 127.0.0.1:1080")
+
+        let pac = SystemProxySnapshot(dictionary: [
+            "ProxyAutoConfigEnable": 1,
+            "ProxyAutoConfigURLString": "http://pac.test/proxy.pac",
+        ])
+        #expect(SystemProxyDescription.text(pac) == "PAC pac.test")
     }
 }

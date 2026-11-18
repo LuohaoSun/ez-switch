@@ -572,11 +572,15 @@ final class Router {
         return fake.startingRemoteID
     }
 
-    func recordFailure(remoteID: UUID, retryAfter date: Date = Date().addingTimeInterval(60)) {
+    /// 记录一次候选失败。
+    /// - Parameter date: 冷却截止时间；传 `nil` 表示只跳过当前这次请求，既不冷却也不降首选
+    ///   （请求侧错误，见 ``FallbackPolicy``）。
+    func recordFailure(remoteID: UUID,
+                       retryAfter date: Date? = Date().addingTimeInterval(FallbackPolicy.defaultCooldown)) {
         lock.lock()
-        retryAfter[remoteID] = date
+        if let date { retryAfter[remoteID] = date }
         // 首选失败即失去资格；在途请求仍按已生成的候选顺序前进。
-        activeRemoteIDs = activeRemoteIDs.filter { $0.value != remoteID }
+        if date != nil { activeRemoteIDs = activeRemoteIDs.filter { $0.value != remoteID } }
         lock.unlock()
     }
 
@@ -591,13 +595,18 @@ final class Router {
 
     /// 完成成功时调用：远端须仍存在且仍绑定；代次未变（nil = 直接调用不校验）才提升首选，
     /// 首选改变时提升代次。取消/流错误不会走到这里。
-    func recordSuccess(fakeID: UUID, remoteID: UUID, epoch: UInt64? = nil) {
+    /// - Parameter adoptsPreferred: 是否把这个远端记成新的“粘性首选”。认证类失败
+    ///   （401/403）后的回退成功传 `false`：备用确实可用，但把它记成首选会让用户
+    ///   修好主账号凭据后也切不回去。
+    func recordSuccess(fakeID: UUID, remoteID: UUID, epoch: UInt64? = nil,
+                       adoptsPreferred: Bool = true) {
         lock.lock()
         defer { lock.unlock() }
         guard let fake = allFakes.first(where: { $0.id == fakeID }),
               remotes[remoteID] != nil,
               fake.orderedRemoteIDs.contains(remoteID) else { return }
         retryAfter.removeValue(forKey: remoteID)
+        guard adoptsPreferred else { return }
         if let epoch, epoch != (selectionEpochs[fakeID] ?? 0) { return }
         // 仅当“有效首选”确实改变时才提升代次；对持久起始的成功不提升，避免作废并发计划。
         if effectivePreferredRemoteID(for: fake) != remoteID {

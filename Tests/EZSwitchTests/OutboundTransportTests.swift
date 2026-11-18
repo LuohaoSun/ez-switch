@@ -307,6 +307,39 @@ struct OutboundTransportSessionTests {
         #expect(dictionary?.isEmpty == true, "direct 的代理字典应为空字典，而非 nil")
     }
 
+    @Test func systemSessionDefersToSystemSettings() throws {
+        let session = try OutboundTransport.session(for: .system)
+        #expect(session.configuration.connectionProxyDictionary == nil,
+                "system 不设代理字典，交给 CFNetwork 按系统设置逐连接决定")
+        let direct = try OutboundTransport.session(for: .direct)
+        #expect(session !== direct)
+    }
+
+    /// 系统代理快照变化（开关或端口）必须换新会话，避免沿用旧设置下建立的连接池。
+    @Test func systemSessionCacheFollowsSnapshot() throws {
+        let idle = SystemProxySnapshot(dictionary: [:])
+        let proxied = SystemProxySnapshot(dictionary: [
+            "HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 7890,
+        ])
+        let first = try OutboundTransport.session(for: .system, systemProxy: idle)
+        let again = try OutboundTransport.session(for: .system, systemProxy: idle)
+        #expect(first === again)
+        let reconnected = try OutboundTransport.session(for: .system, systemProxy: proxied)
+        #expect(reconnected !== first)
+    }
+
+    /// 回环上游只在显式代理下硬拒绝；跟随系统代理时交给 macOS 例外列表。
+    @Test func loopbackRejectionOnlyAppliesToExplicitProxy() throws {
+        let loopback = URL(string: "http://127.0.0.1:8080/v1/chat/completions")!
+        try OutboundTransport.validateDestination(loopback, policy: .system)
+        try OutboundTransport.validateDestination(loopback, policy: .direct)
+
+        let proxy = try OutboundTransport.validateProxyURL("http://127.0.0.1:7890")
+        #expect(throws: OutboundTransportError.self) {
+            try OutboundTransport.validateDestination(loopback, policy: .proxy(proxy))
+        }
+    }
+
     @Test func directSessionRoundTripsOverLoopback() async throws {
         let target = try MockTCPEndpoint(respond: httpOK)
         defer { target.stop() }
